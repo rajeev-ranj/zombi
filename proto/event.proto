@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package zombi;
+
+message Event {
+  bytes payload = 1;
+  int64 timestamp_ms = 2;
+  string idempotency_key = 3;
+  map<string, string> headers = 4;
+}
+
+message StoredEvent {
+  uint64 sequence = 1;
+  string topic = 2;
+  uint32 partition = 3;
+  Event event = 4;
+}
