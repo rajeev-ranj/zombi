@@ -7,6 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use futures::future::join_all;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -36,13 +37,16 @@ impl Metrics {
     pub fn record_write(&self, bytes: u64, latency_us: u64) {
         self.writes_total.fetch_add(1, Ordering::Relaxed);
         self.writes_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.write_latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.write_latency_sum_us
+            .fetch_add(latency_us, Ordering::Relaxed);
     }
 
     pub fn record_read(&self, records: u64, latency_us: u64) {
         self.reads_total.fetch_add(1, Ordering::Relaxed);
-        self.read_records_total.fetch_add(records, Ordering::Relaxed);
-        self.read_latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.read_records_total
+            .fetch_add(records, Ordering::Relaxed);
+        self.read_latency_sum_us
+            .fetch_add(latency_us, Ordering::Relaxed);
     }
 
     pub fn record_error(&self) {
@@ -87,6 +91,15 @@ impl ColdStorage for NoopColdStorage {
     ) -> Result<Vec<crate::contracts::SegmentInfo>, StorageError> {
         Ok(Vec::new())
     }
+
+    fn storage_info(&self) -> crate::contracts::ColdStorageInfo {
+        crate::contracts::ColdStorageInfo {
+            storage_type: "none".into(),
+            iceberg_enabled: false,
+            bucket: String::new(),
+            base_path: String::new(),
+        }
+    }
 }
 
 /// Request body for writing records.
@@ -104,6 +117,30 @@ pub struct WriteRecordRequest {
 pub struct WriteRecordResponse {
     pub offset: u64,
     pub partition: u32,
+    pub table: String,
+}
+
+/// Request body for bulk write operations (#1).
+#[derive(Debug, Deserialize)]
+pub struct BulkWriteRequest {
+    pub records: Vec<BulkWriteRecord>,
+}
+
+/// Single record in bulk write request.
+#[derive(Debug, Deserialize)]
+pub struct BulkWriteRecord {
+    pub payload: String,
+    #[serde(default)]
+    pub partition: u32,
+    pub timestamp_ms: Option<i64>,
+    pub idempotency_key: Option<String>,
+}
+
+/// Response for bulk write operations.
+#[derive(Debug, Serialize)]
+pub struct BulkWriteResponse {
+    pub offsets: Vec<u64>,
+    pub count: usize,
     pub table: String,
 }
 
@@ -218,63 +255,64 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    let (payload, partition, timestamp_ms, idempotency_key) = if content_type
-        .starts_with("application/x-protobuf")
-    {
-        // Parse protobuf Event
-        let event = proto::Event::decode(body).map_err(|e| {
-            state.metrics.record_error();
-            ApiError::BadRequest(format!("Invalid protobuf: {}", e))
-        })?;
+    let (payload, partition, timestamp_ms, idempotency_key) =
+        if content_type.starts_with("application/x-protobuf") {
+            // Parse protobuf Event
+            let event = proto::Event::decode(body).map_err(|e| {
+                state.metrics.record_error();
+                ApiError::BadRequest(format!("Invalid protobuf: {}", e))
+            })?;
 
-        let timestamp = if event.timestamp_ms != 0 {
-            event.timestamp_ms
+            let timestamp = if event.timestamp_ms != 0 {
+                event.timestamp_ms
+            } else {
+                current_timestamp_ms()
+            };
+
+            let idempotency_key = if event.idempotency_key.is_empty() {
+                None
+            } else {
+                Some(event.idempotency_key)
+            };
+
+            // Partition from X-Partition header, default 0
+            let partition = headers
+                .get("x-partition")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0u32);
+
+            (event.payload, partition, timestamp, idempotency_key)
         } else {
-            current_timestamp_ms()
-        };
-
-        let idempotency_key = if event.idempotency_key.is_empty() {
-            None
-        } else {
-            Some(event.idempotency_key)
-        };
-
-        // Partition from X-Partition header, default 0
-        let partition = headers
-            .get("x-partition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0u32);
-
-        (event.payload, partition, timestamp, idempotency_key)
-    } else {
-        // Parse JSON
-        let request: WriteRecordRequest = serde_json::from_slice(&body)
-            .map_err(|e| {
+            // Parse JSON
+            let request: WriteRecordRequest = serde_json::from_slice(&body).map_err(|e| {
                 state.metrics.record_error();
                 ApiError::BadRequest(format!("Invalid JSON: {}", e))
             })?;
 
-        let timestamp = request.timestamp_ms.unwrap_or_else(current_timestamp_ms);
+            let timestamp = request.timestamp_ms.unwrap_or_else(current_timestamp_ms);
 
-        (
-            request.payload.into_bytes(),
-            request.partition,
-            timestamp,
-            request.idempotency_key,
+            (
+                request.payload.into_bytes(),
+                request.partition,
+                timestamp,
+                request.idempotency_key,
+            )
+        };
+
+    let offset = state
+        .storage
+        .write(
+            &table,
+            partition,
+            &payload,
+            timestamp_ms,
+            idempotency_key.as_deref(),
         )
-    };
-
-    let offset = state.storage.write(
-        &table,
-        partition,
-        &payload,
-        timestamp_ms,
-        idempotency_key.as_deref(),
-    ).map_err(|e| {
-        state.metrics.record_error();
-        ApiError::from(e)
-    })?;
+        .map_err(|e| {
+            state.metrics.record_error();
+            ApiError::from(e)
+        })?;
 
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_write(body_len, latency_us);
@@ -289,11 +327,93 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     ))
 }
 
+/// POST /tables/{table}/bulk
+/// Bulk write multiple records in a single batch (#1 Bulk Write API).
+/// Reduces HTTP overhead and uses a single RocksDB WriteBatch.
+pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
+    Path(table): Path<String>,
+    Json(request): Json<BulkWriteRequest>,
+) -> Result<(StatusCode, Json<BulkWriteResponse>), ApiError> {
+    let start = Instant::now();
+    let record_count = request.records.len();
+
+    if record_count == 0 {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(BulkWriteResponse {
+                offsets: Vec::new(),
+                count: 0,
+                table,
+            }),
+        ));
+    }
+
+    // Convert to BulkWriteEvent format
+    let events: Vec<crate::contracts::BulkWriteEvent> = request
+        .records
+        .into_iter()
+        .map(|r| crate::contracts::BulkWriteEvent {
+            partition: r.partition,
+            payload: r.payload.into_bytes(),
+            timestamp_ms: r.timestamp_ms.unwrap_or_else(current_timestamp_ms),
+            idempotency_key: r.idempotency_key,
+        })
+        .collect();
+
+    let total_bytes: u64 = events.iter().map(|e| e.payload.len() as u64).sum();
+
+    // Single batch write for all events
+    let offsets = state.storage.write_batch(&table, &events).map_err(|e| {
+        state.metrics.record_error();
+        ApiError::from(e)
+    })?;
+
+    let latency_us = start.elapsed().as_micros() as u64;
+
+    // Record metrics for each event (averaged latency)
+    let per_event_latency = latency_us / record_count.max(1) as u64;
+    for _ in 0..record_count {
+        state
+            .metrics
+            .record_write(total_bytes / record_count as u64, per_event_latency);
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BulkWriteResponse {
+            count: offsets.len(),
+            offsets,
+            table,
+        }),
+    ))
+}
+
 fn current_timestamp_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Calculates rate per second, returning 0.0 if duration is zero.
+#[inline]
+fn safe_rate(count: u64, duration_secs: f64) -> f64 {
+    if duration_secs > 0.0 {
+        count as f64 / duration_secs
+    } else {
+        0.0
+    }
+}
+
+/// Calculates average, returning 0.0 if count is zero.
+#[inline]
+fn safe_avg(sum: u64, count: u64) -> f64 {
+    if count > 0 {
+        sum as f64 / count as f64
+    } else {
+        0.0
+    }
 }
 
 /// GET /tables/{table}
@@ -306,25 +426,38 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
 ) -> Result<Json<ReadRecordsResponse>, ApiError> {
     let start = Instant::now();
 
-    // Read from hot storage
+    // Read from hot storage (pass None for start_offsets - could be added for consumer groups later)
     let mut all_events = state
         .storage
-        .read_all_partitions(&table, query.since, query.limit + 1)
+        .read_all_partitions(&table, None, query.since, query.limit + 1)
         .map_err(|e| {
             state.metrics.record_error();
             ApiError::from(e)
         })?;
 
-    // Also read from cold storage if configured
+    // Also read from cold storage if configured - parallel reads for all partitions
     if let Some(ref cold) = state.cold_storage {
         let partitions = state.storage.list_partitions(&table).unwrap_or_default();
-        for partition in partitions {
-            let cold_events = cold
-                .read_events(&table, partition, 0, query.limit + 1)
-                .await
-                .unwrap_or_default();
 
-            // Filter by timestamp if specified
+        // Create futures for all partition reads
+        let read_futures: Vec<_> = partitions
+            .iter()
+            .map(|&partition| {
+                let cold = cold.clone();
+                let table = table.clone();
+                async move {
+                    cold.read_events(&table, partition, 0, query.limit + 1)
+                        .await
+                        .unwrap_or_default()
+                }
+            })
+            .collect();
+
+        // Execute all reads in parallel
+        let results = join_all(read_futures).await;
+
+        // Collect and filter results
+        for cold_events in results {
             let cold_events: Vec<_> = if let Some(since) = query.since {
                 cold_events
                     .into_iter()
@@ -333,7 +466,6 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
             } else {
                 cold_events
             };
-
             all_events.extend(cold_events);
         }
 
@@ -426,30 +558,14 @@ pub async fn get_stats<H: HotStorage, C: ColdStorage>(
         writes: WriteStats {
             total: writes_total,
             bytes_total: writes_bytes,
-            rate_per_sec: if uptime_secs > 0.0 {
-                writes_total as f64 / uptime_secs
-            } else {
-                0.0
-            },
-            avg_latency_us: if writes_total > 0 {
-                write_latency_sum as f64 / writes_total as f64
-            } else {
-                0.0
-            },
+            rate_per_sec: safe_rate(writes_total, uptime_secs),
+            avg_latency_us: safe_avg(write_latency_sum, writes_total),
         },
         reads: ReadStats {
             total: reads_total,
             records_total: read_records_total,
-            rate_per_sec: if uptime_secs > 0.0 {
-                reads_total as f64 / uptime_secs
-            } else {
-                0.0
-            },
-            avg_latency_us: if reads_total > 0 {
-                read_latency_sum as f64 / reads_total as f64
-            } else {
-                0.0
-            },
+            rate_per_sec: safe_rate(reads_total, uptime_secs),
+            avg_latency_us: safe_avg(read_latency_sum, reads_total),
         },
         errors_total,
     })
@@ -525,5 +641,105 @@ pub async fn get_offset<H: HotStorage, C: ColdStorage>(
         topic: query.topic,
         partition: query.partition,
         offset,
+    }))
+}
+
+// ============================================================================
+// Iceberg Admin Endpoints
+// ============================================================================
+
+/// Response for table metadata endpoint.
+#[derive(Debug, Serialize)]
+pub struct TableMetadataResponse {
+    pub table: String,
+    pub storage_type: String,
+    pub iceberg_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
+}
+
+/// Response for flush endpoint.
+#[derive(Debug, Serialize)]
+pub struct FlushResponse {
+    pub status: String,
+    pub message: String,
+}
+
+/// Response for compact endpoint.
+#[derive(Debug, Serialize)]
+pub struct CompactResponse {
+    pub status: String,
+    pub message: String,
+}
+
+/// GET /tables/{table}/metadata
+/// Returns metadata about the table storage, including Iceberg location if enabled.
+pub async fn get_table_metadata<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
+    Path(table): Path<String>,
+) -> Result<Json<TableMetadataResponse>, ApiError> {
+    let response = if let Some(ref cold) = state.cold_storage {
+        let info = cold.storage_info();
+        let metadata_location = cold.iceberg_metadata_location(&table);
+
+        TableMetadataResponse {
+            table,
+            storage_type: info.storage_type,
+            iceberg_enabled: info.iceberg_enabled,
+            metadata_location,
+            bucket: Some(info.bucket),
+            base_path: Some(info.base_path),
+        }
+    } else {
+        TableMetadataResponse {
+            table,
+            storage_type: "hot_only".into(),
+            iceberg_enabled: false,
+            metadata_location: None,
+            bucket: None,
+            base_path: None,
+        }
+    };
+
+    Ok(Json(response))
+}
+
+/// POST /tables/{table}/flush
+/// Forces a flush of pending events to cold storage.
+/// Note: This endpoint requires the flusher to be wired into AppState.
+pub async fn flush_table<H: HotStorage, C: ColdStorage>(
+    State(_state): State<Arc<AppState<H, C>>>,
+    Path(table): Path<String>,
+) -> Result<Json<FlushResponse>, ApiError> {
+    // TODO: Wire flusher into AppState to enable this endpoint
+    // For now, return 501 Not Implemented
+    Ok(Json(FlushResponse {
+        status: "not_implemented".into(),
+        message: format!(
+            "Flush for table '{}' is not yet wired. Add flusher to AppState to enable.",
+            table
+        ),
+    }))
+}
+
+/// POST /tables/{table}/compact
+/// Triggers compaction for the table to merge small files.
+/// Note: This endpoint requires the compactor to be wired into AppState.
+pub async fn compact_table<H: HotStorage, C: ColdStorage>(
+    State(_state): State<Arc<AppState<H, C>>>,
+    Path(table): Path<String>,
+) -> Result<Json<CompactResponse>, ApiError> {
+    // TODO: Wire compactor into AppState to enable this endpoint
+    // For now, return 501 Not Implemented
+    Ok(Json(CompactResponse {
+        status: "not_implemented".into(),
+        message: format!(
+            "Compaction for table '{}' is not yet wired. Add compactor to AppState to enable.",
+            table
+        ),
     }))
 }

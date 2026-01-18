@@ -16,13 +16,28 @@ pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(
     Router::new()
         .route("/health", get(handlers::health_check))
         .route("/stats", get(handlers::get_stats::<H, C>))
+        .route("/tables/:table/bulk", post(handlers::bulk_write::<H, C>))
         .route("/tables/:table", post(handlers::write_record::<H, C>))
         .route("/tables/:table", get(handlers::read_records::<H, C>))
+        // Iceberg admin endpoints
+        .route(
+            "/tables/:table/metadata",
+            get(handlers::get_table_metadata::<H, C>),
+        )
+        .route("/tables/:table/flush", post(handlers::flush_table::<H, C>))
+        .route(
+            "/tables/:table/compact",
+            post(handlers::compact_table::<H, C>),
+        )
+        // Consumer offset management
         .route(
             "/consumers/:group/commit",
             post(handlers::commit_offset::<H, C>),
         )
-        .route("/consumers/:group/offset", get(handlers::get_offset::<H, C>))
+        .route(
+            "/consumers/:group/offset",
+            get(handlers::get_offset::<H, C>),
+        )
         .with_state(state)
 }
 

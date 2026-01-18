@@ -59,18 +59,21 @@ impl Default for AtomicSequenceGenerator {
 impl SequenceGenerator for AtomicSequenceGenerator {
     fn next(&self) -> Result<u64, SequenceError> {
         // fetch_add returns the previous value, so we add 1 to get the new value
-        let prev = self.counter.fetch_add(1, Ordering::SeqCst);
+        // Relaxed ordering is sufficient - we only need atomicity, not memory ordering (#3)
+        let prev = self.counter.fetch_add(1, Ordering::Relaxed);
         let next = prev.checked_add(1).ok_or(SequenceError::Overflow)?;
         Ok(next)
     }
 
     fn current(&self) -> Result<u64, SequenceError> {
-        Ok(self.counter.load(Ordering::SeqCst))
+        // Relaxed is fine for reading current value
+        Ok(self.counter.load(Ordering::Relaxed))
     }
 
     fn persist(&self) -> Result<(), SequenceError> {
         if let Some(ref path) = self.persistence_path {
-            let value = self.counter.load(Ordering::SeqCst);
+            // Acquire ensures we see all increments before persisting
+            let value = self.counter.load(Ordering::Acquire);
             std::fs::write(path, value.to_string())
                 .map_err(|e| SequenceError::PersistFailed(e.to_string()))?;
         }

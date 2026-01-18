@@ -21,6 +21,18 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
     (router, dir)
 }
 
+fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let state = Arc::new(AppState {
+        storage: Arc::new(storage),
+        cold_storage: Some(Arc::new(NoopColdStorage)),
+        metrics: Arc::new(Metrics::new()),
+    });
+    let router = create_router(state);
+    (router, dir)
+}
+
 #[tokio::test]
 async fn test_health_check() {
     let (app, _dir) = create_test_app();
@@ -289,6 +301,119 @@ async fn test_commit_and_get_offset() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["offset"], 100);
+}
+
+#[tokio::test]
+async fn test_table_metadata_hot_only() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/user_events/metadata")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["table"], "user_events");
+    assert_eq!(json["storage_type"], "hot_only");
+    assert_eq!(json["iceberg_enabled"], false);
+    assert!(json.get("metadata_location").is_none());
+}
+
+#[tokio::test]
+async fn test_table_metadata_with_cold_storage() {
+    // This test uses NoopColdStorage which returns "none" as storage_type
+    // In production with real S3 or Iceberg storage, storage_type would be "s3" or "iceberg"
+    let (app, _dir) = create_test_app_with_cold_storage();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/user_events/metadata")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["table"], "user_events");
+    assert_eq!(json["storage_type"], "none"); // NoopColdStorage returns "none"
+    assert_eq!(json["iceberg_enabled"], false);
+}
+
+#[tokio::test]
+async fn test_flush_table_not_implemented() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/user_events/flush")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "not_implemented");
+    assert!(json["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("not yet wired"));
+}
+
+#[tokio::test]
+async fn test_compact_table_not_implemented() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/user_events/compact")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "not_implemented");
+    assert!(json["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("not yet wired"));
 }
 
 #[tokio::test]

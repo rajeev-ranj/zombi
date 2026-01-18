@@ -1,8 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rocksdb::{Options, WriteBatch, DB};
+use rayon::prelude::*;
+use rocksdb::{BlockBasedOptions, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 
 use crate::contracts::{HotStorage, SequenceGenerator, StorageError, StoredEvent};
 use crate::storage::AtomicSequenceGenerator;
@@ -21,6 +23,10 @@ pub struct RocksDbStorage {
     db: DB,
     /// Per-partition sequence generators (lock-free concurrent map)
     sequences: DashMap<(String, u32), Arc<AtomicSequenceGenerator>>,
+    /// Cached partitions per topic (avoids full scan on list_partitions)
+    partitions_cache: DashMap<String, HashSet<u32>>,
+    /// Cached topics (avoids full scan on list_topics)
+    topics_cache: DashMap<(), HashSet<String>>,
     /// Path for sequence persistence (reserved for future use)
     #[allow(dead_code)]
     data_path: std::path::PathBuf,
@@ -51,6 +57,13 @@ impl RocksDbStorage {
         opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
         opts.set_level_zero_file_num_compaction_trigger(4);
 
+        // Block cache: explicitly configure for read performance (#6)
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(128 * 1024 * 1024)); // 128MB cache
+        block_opts.set_block_size(16 * 1024); // 16KB blocks (good for sequential reads)
+        block_opts.set_cache_index_and_filter_blocks(true); // Cache index blocks too
+        opts.set_block_based_table_factory(&block_opts);
+
         // Disable WAL sync on every write for better throughput
         // (data is still durable after process crash, just not OS crash)
         opts.set_wal_dir(path.join("wal"));
@@ -60,6 +73,8 @@ impl RocksDbStorage {
         Ok(Self {
             db,
             sequences: DashMap::new(),
+            partitions_cache: DashMap::new(),
+            topics_cache: DashMap::new(),
             data_path: path.to_path_buf(),
         })
     }
@@ -85,32 +100,7 @@ impl RocksDbStorage {
     /// Loads the high watermark from the database.
     fn load_high_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
         let key = format!("{}:{}:{}", HWM_PREFIX, topic, partition);
-        match self.db.get(key.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let hwm = u64::from_be_bytes(
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| StorageError::Serialization("Invalid hwm bytes".into()))?,
-                );
-                Ok(hwm)
-            }
-            Ok(None) => Ok(0),
-            Err(e) => Err(StorageError::RocksDb(e.to_string())),
-        }
-    }
-
-    /// Saves the high watermark to the database.
-    fn save_high_watermark(
-        &self,
-        topic: &str,
-        partition: u32,
-        hwm: u64,
-    ) -> Result<(), StorageError> {
-        let key = format!("{}:{}:{}", HWM_PREFIX, topic, partition);
-        self.db
-            .put(key.as_bytes(), hwm.to_be_bytes())
-            .map_err(|e| StorageError::RocksDb(e.to_string()))
+        Ok(self.get_u64(&key)?.unwrap_or(0))
     }
 
     /// Creates an event key.
@@ -133,9 +123,89 @@ impl RocksDbStorage {
         bincode::serialize(event).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
+    /// Registers a partition in the cache (called on write).
+    /// Checks if already cached to avoid unnecessary writes (#6).
+    fn register_partition(&self, topic: &str, partition: u32) {
+        // Fast path: check if already cached
+        if let Some(partitions) = self.partitions_cache.get(topic) {
+            if partitions.contains(&partition) {
+                return;
+            }
+        }
+        // Slow path: insert into cache
+        self.partitions_cache
+            .entry(topic.to_string())
+            .or_default()
+            .insert(partition);
+    }
+
+    /// Registers a topic in the cache (called on write).
+    /// Checks if already cached to avoid unnecessary writes (#6).
+    fn register_topic(&self, topic: &str) {
+        // Fast path: check if already cached
+        if let Some(topics) = self.topics_cache.get(&()) {
+            if topics.contains(topic) {
+                return;
+            }
+        }
+        // Slow path: insert into cache
+        self.topics_cache
+            .entry(())
+            .or_default()
+            .insert(topic.to_string());
+    }
+
+    /// Creates optimized write options with WAL sync disabled (#4).
+    fn write_options() -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.disable_wal(true); // Skip WAL for throughput (data in memtable is still durable)
+        opts
+    }
+
+    /// Creates optimized read options for scanning with optional upper bound (#7).
+    fn read_options_with_bound(upper_bound: Option<&[u8]>) -> ReadOptions {
+        let mut opts = ReadOptions::default();
+        opts.set_verify_checksums(false); // Skip checksum for speed
+        opts.fill_cache(true); // Populate block cache
+        if let Some(bound) = upper_bound {
+            opts.set_iterate_upper_bound(bound.to_vec());
+        }
+        opts
+    }
+
+    /// Creates an upper bound key for a topic/partition (next partition prefix).
+    fn event_upper_bound(topic: &str, partition: u32) -> Vec<u8> {
+        // Upper bound is the next partition (partition + 1)
+        format!("{}:{}:{}:", EVENT_PREFIX, topic, partition + 1).into_bytes()
+    }
+
+    /// Creates a key prefix for a topic/partition as bytes.
+    fn event_prefix_bytes(topic: &str, partition: u32) -> Vec<u8> {
+        format!("{}:{}:{}:", EVENT_PREFIX, topic, partition).into_bytes()
+    }
+
     /// Deserializes bytes to a stored event using bincode.
     fn deserialize_event(bytes: &[u8]) -> Result<StoredEvent, StorageError> {
         bincode::deserialize(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
+    }
+
+    /// Parses a u64 from big-endian bytes.
+    #[inline]
+    fn parse_u64_be(bytes: &[u8]) -> Result<u64, StorageError> {
+        bytes
+            .try_into()
+            .map(u64::from_be_bytes)
+            .map_err(|_| StorageError::Serialization("Invalid u64 bytes".into()))
+    }
+
+    /// Gets a u64 value from the database by key.
+    #[inline]
+    fn get_u64(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        match self.db.get(key.as_bytes()) {
+            Ok(Some(bytes)) => Ok(Some(Self::parse_u64_be(&bytes)?)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(StorageError::RocksDb(e.to_string())),
+        }
     }
 }
 
@@ -193,12 +263,102 @@ impl HotStorage for RocksDbStorage {
         let hwm_key = format!("{}:{}:{}", HWM_PREFIX, topic, partition);
         batch.put(hwm_key.as_bytes(), sequence.to_be_bytes());
 
-        // Single atomic write for all operations
+        // Single atomic write for all operations (with WAL disabled for throughput #4)
         self.db
-            .write(batch)
+            .write_opt(batch, &Self::write_options())
             .map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
+        // Register partition and topic in cache for fast lookups
+        self.register_partition(topic, partition);
+        self.register_topic(topic);
+
         Ok(sequence)
+    }
+
+    fn write_batch(
+        &self,
+        topic: &str,
+        events: &[crate::contracts::BulkWriteEvent],
+    ) -> Result<Vec<u64>, StorageError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sequences = Vec::with_capacity(events.len());
+        let mut batch = WriteBatch::default();
+
+        // Track high watermarks per partition
+        let mut partition_hwms: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
+        // Track partitions to register
+        let mut partitions_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        for event in events {
+            // Check idempotency first
+            if let Some(ref idem_key) = event.idempotency_key {
+                if let Some(existing_offset) =
+                    self.get_idempotency_offset(topic, event.partition, idem_key)?
+                {
+                    sequences.push(existing_offset);
+                    continue;
+                }
+            }
+
+            // Get next sequence for this partition
+            let seq_gen = self.get_sequence(topic, event.partition)?;
+            let sequence = seq_gen
+                .next()
+                .map_err(|e| StorageError::RocksDb(e.to_string()))?;
+
+            // Create stored event
+            let stored_event = StoredEvent {
+                sequence,
+                topic: topic.to_string(),
+                partition: event.partition,
+                payload: event.payload.clone(),
+                timestamp_ms: event.timestamp_ms,
+                idempotency_key: event.idempotency_key.clone(),
+            };
+
+            // Serialize and add to batch
+            let event_bytes = Self::serialize_event(&stored_event)?;
+            let event_key = Self::event_key(topic, event.partition, sequence);
+            batch.put(event_key.as_bytes(), &event_bytes);
+
+            // Add idempotency mapping if present
+            if let Some(ref idem_key) = event.idempotency_key {
+                let idem_db_key = Self::idempotency_key(topic, event.partition, idem_key);
+                batch.put(idem_db_key.as_bytes(), sequence.to_be_bytes());
+            }
+
+            // Track high watermark for this partition
+            partition_hwms
+                .entry(event.partition)
+                .and_modify(|hwm| *hwm = (*hwm).max(sequence))
+                .or_insert(sequence);
+
+            partitions_seen.insert(event.partition);
+            sequences.push(sequence);
+        }
+
+        // Add high watermark updates for all partitions
+        for (partition, hwm) in &partition_hwms {
+            let hwm_key = format!("{}:{}:{}", HWM_PREFIX, topic, partition);
+            batch.put(hwm_key.as_bytes(), hwm.to_be_bytes());
+        }
+
+        // Single atomic write for ALL events (with WAL disabled for throughput)
+        self.db
+            .write_opt(batch, &Self::write_options())
+            .map_err(|e| StorageError::RocksDb(e.to_string()))?;
+
+        // Register partitions and topic in cache
+        for partition in partitions_seen {
+            self.register_partition(topic, partition);
+        }
+        self.register_topic(topic);
+
+        Ok(sequences)
     }
 
     fn read(
@@ -209,14 +369,16 @@ impl HotStorage for RocksDbStorage {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         let mut events = Vec::with_capacity(limit);
-        let prefix = format!("{}:{}:{}:", EVENT_PREFIX, topic, partition);
+        let prefix_bytes = Self::event_prefix_bytes(topic, partition);
 
-        // Create iterator starting at the offset
+        // Create iterator with optimized read options and upper bound (#7)
         let start_key = Self::event_key(topic, partition, offset);
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            start_key.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let upper_bound = Self::event_upper_bound(topic, partition);
+        let read_opts = Self::read_options_with_bound(Some(&upper_bound));
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
+            read_opts,
+        );
 
         for item in iter {
             if events.len() >= limit {
@@ -224,10 +386,9 @@ impl HotStorage for RocksDbStorage {
             }
 
             let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
-            let key_str = String::from_utf8_lossy(&key);
 
-            // Stop if we've left our prefix
-            if !key_str.starts_with(&prefix) {
+            // Byte-based prefix check (no String allocation)
+            if !key.starts_with(&prefix_bytes) {
                 break;
             }
 
@@ -243,23 +404,28 @@ impl HotStorage for RocksDbStorage {
     }
 
     fn low_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
-        let prefix = format!("{}:{}:{}:", EVENT_PREFIX, topic, partition);
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let prefix_bytes = Self::event_prefix_bytes(topic, partition);
+        let upper_bound = Self::event_upper_bound(topic, partition);
+        let read_opts = Self::read_options_with_bound(Some(&upper_bound));
+
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
 
         for item in iter {
             let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
-            let key_str = String::from_utf8_lossy(&key);
 
-            if !key_str.starts_with(&prefix) {
+            // Byte-based prefix check (no String allocation) (#3)
+            if !key.starts_with(&prefix_bytes) {
                 break;
             }
 
-            // Parse sequence from key
-            if let Some(seq_hex) = key_str.strip_prefix(&prefix) {
-                if let Ok(seq) = u64::from_str_radix(seq_hex, 16) {
+            // Parse sequence from key bytes (after prefix)
+            // Key format: evt:topic:partition:SEQUENCE_HEX
+            let seq_bytes = &key[prefix_bytes.len()..];
+            if let Ok(seq_str) = std::str::from_utf8(seq_bytes) {
+                if let Ok(seq) = u64::from_str_radix(seq_str, 16) {
                     return Ok(seq);
                 }
             }
@@ -275,19 +441,7 @@ impl HotStorage for RocksDbStorage {
         idempotency_key: &str,
     ) -> Result<Option<u64>, StorageError> {
         let key = Self::idempotency_key(topic, partition, idempotency_key);
-        match self.db.get(key.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let offset = u64::from_be_bytes(
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| StorageError::Serialization("Invalid offset bytes".into()))?,
-                );
-                Ok(Some(offset))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::RocksDb(e.to_string())),
-        }
+        self.get_u64(&key)
     }
 
     fn commit_offset(
@@ -310,24 +464,18 @@ impl HotStorage for RocksDbStorage {
         partition: u32,
     ) -> Result<Option<u64>, StorageError> {
         let key = Self::consumer_offset_key(group, topic, partition);
-        match self.db.get(key.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let offset = u64::from_be_bytes(
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| StorageError::Serialization("Invalid offset bytes".into()))?,
-                );
-                Ok(Some(offset))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::RocksDb(e.to_string())),
-        }
+        self.get_u64(&key)
     }
 
     fn list_partitions(&self, topic: &str) -> Result<Vec<u32>, StorageError> {
-        use std::collections::HashSet;
+        // Check cache first - O(1) lookup vs full table scan
+        if let Some(partitions) = self.partitions_cache.get(topic) {
+            let mut result: Vec<u32> = partitions.iter().copied().collect();
+            result.sort();
+            return Ok(result);
+        }
 
+        // Cache miss - fall back to scan (populates cache for next time)
         let mut partitions = HashSet::new();
         let prefix = format!("{}:{}:", EVENT_PREFIX, topic);
 
@@ -355,14 +503,28 @@ impl HotStorage for RocksDbStorage {
             }
         }
 
+        // Populate cache for future calls
+        if !partitions.is_empty() {
+            self.partitions_cache
+                .entry(topic.to_string())
+                .or_default()
+                .extend(partitions.iter().copied());
+        }
+
         let mut result: Vec<u32> = partitions.into_iter().collect();
         result.sort();
         Ok(result)
     }
 
     fn list_topics(&self) -> Result<Vec<String>, StorageError> {
-        use std::collections::HashSet;
+        // Check cache first - O(1) lookup vs full table scan (#4)
+        if let Some(topics) = self.topics_cache.get(&()) {
+            let mut result: Vec<String> = topics.iter().cloned().collect();
+            result.sort();
+            return Ok(result);
+        }
 
+        // Cache miss - fall back to scan (populates cache for next time)
         let mut topics = HashSet::new();
         let prefix = format!("{}:", EVENT_PREFIX);
 
@@ -387,6 +549,14 @@ impl HotStorage for RocksDbStorage {
             }
         }
 
+        // Populate cache for future calls
+        if !topics.is_empty() {
+            self.topics_cache
+                .entry(())
+                .or_default()
+                .extend(topics.iter().cloned());
+        }
+
         let mut result: Vec<String> = topics.into_iter().collect();
         result.sort();
         Ok(result)
@@ -395,6 +565,7 @@ impl HotStorage for RocksDbStorage {
     fn read_all_partitions(
         &self,
         topic: &str,
+        start_offsets: Option<&HashMap<u32, u64>>,
         start_timestamp_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
@@ -404,12 +575,24 @@ impl HotStorage for RocksDbStorage {
             return Ok(Vec::new());
         }
 
-        // Read from all partitions (use a reasonable per-partition limit)
+        // Read from all partitions in parallel using rayon
         let per_partition_limit = limit.saturating_mul(2).max(1000);
+
+        let results: Vec<Result<Vec<StoredEvent>, StorageError>> = partitions
+            .par_iter()
+            .map(|&partition| {
+                // Use start_offset if provided, otherwise start from 0
+                let offset = start_offsets
+                    .and_then(|offsets| offsets.get(&partition).copied())
+                    .unwrap_or(0);
+                self.read(topic, partition, offset, per_partition_limit)
+            })
+            .collect();
+
+        // Collect results, propagating any errors
         let mut all_events = Vec::new();
-        for partition in partitions {
-            let events = self.read(topic, partition, 0, per_partition_limit)?;
-            all_events.extend(events);
+        for result in results {
+            all_events.extend(result?);
         }
 
         // Filter by timestamp if specified
@@ -603,5 +786,157 @@ mod tests {
             storage.get_offset("group-b", "test-topic", 0).unwrap(),
             Some(200)
         );
+    }
+
+    // =========================================================================
+    // Edge Case Tests
+    // =========================================================================
+
+    #[test]
+    fn empty_payload_is_valid() {
+        let (storage, _dir) = create_test_storage();
+        let offset = storage.write("test-topic", 0, b"", 0, None).unwrap();
+        let events = storage.read("test-topic", 0, offset, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, b"");
+    }
+
+    #[test]
+    fn large_payload_1mb() {
+        let (storage, _dir) = create_test_storage();
+        let payload = vec![0u8; 1_000_000]; // 1MB
+        let offset = storage.write("test-topic", 0, &payload, 0, None).unwrap();
+        let events = storage.read("test-topic", 0, offset, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.len(), 1_000_000);
+    }
+
+    #[test]
+    fn special_characters_in_topic_name() {
+        let (storage, _dir) = create_test_storage();
+        let offset = storage.write("topic-with_special.chars", 0, b"data", 0, None);
+        assert!(offset.is_ok());
+
+        let events = storage.read("topic-with_special.chars", 0, 0, 100).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn read_empty_topic_returns_empty() {
+        let (storage, _dir) = create_test_storage();
+        let events = storage.read("nonexistent", 0, 0, 100).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn read_empty_partition_returns_empty() {
+        let (storage, _dir) = create_test_storage();
+        // Write to partition 0
+        storage.write("test-topic", 0, b"data", 0, None).unwrap();
+        // Read from partition 1 (empty)
+        let events = storage.read("test-topic", 1, 0, 100).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn read_beyond_high_watermark_returns_empty() {
+        let (storage, _dir) = create_test_storage();
+        for _ in 0..10 {
+            storage.write("test-topic", 0, b"data", 0, None).unwrap();
+        }
+        // Read from offset 100 (beyond high watermark of 10)
+        let events = storage.read("test-topic", 0, 100, 100).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn zero_limit_returns_empty() {
+        let (storage, _dir) = create_test_storage();
+        storage.write("test-topic", 0, b"data", 0, None).unwrap();
+        let events = storage.read("test-topic", 0, 0, 0).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn binary_payload_preserved() {
+        let (storage, _dir) = create_test_storage();
+        // Binary data with null bytes and all byte values
+        let payload: Vec<u8> = (0..=255).collect();
+        let offset = storage.write("test-topic", 0, &payload, 0, None).unwrap();
+        let events = storage.read("test-topic", 0, offset, 1).unwrap();
+        assert_eq!(events[0].payload, payload);
+    }
+
+    #[test]
+    fn unicode_topic_name() {
+        let (storage, _dir) = create_test_storage();
+        let offset = storage.write("日本語-topic-émoji-🎉", 0, b"data", 0, None);
+        assert!(offset.is_ok());
+
+        let events = storage.read("日本語-topic-émoji-🎉", 0, 0, 100).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn very_long_topic_name() {
+        let (storage, _dir) = create_test_storage();
+        let long_topic = "a".repeat(1000);
+        let offset = storage.write(&long_topic, 0, b"data", 0, None);
+        assert!(offset.is_ok());
+
+        let events = storage.read(&long_topic, 0, 0, 100).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn very_long_idempotency_key() {
+        let (storage, _dir) = create_test_storage();
+        let long_key = "k".repeat(1000);
+        let offset1 = storage
+            .write("test-topic", 0, b"data", 0, Some(&long_key))
+            .unwrap();
+        let offset2 = storage
+            .write("test-topic", 0, b"data", 0, Some(&long_key))
+            .unwrap();
+        assert_eq!(offset1, offset2);
+    }
+
+    #[test]
+    fn max_timestamp() {
+        let (storage, _dir) = create_test_storage();
+        let offset = storage
+            .write("test-topic", 0, b"data", i64::MAX, None)
+            .unwrap();
+        let events = storage.read("test-topic", 0, offset, 1).unwrap();
+        assert_eq!(events[0].timestamp_ms, i64::MAX);
+    }
+
+    #[test]
+    fn high_partition_number() {
+        let (storage, _dir) = create_test_storage();
+        let offset = storage.write("test-topic", 1000, b"data", 0, None).unwrap();
+        let events = storage.read("test-topic", 1000, offset, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].partition, 1000);
+    }
+
+    #[test]
+    fn consumer_offset_zero_is_valid() {
+        let (storage, _dir) = create_test_storage();
+        storage
+            .commit_offset("test-group", "test-topic", 0, 0)
+            .unwrap();
+        let offset = storage.get_offset("test-group", "test-topic", 0).unwrap();
+        assert_eq!(offset, Some(0));
+    }
+
+    #[test]
+    fn consumer_offset_max_value() {
+        let (storage, _dir) = create_test_storage();
+        storage
+            .commit_offset("test-group", "test-topic", 0, u64::MAX)
+            .unwrap();
+        let offset = storage.get_offset("test-group", "test-topic", 0).unwrap();
+        assert_eq!(offset, Some(u64::MAX));
     }
 }

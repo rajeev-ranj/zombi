@@ -1,97 +1,183 @@
-# Zombi Specification
+# Zombi Specification v2.0
 
-> A Kafka-replacement streaming proxy with RocksDB hot storage and S3 cold storage.
+> The lowest-cost path from events to Iceberg, with optional streaming support.
 
 ---
 
-## Overview
+## Vision
 
-Zombi is a lightweight event streaming system designed for:
-- **Simplicity**: Single binary, no ZooKeeper, no broker cluster
-- **Low latency**: Sub-millisecond writes to RocksDB
-- **Cost efficiency**: Cold storage on S3, 10x cheaper than Kafka
-- **Unified API**: Iceberg-style table interface abstracts storage tiers
+**Problem:** Getting data into Iceberg today requires expensive, complex infrastructure:
+```
+Producer → Kafka ($$$) → Flink/Spark ($$$) → Iceberg
+           Complex        Complex             Finally queryable
+```
+
+**Zombi's Solution:** Direct ingestion to Iceberg with minimal infrastructure:
+```
+Producer → Zombi → Iceberg
+           Simple   Queryable by Spark/Trino/DuckDB
+```
+
+**Secondary Goal:** Replace Kafka for simple streaming use cases where consumers need real-time access to recent events.
 
 ---
 
 ## Architecture
 
+### Single Node (Current)
 ```
-Producers → HTTP API → RocksDB (hot) → BackgroundFlusher → S3 (cold)
-                              ↑                              ↑
-                              └────── Unified Read ──────────┘
+Producer → HTTP API → RocksDB (hot) → Flusher → Iceberg (S3)
+                           │                        │
+                           ↓                        ↓
+                    Streaming Consumer      Analytics (Spark/Trino)
 ```
 
-### Storage Tiers
-
-| Tier | Technology | Latency | Retention |
-|------|------------|---------|-----------|
-| L1 Hot | RocksDB | <1ms | Hours |
-| L2 Cold | S3 JSON Segments | 10-50ms | Forever |
+### Multi-Node (Target)
+```
+                    ┌─────────────────────────────────────┐
+                    │         Zombi Cluster               │
+Producer → LB ────→ │  ┌──────────┐  ┌──────────┐        │
+                    │  │ Proxy 1  │  │ Proxy 2  │        │
+                    │  │ RocksDB  │  │ RocksDB  │        │
+                    │  └────┬─────┘  └────┬─────┘        │
+                    └───────┼─────────────┼──────────────┘
+                            │             │
+                            └──────┬──────┘
+                                   ↓
+                             ┌──────────┐
+                             │  Redis   │ (offset coordination)
+                             └────┬─────┘
+                                  ↓
+                          ┌──────────────┐
+                          │   Iceberg    │ ←── Spark/Trino/DuckDB
+                          │  (S3/GCS)    │
+                          └──────────────┘
+```
 
 ---
 
-## Core Components
+## Storage Tiers
 
-### 1. Event
-The fundamental data unit.
+| Tier | Technology | Purpose | Latency | Retention |
+|------|------------|---------|---------|-----------|
+| **L1 Hot** | RocksDB | Streaming consumers | <1ms | Hours |
+| **L2 Cold** | Iceberg (Parquet) | Analytics queries | 50-500ms | Forever |
 
-```protobuf
-message Event {
-  bytes payload = 1;           // Arbitrary bytes
-  int64 timestamp_ms = 2;      // Producer timestamp
-  string idempotency_key = 3;  // For deduplication
-  map<string, string> headers = 4;
-}
+### Design Principles
+
+1. **Iceberg is the source of truth** - All data eventually lands in Iceberg
+2. **RocksDB is ephemeral** - A write buffer for streaming, not permanent storage
+3. **Stateless reads for analytics** - Query engines read Iceberg directly
+4. **Simple streaming** - Offset-based reads for real-time consumers
+
+---
+
+## Data Flow
+
+### Write Path
+```
+1. Producer sends event via HTTP
+2. Zombi writes to RocksDB (sub-ms, durable via WAL)
+3. Returns offset to producer
+4. Background flusher batches events
+5. Writes Parquet file to S3
+6. Commits Iceberg metadata (atomic)
+7. Optional: Register with REST catalog
 ```
 
-### 2. Sequence Generator
-Assigns monotonically increasing sequence numbers per partition.
-
-**Invariants:**
-- `seq[n+1] > seq[n]` always
-- Survives process restart
-- Lock-free in hot path
-
-### 3. Hot Storage (RocksDB)
-Embedded key-value store for recent events.
-
-**Key format:** `evt:{table}:{partition}:{sequence:016x}`
-**Value:** Serialized StoredEvent (JSON)
-
-**Operations:**
-- `write(table, partition, event) → sequence`
-- `read_all_partitions(table, since, limit) → Vec<Event>`
-- `list_topics() → Vec<String>`
-- `list_partitions(table) → Vec<u32>`
-
-### 4. Cold Storage (S3)
-Long-term storage for archived events.
-
-**Segment format:** `segments/{table}/{partition}/{start:016x}-{end:016x}.json`
-
-**Operations:**
-- `write_segment(table, partition, events) → segment_id`
-- `read_events(table, partition, offset, limit) → Vec<Event>`
-- `list_segments(table, partition) → Vec<SegmentInfo>`
-
-### 5. Background Flusher
-Automatically moves data from hot to cold storage.
-
-**Behavior:**
-- Discovers topics/partitions from RocksDB
-- Triggers every N seconds (configurable)
-- Writes JSON segments to S3
-- Tracks flush watermarks per partition
-
-### 6. HTTP API
-
-#### Write Records
+### Read Path - Streaming
 ```
+Consumer: GET /tables/{table}/stream?partition=0&offset=1000
+
+1. Read from RocksDB by offset
+2. Return events in sequence order
+3. Consumer tracks offset, commits periodically
+```
+
+### Read Path - Analytics
+```
+Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
+
+1. Query engine reads Iceberg metadata
+2. Prunes partitions based on query
+3. Reads Parquet files directly from S3
+4. Zombi not involved (stateless)
+```
+
+---
+
+## Iceberg Integration
+
+### Table Format
+- **Format Version:** Iceberg v2 (v3 when stable)
+- **File Format:** Parquet with Zstd compression
+- **Partitioning:** By event date/hour (configurable)
+
+### Schema
+```
+┌─────────────────┬──────────┬──────────┐
+│ Field           │ Type     │ Required │
+├─────────────────┼──────────┼──────────┤
+│ sequence        │ long     │ yes      │
+│ topic           │ string   │ yes      │
+│ partition       │ int      │ yes      │
+│ payload         │ binary   │ yes      │
+│ timestamp_ms    │ long     │ yes      │
+│ idempotency_key │ string   │ no       │
+│ event_date      │ date     │ yes      │  ← partition column
+│ event_hour      │ int      │ yes      │  ← partition column
+└─────────────────┴──────────┴──────────┘
+```
+
+### Directory Layout
+```
+s3://bucket/tables/{topic}/
+├── metadata/
+│   ├── v1.metadata.json
+│   ├── v2.metadata.json
+│   └── snap-{id}.avro
+└── data/
+    └── event_date=2024-01-15/
+        └── event_hour=14/
+            └── partition=0/
+                ├── {uuid}-00001.parquet
+                └── {uuid}-00002.parquet
+```
+
+### Catalog Support
+| Catalog | Status | Use Case |
+|---------|--------|----------|
+| Filesystem | ✅ Implemented | Development, simple deployments |
+| REST Catalog | ✅ Implemented | Production (AWS Glue, Tabular, etc.) |
+| Hive Metastore | Planned | Legacy Hadoop environments |
+
+### Query Engine Compatibility
+| Engine | Support | Notes |
+|--------|---------|-------|
+| Apache Spark | ✅ | Via Iceberg connector |
+| Trino/Presto | ✅ | Via Iceberg connector |
+| DuckDB | ✅ | Via iceberg extension |
+| Athena | ✅ | Native Iceberg support |
+| Snowflake | ✅ | External Iceberg tables |
+| Databricks | ✅ | Unity Catalog or external |
+
+---
+
+## API Specification
+
+### Write Events
+
+**Single Event:**
+```http
 POST /tables/{table}
 Content-Type: application/json
 
-{"payload": "hello world", "partition": 0}
+{
+  "payload": "base64-or-string",
+  "partition": 0,
+  "timestamp_ms": 1704067200000,
+  "idempotency_key": "unique-key"
+}
 
 Response 202:
 {
@@ -101,163 +187,212 @@ Response 202:
 }
 ```
 
-Or with protobuf:
-```
-POST /tables/{table}
-Content-Type: application/x-protobuf
-X-Partition: 0
+**Bulk Write:**
+```http
+POST /tables/{table}/bulk
+Content-Type: application/json
 
-<protobuf Event>
+{
+  "events": [
+    {"partition": 0, "payload": "event1"},
+    {"partition": 0, "payload": "event2"},
+    {"partition": 1, "payload": "event3"}
+  ]
+}
+
+Response 202:
+{
+  "offsets": [12345, 12346, 12347],
+  "count": 3
+}
 ```
 
-#### Read Records
-Reads from all partitions, merged by timestamp. Partitions are abstracted away.
+### Read Events - Streaming
 
-```
-GET /tables/{table}
-GET /tables/{table}?limit=100
-GET /tables/{table}?since=1704067200000
+**By Offset (for streaming consumers):**
+```http
+GET /tables/{table}/stream?partition=0&offset=1000&limit=100
 
 Response 200:
 {
-  "records": [
-    {"payload": "hello", "timestamp_ms": 1704067200000},
-    {"payload": "world", "timestamp_ms": 1704067201000}
+  "events": [
+    {"sequence": 1000, "payload": "...", "timestamp_ms": ...},
+    {"sequence": 1001, "payload": "...", "timestamp_ms": ...}
   ],
-  "count": 2,
-  "has_more": false
+  "next_offset": 1100,
+  "has_more": true
 }
 ```
 
-#### Consumer Offsets
+**Long Polling (optional):**
+```http
+GET /tables/{table}/stream?partition=0&offset=1000&wait_ms=5000
+
+Waits up to 5 seconds for new events if none available.
 ```
-POST /consumers/{group}/commit
+
+### Read Events - Simple Query
+
+**For light queries (not analytics):**
+```http
+GET /tables/{table}?since=1704067200000&limit=100
+
+Response 200:
 {
-  "topic": "events",
-  "partition": 0,
-  "offset": 200
+  "records": [...],
+  "count": 100,
+  "has_more": true
 }
+```
+
+### Consumer Offsets
+
+```http
+POST /consumers/{group}/commit
+{"topic": "events", "partition": 0, "offset": 2000}
 
 GET /consumers/{group}/offset?topic=events&partition=0
-{
-  "group": "my-group",
-  "topic": "events",
-  "partition": 0,
-  "offset": 200
-}
+{"offset": 2000}
 ```
 
-#### Health Check
-```
+### Admin APIs
+
+```http
 GET /health
-
-{"status": "healthy"}
-```
-
-#### Server Metrics
-```
 GET /stats
-
-Response 200:
-{
-  "uptime_secs": 123.45,
-  "writes": {
-    "total": 1000,
-    "bytes_total": 50000,
-    "rate_per_sec": 8.1,
-    "avg_latency_us": 45.2
-  },
-  "reads": {
-    "total": 200,
-    "records_total": 5000,
-    "rate_per_sec": 1.6,
-    "avg_latency_us": 120.5
-  },
-  "errors_total": 0
-}
+GET /tables                    # List all tables
+GET /tables/{table}/metadata   # Iceberg metadata location
+POST /tables/{table}/compact   # Trigger compaction
+POST /tables/{table}/flush     # Force flush to Iceberg
 ```
 
-**Metrics tracked:**
-- `writes_total`: Total write requests
-- `writes_bytes`: Total bytes written
-- `write_latency_sum_us`: Cumulative write latency (microseconds)
-- `reads_total`: Total read requests
-- `read_records_total`: Total records returned
-- `read_latency_sum_us`: Cumulative read latency (microseconds)
-- `errors_total`: Total error responses
-
-### 7. Unified Read Path
-Transparently merges data from hot and cold storage:
-
-1. Read from RocksDB (all partitions)
-2. Read from S3 (all partitions, if configured)
-3. Merge by timestamp
-4. Deduplicate
-5. Apply limit
-
 ---
 
-## Invariants
+## Scalability
 
-These MUST always hold:
+### Single Node Limits
+- Writes: ~50,000 events/sec
+- Storage: Limited by local disk
+- Suitable for: Small-medium workloads, development
 
-| ID | Invariant | Description |
-|----|-----------|-------------|
-| INV-1 | Monotonic | Sequence numbers never go backwards |
-| INV-2 | No Loss | Every ACKed write is readable |
-| INV-3 | Order | Events read in timestamp order |
-| INV-4 | Idem | Same idempotency key = same offset |
-| INV-5 | Isolation | Partition data stays in partition |
-| INV-6 | Recovery | Data survives crash after ACK |
+### Multi-Node Architecture
 
----
+**Coordination via Redis:**
+```
+Redis stores:
+  offset:{topic}:{partition} → next offset (atomic increment)
+  consumer:{group}:{topic}:{partition} → committed offset
+  flush:{topic}:{partition} → flush watermark
+```
 
-## Error Handling
+**Scaling Strategy:**
+1. **Writes:** Any proxy can accept writes (Redis coordinates offsets)
+2. **Streaming reads:** Route to proxy that has data in RocksDB, or read from Iceberg
+3. **Analytics:** Direct to Iceberg (Zombi not involved)
 
-| Error | HTTP Code | Behavior |
-|-------|-----------|----------|
-| Invalid JSON/protobuf | 400 | Reject, no retry |
-| Table not found | 200 | Return empty records |
-| S3 unavailable | 200 | Return hot storage only |
-| RocksDB error | 500 | Return error |
+**Consistency Model:**
+- Writes: Strongly consistent (Redis atomic increment)
+- Streaming reads: Eventually consistent (local RocksDB or Iceberg)
+- Analytics: Read committed (Iceberg snapshots)
+
+### Partition Strategy
+- Producers specify partition (hash-based or explicit)
+- Each partition has independent offset sequence
+- Partitions can be distributed across proxies
 
 ---
 
 ## Configuration
 
-Environment variables:
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZOMBI_DATA_DIR` | `./data` | RocksDB data directory |
-| `ZOMBI_HOST` | `0.0.0.0` | HTTP server host |
-| `ZOMBI_PORT` | `8080` | HTTP server port |
-| `ZOMBI_S3_BUCKET` | - | S3 bucket (enables cold storage) |
-| `ZOMBI_S3_ENDPOINT` | AWS | Custom S3 endpoint (for MinIO) |
+| **Core** |
+| `ZOMBI_DATA_DIR` | `./data` | RocksDB directory |
+| `ZOMBI_HOST` | `0.0.0.0` | HTTP bind address |
+| `ZOMBI_PORT` | `8080` | HTTP port |
+| **Storage** |
+| `ZOMBI_S3_BUCKET` | - | S3 bucket (required for Iceberg) |
+| `ZOMBI_S3_ENDPOINT` | AWS | Custom endpoint (MinIO) |
 | `ZOMBI_S3_REGION` | `us-east-1` | AWS region |
-| `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | Flush interval in seconds |
-| `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | Min events before flush |
-| `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per segment |
+| `ZOMBI_STORAGE_PATH` | `tables` | Base path in bucket |
+| **Iceberg** |
+| `ZOMBI_ICEBERG_ENABLED` | `true` | Enable Iceberg output |
+| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size |
+| `ZOMBI_FLUSH_INTERVAL_SECS` | `30` | Flush interval |
+| `ZOMBI_FLUSH_MIN_EVENTS` | `10000` | Min events before flush |
+| **Catalog** |
+| `ZOMBI_CATALOG_TYPE` | `filesystem` | `filesystem` or `rest` |
+| `ZOMBI_CATALOG_URL` | - | REST catalog URL |
+| `ZOMBI_CATALOG_NAMESPACE` | `zombi` | Iceberg namespace |
+| **Scaling** |
+| `ZOMBI_REDIS_URL` | - | Redis URL (enables multi-node) |
+| `ZOMBI_NODE_ID` | `auto` | Unique node identifier |
+| **Observability** |
 | `RUST_LOG` | `zombi=info` | Log level |
 
 ---
 
-## Non-Goals (v0.1)
+## Invariants
 
-- Replication / HA
-- Consumer groups with rebalancing
-- Iceberg/Parquet format
-- Exactly-once semantics
-- Multi-tenancy
-- Authentication
+| ID | Invariant | Scope |
+|----|-----------|-------|
+| INV-1 | Sequences are monotonically increasing | Per partition |
+| INV-2 | No data loss after ACK | Always |
+| INV-3 | Order preserved within partition | Per partition |
+| INV-4 | Idempotent writes | Per partition |
+| INV-5 | Iceberg commits are atomic | Always |
+| INV-6 | Compaction preserves all data | Always |
 
 ---
 
-## Future (v0.2+)
+## Non-Goals
 
-- Consumer group rebalancing
-- Iceberg/Parquet cold storage
-- gRPC API
-- Raft replication
-- Schema registry integration
-- Prometheus metrics
+These are explicitly **not** in scope:
+
+- **Exactly-once delivery** - At-least-once with idempotency keys
+- **Complex stream processing** - Use Flink/Spark for that
+- **Schema enforcement** - Payload is opaque bytes
+- **Multi-tenancy** - Single tenant per deployment
+- **Transaction support** - Append-only model
+- **Message replay by time** - Use Iceberg time travel instead
+
+---
+
+## Comparison
+
+| Feature | Kafka | Zombi |
+|---------|-------|-------|
+| Streaming | Full-featured | Simple (offset-based) |
+| Analytics | Requires ETL | Native Iceberg |
+| Infrastructure | Brokers + ZK/KRaft | Single binary + S3 |
+| Cost | $$$ | $ |
+| Latency (write) | ~5ms | <1ms |
+| Latency (analytics) | N/A | 50-500ms (Iceberg) |
+| Retention | Expensive | Cheap (S3) |
+| Query engines | Limited | Spark/Trino/DuckDB/etc |
+
+**Use Zombi when:**
+- Primary goal is analytics on event data
+- Simple streaming needs (few consumers)
+- Cost is a concern
+- Want to query with standard SQL engines
+
+**Use Kafka when:**
+- Complex streaming topologies
+- Many consumer groups with rebalancing
+- Exactly-once semantics required
+- Kafka Connect ecosystem needed
+
+---
+
+## Version History
+
+| Version | Status | Key Features |
+|---------|--------|--------------|
+| v0.1 | ✅ Done | RocksDB + S3 JSON |
+| v0.2 | ✅ Done | Iceberg/Parquet output |
+| v0.3 | 🚧 Next | Partitioning, catalog registration |
+| v0.4 | Planned | Redis coordination (multi-node) |
+| v1.0 | Planned | Production ready |

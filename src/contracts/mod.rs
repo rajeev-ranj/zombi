@@ -4,8 +4,8 @@ pub mod flusher;
 pub mod sequence;
 pub mod storage;
 
-pub use cold_storage::{ColdStorage, SegmentInfo};
-pub use error::{SequenceError, StorageError, ZombiError};
+pub use cold_storage::{ColdStorage, ColdStorageInfo, SegmentInfo};
+pub use error::{LockResultExt, SequenceError, StorageError, ZombiError};
 pub use flusher::{FlushResult, Flusher};
 pub use sequence::SequenceGenerator;
-pub use storage::{HotStorage, StoredEvent};
+pub use storage::{BulkWriteEvent, HotStorage, StoredEvent};

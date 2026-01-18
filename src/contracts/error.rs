@@ -1,3 +1,5 @@
+use std::sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard};
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -12,6 +14,30 @@ pub enum ZombiError {
     Serialization(String),
 }
 
+/// Extension trait for converting lock errors to StorageError.
+pub trait LockResultExt<T> {
+    /// Converts a lock error to a StorageError.
+    fn map_lock_err(self) -> Result<T, StorageError>;
+}
+
+impl<'a, T> LockResultExt<RwLockReadGuard<'a, T>>
+    for Result<RwLockReadGuard<'a, T>, PoisonError<RwLockReadGuard<'a, T>>>
+{
+    #[inline]
+    fn map_lock_err(self) -> Result<RwLockReadGuard<'a, T>, StorageError> {
+        self.map_err(|e| StorageError::S3(format!("Lock error: {}", e)))
+    }
+}
+
+impl<'a, T> LockResultExt<RwLockWriteGuard<'a, T>>
+    for Result<RwLockWriteGuard<'a, T>, PoisonError<RwLockWriteGuard<'a, T>>>
+{
+    #[inline]
+    fn map_lock_err(self) -> Result<RwLockWriteGuard<'a, T>, StorageError> {
+        self.map_err(|e| StorageError::S3(format!("Lock error: {}", e)))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("RocksDB error: {0}")]
@@ -19,6 +45,9 @@ pub enum StorageError {
 
     #[error("S3 error: {0}")]
     S3(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 
     #[error("Topic not found: {0}")]
     TopicNotFound(String),

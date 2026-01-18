@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::contracts::{ColdStorage, FlushResult, Flusher, HotStorage, StorageError};
+use crate::contracts::{
+    ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError,
+};
 
 /// Configuration for the background flusher.
 #[derive(Debug, Clone)]
@@ -17,6 +19,11 @@ pub struct FlusherConfig {
     pub batch_size: usize,
     /// Maximum events per segment
     pub max_segment_size: usize,
+    /// Target size in bytes for each Parquet file (for Iceberg)
+    /// Default: 128MB (Iceberg recommended)
+    pub target_file_size_bytes: usize,
+    /// Enable Iceberg metadata management
+    pub iceberg_enabled: bool,
 }
 
 impl Default for FlusherConfig {
@@ -25,6 +32,21 @@ impl Default for FlusherConfig {
             interval: Duration::from_secs(5),
             batch_size: 1000,
             max_segment_size: 10000,
+            target_file_size_bytes: 128 * 1024 * 1024, // 128MB
+            iceberg_enabled: false,
+        }
+    }
+}
+
+impl FlusherConfig {
+    /// Creates a config optimized for Iceberg with size-based flushing.
+    pub fn iceberg_defaults() -> Self {
+        Self {
+            interval: Duration::from_secs(30),         // Less frequent checks
+            batch_size: 10000,                         // More events per batch
+            max_segment_size: 100000,                  // Larger segments for Iceberg
+            target_file_size_bytes: 128 * 1024 * 1024, // 128MB target
+            iceberg_enabled: true,
         }
     }
 }
@@ -71,10 +93,7 @@ where
 
     /// Registers a topic/partition for flushing.
     pub fn register_topic(&self, topic: String, partition: u32) -> Result<(), StorageError> {
-        let mut topics = self
-            .topics
-            .write()
-            .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+        let mut topics = self.topics.write().map_lock_err()?;
         let key = (topic, partition);
         if !topics.contains(&key) {
             topics.push(key);
@@ -83,6 +102,10 @@ where
     }
 
     /// Flushes a single topic/partition.
+    ///
+    /// When `iceberg_enabled` is true, uses `target_file_size_bytes` to limit
+    /// the segment size instead of event count alone.
+    #[allow(clippy::too_many_arguments)]
     async fn flush_partition(
         hot_storage: &H,
         cold_storage: &C,
@@ -90,6 +113,8 @@ where
         partition: u32,
         watermark: u64,
         max_segment_size: usize,
+        iceberg_enabled: bool,
+        target_file_size_bytes: usize,
     ) -> Result<(usize, u64), StorageError> {
         let high_watermark = hot_storage.high_watermark(topic, partition)?;
 
@@ -98,7 +123,42 @@ where
         }
 
         // Read events from hot storage
-        let events = hot_storage.read(topic, partition, watermark + 1, max_segment_size)?;
+        let all_events = hot_storage.read(topic, partition, watermark + 1, max_segment_size)?;
+
+        if all_events.is_empty() {
+            return Ok((0, watermark));
+        }
+
+        // When Iceberg is enabled, use size-based batching
+        let events = if iceberg_enabled {
+            let mut total_size: usize = 0;
+            let mut count = 0;
+
+            for event in &all_events {
+                // Estimate event size: payload + overhead for metadata (timestamp, sequence, etc.)
+                // Parquet typically has ~10-20% overhead, so estimate conservatively
+                let event_size = event.payload.len() + 64; // 64 bytes for metadata overhead
+                if total_size + event_size > target_file_size_bytes && count > 0 {
+                    break;
+                }
+                total_size += event_size;
+                count += 1;
+            }
+
+            tracing::debug!(
+                topic = topic,
+                partition = partition,
+                total_events = all_events.len(),
+                size_limited_events = count,
+                estimated_size = total_size,
+                target_size = target_file_size_bytes,
+                "Using size-based batching for Iceberg"
+            );
+
+            all_events.into_iter().take(count).collect::<Vec<_>>()
+        } else {
+            all_events
+        };
 
         if events.is_empty() {
             return Ok((0, watermark));
@@ -117,6 +177,7 @@ where
             partition = partition,
             events = events_count,
             new_watermark = new_watermark,
+            iceberg_enabled = iceberg_enabled,
             "Flushed events to cold storage"
         );
 
@@ -140,6 +201,8 @@ where
         let _topics = Arc::clone(&self.topics); // Reserved for manual registration
         let interval = self.config.interval;
         let max_segment_size = self.config.max_segment_size;
+        let iceberg_enabled = self.config.iceberg_enabled;
+        let target_file_size_bytes = self.config.target_file_size_bytes;
 
         let handle = tokio::spawn(async move {
             tracing::info!("Flusher background task started");
@@ -199,6 +262,8 @@ where
                         partition,
                         current_watermark,
                         max_segment_size,
+                        iceberg_enabled,
+                        target_file_size_bytes,
                     )
                     .await
                     {
@@ -224,10 +289,7 @@ where
             tracing::info!("Flusher background task stopped");
         });
 
-        let mut task_handle = self
-            .task_handle
-            .write()
-            .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+        let mut task_handle = self.task_handle.write().map_lock_err()?;
         *task_handle = Some(handle);
 
         Ok(())
@@ -238,10 +300,7 @@ where
         self.flush_notify.notify_one(); // Wake up the task
 
         let handle = {
-            let mut task_handle = self
-                .task_handle
-                .write()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            let mut task_handle = self.task_handle.write().map_lock_err()?;
             task_handle.take()
         };
 
@@ -255,26 +314,20 @@ where
     }
 
     async fn flush_now(&self) -> Result<FlushResult, StorageError> {
-        let topics_to_flush = {
-            self.topics
-                .read()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?
-                .clone()
-        };
+        let topics_to_flush = self.topics.read().map_lock_err()?.clone();
 
         let mut total_events = 0;
         let mut total_segments = 0;
         let mut max_watermark = 0u64;
 
         for (topic, partition) in topics_to_flush {
-            let current_watermark = {
-                self.watermarks
-                    .read()
-                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?
-                    .get(&(topic.clone(), partition))
-                    .copied()
-                    .unwrap_or(0)
-            };
+            let current_watermark = self
+                .watermarks
+                .read()
+                .map_lock_err()?
+                .get(&(topic.clone(), partition))
+                .copied()
+                .unwrap_or(0);
 
             let (count, new_watermark) = Self::flush_partition(
                 &self.hot_storage,
@@ -283,6 +336,8 @@ where
                 partition,
                 current_watermark,
                 self.config.max_segment_size,
+                self.config.iceberg_enabled,
+                self.config.target_file_size_bytes,
             )
             .await?;
 
@@ -292,7 +347,7 @@ where
 
                 self.watermarks
                     .write()
-                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?
+                    .map_lock_err()?
                     .insert((topic, partition), new_watermark);
 
                 if new_watermark > max_watermark {
@@ -309,11 +364,7 @@ where
     }
 
     async fn flush_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
-        let watermarks = self
-            .watermarks
-            .read()
-            .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
-
+        let watermarks = self.watermarks.read().map_lock_err()?;
         Ok(*watermarks
             .get(&(topic.to_string(), partition))
             .unwrap_or(&0))
@@ -330,5 +381,17 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(5));
         assert_eq!(config.batch_size, 1000);
         assert_eq!(config.max_segment_size, 10000);
+        assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
+        assert!(!config.iceberg_enabled);
+    }
+
+    #[test]
+    fn test_flusher_config_iceberg_defaults() {
+        let config = FlusherConfig::iceberg_defaults();
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.batch_size, 10000);
+        assert_eq!(config.max_segment_size, 100000);
+        assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
+        assert!(config.iceberg_enabled);
     }
 }

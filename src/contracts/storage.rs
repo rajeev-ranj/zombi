@@ -21,6 +21,12 @@ pub trait HotStorage: Send + Sync {
         idempotency_key: Option<&str>,
     ) -> Result<u64, StorageError>;
 
+    /// Writes multiple events to storage in a single batch (#1 Bulk Write API).
+    /// Returns the assigned sequence numbers for each event.
+    /// All events must be for the same topic.
+    fn write_batch(&self, topic: &str, events: &[BulkWriteEvent])
+        -> Result<Vec<u64>, StorageError>;
+
     /// Reads events starting from offset.
     /// Returns up to `limit` events.
     fn read(
@@ -70,10 +76,16 @@ pub trait HotStorage: Send + Sync {
     fn list_topics(&self) -> Result<Vec<String>, StorageError>;
 
     /// Reads events from all partitions, merged by timestamp.
-    /// Returns up to `limit` events starting from `start_timestamp_ms`.
+    ///
+    /// # Arguments
+    /// * `topic` - The topic to read from
+    /// * `start_offsets` - Optional per-partition starting offsets (avoids reading from 0)
+    /// * `start_timestamp_ms` - Optional timestamp filter
+    /// * `limit` - Maximum number of events to return
     fn read_all_partitions(
         &self,
         topic: &str,
+        start_offsets: Option<&std::collections::HashMap<u32, u64>>,
         start_timestamp_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError>;
@@ -84,6 +96,15 @@ pub trait HotStorage: Send + Sync {
 pub struct StoredEvent {
     pub sequence: u64,
     pub topic: String,
+    pub partition: u32,
+    pub payload: Vec<u8>,
+    pub timestamp_ms: i64,
+    pub idempotency_key: Option<String>,
+}
+
+/// An event for bulk write operations.
+#[derive(Debug, Clone)]
+pub struct BulkWriteEvent {
     pub partition: u32,
     pub payload: Vec<u8>,
     pub timestamp_ms: i64,

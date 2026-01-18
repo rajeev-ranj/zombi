@@ -6,7 +6,9 @@ use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
-use crate::contracts::{ColdStorage, SegmentInfo, StorageError, StoredEvent};
+use crate::contracts::{
+    ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
+};
 
 /// S3-backed cold storage implementation.
 pub struct S3Storage {
@@ -55,6 +57,11 @@ impl S3Storage {
             bucket: bucket.into(),
             segment_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Returns the bucket name.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
     }
 
     /// Generates an S3 key for a segment.
@@ -129,10 +136,7 @@ impl ColdStorage for S3Storage {
 
         // Update cache
         {
-            let mut cache = self
-                .segment_cache
-                .write()
-                .map_err(|e| StorageError::S3(format!("Failed to acquire cache lock: {}", e)))?;
+            let mut cache = self.segment_cache.write().map_lock_err()?;
             let segments = cache.entry((topic.to_string(), partition)).or_default();
             segments.push(SegmentInfo {
                 segment_id: key.clone(),
@@ -232,6 +236,15 @@ impl ColdStorage for S3Storage {
 
         segments.sort_by_key(|s| s.start_offset);
         Ok(segments)
+    }
+
+    fn storage_info(&self) -> ColdStorageInfo {
+        ColdStorageInfo {
+            storage_type: "s3".into(),
+            iceberg_enabled: false,
+            bucket: self.bucket.clone(),
+            base_path: "segments".into(),
+        }
     }
 }
 

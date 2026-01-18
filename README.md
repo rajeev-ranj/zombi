@@ -9,6 +9,8 @@ A lightweight Kafka-replacement event streaming system with RocksDB hot storage 
 - **Cost efficient**: Cold storage on S3
 - **Unified API**: Iceberg-style table interface abstracts storage tiers
 - **Dual format**: Supports both JSON and Protobuf writes
+- **Iceberg compatible**: Optional Parquet output with Iceberg metadata
+- **Compaction**: Automatic merging of small files for optimal query performance
 
 ## Quick Start
 
@@ -167,6 +169,10 @@ Environment variables:
 | `ZOMBI_S3_ENDPOINT` | AWS | Custom S3 endpoint (for MinIO) |
 | `ZOMBI_S3_REGION` | `us-east-1` | AWS region |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | Flush interval in seconds |
+| `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | Min events before flushing |
+| `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per segment |
+| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size (Iceberg) |
+| `ZOMBI_ICEBERG_ENABLED` | `false` | Enable Iceberg format output |
 | `RUST_LOG` | `zombi=info` | Log level |
 
 ## Architecture
@@ -181,6 +187,84 @@ Write → RocksDB (hot) → BackgroundFlusher → S3 (cold)
 - **Cold storage**: S3 for archived data (optional)
 - **Background flusher**: Automatically moves data from hot to cold
 - **Unified reads**: Transparently merges data from both tiers
+
+## Iceberg Integration
+
+Zombi can write cold storage data in Apache Iceberg format, making it queryable by Spark, Trino, Athena, and other analytics engines.
+
+### Enable Iceberg Mode
+
+```bash
+ZOMBI_ICEBERG_ENABLED=true \
+ZOMBI_TARGET_FILE_SIZE_MB=128 \
+ZOMBI_S3_BUCKET=my-bucket \
+./target/release/zombi
+```
+
+### Data Layout
+
+With Iceberg enabled, data is written as Parquet files:
+
+```
+s3://bucket/tables/{topic}/
+├── metadata/
+│   ├── v1.metadata.json      # Iceberg table metadata
+│   ├── v2.metadata.json
+│   └── snap-{id}-{uuid}.avro # Manifest lists
+└── data/
+    └── partition={n}/
+        ├── {uuid}.parquet    # Data files
+        └── {uuid}.parquet
+```
+
+### Querying with Spark
+
+```python
+# Read Zombi table with Spark
+spark.read.format("iceberg") \
+    .load("s3://bucket/tables/events") \
+    .filter("timestamp_ms > 1704067200000") \
+    .show()
+```
+
+### REST Catalog Registration
+
+Optionally register tables with an Iceberg REST catalog:
+
+```rust
+use zombi::storage::{CatalogClient, CatalogConfig};
+
+let catalog = CatalogClient::new(CatalogConfig {
+    base_url: "http://catalog:8181".into(),
+    namespace: "zombi".into(),
+    ..Default::default()
+})?;
+
+catalog.register_table("events", &metadata).await?;
+```
+
+### Compaction
+
+Zombi includes automatic compaction to merge small Parquet files:
+
+```rust
+use zombi::storage::{Compactor, CompactionConfig};
+
+let compactor = Compactor::new(
+    s3_client,
+    "my-bucket",
+    "tables",
+    CompactionConfig {
+        min_file_size_bytes: 64 * 1024 * 1024,  // 64MB
+        target_file_size_bytes: 128 * 1024 * 1024,  // 128MB
+        ..Default::default()
+    }
+);
+
+// Compact all partitions for a topic
+let result = compactor.compact_topic("events").await?;
+println!("Compacted {} files into {}", result.files_compacted, result.files_created);
+```
 
 ## Development
 

@@ -14,8 +14,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
 dashmap = "5"
+rayon = "1"
+futures = "0.3"
 thiserror = "1"
 tracing = "0.1"
+arrow = { version = "53", default-features = false, features = ["ipc"] }
+parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
+iceberg = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 
@@ -25,6 +33,12 @@ tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+loom = "0.7"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [build-dependencies]
 prost-build = "0.12"
+
+[[bench]]
+name = "write_throughput"
+harness = false

@@ -1,0 +1,41 @@
+[package]
+name = "zombi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+prost = "0.12"
+
+[dependencies.zombi]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_write"
+path = "fuzz_targets/fuzz_write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_proto"
+path = "fuzz_targets/fuzz_proto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_topic_name"
+path = "fuzz_targets/fuzz_topic_name.rs"
+test = false
+doc = false
+bench = false
