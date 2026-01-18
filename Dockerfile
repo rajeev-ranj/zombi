@@ -15,19 +15,8 @@ COPY Cargo.toml Cargo.lock* ./
 COPY build.rs ./
 COPY proto ./proto
 
-
-# Create dummy src to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
-
-# Create dummy bench file to satisfy Cargo.toml during dependency build
-RUN mkdir benches && echo "fn main() {}" > benches/write_throughput.rs
-
-# Build dependencies only
-RUN cargo build --release --lib && rm -rf src benches
-
-# Restore Cargo.toml (since we copied it, we need to copy it again in next step or just not mess it up locally... 
-# actually Docker layers work such that we copy it again below?)
-# Wait, the next COPY instruction will overwrite the modified Cargo.toml with the real one.
+# Pre-fetch dependencies to improve layer caching.
+RUN cargo fetch
 
 
 # Copy real source code
