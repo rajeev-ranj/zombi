@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/ap
 COPY Cargo.toml Cargo.lock* ./
 COPY build.rs ./
 COPY proto ./proto
+COPY benches ./benches
 
 # Create dummy src to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
