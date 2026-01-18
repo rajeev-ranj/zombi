@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Build stage
 FROM rust:1.88-bookworm AS builder
 
@@ -20,7 +22,9 @@ COPY build.rs ./
 COPY proto ./proto
 
 # Pre-fetch dependencies to improve layer caching.
-RUN mkdir -p src benches \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/write_throughput.rs \
@@ -35,7 +39,10 @@ COPY benches ./benches
 # Build the application
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
-RUN touch src/main.rs src/lib.rs && cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    touch src/main.rs src/lib.rs && cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim

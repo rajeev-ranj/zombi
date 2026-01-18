@@ -80,9 +80,82 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
+  integration:
     runs-on: ubuntu-latest
     needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data --console-address ":9001"
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install awscli
+
+      - name: Create bucket
+        run: |
+          aws --endpoint-url http://localhost:9000 s3 mb s3://zombi-events
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Zombi
+        run: |
+          docker run -d --name zombi \
+            --add-host=host.docker.internal:host-gateway \
+            -p 8080:8080 \
+            -e AWS_ACCESS_KEY_ID=minioadmin \
+            -e AWS_SECRET_ACCESS_KEY=minioadmin \
+            -e ZOMBI_S3_BUCKET=zombi-events \
+            -e ZOMBI_S3_ENDPOINT=http://host.docker.internal:9000 \
+            -e ZOMBI_S3_REGION=us-east-1 \
+            -e ZOMBI_ICEBERG_ENABLED=true \
+            -e ZOMBI_FLUSH_INTERVAL_SECS=1 \
+            -e ZOMBI_FLUSH_BATCH_SIZE=1 \
+            -e ZOMBI_FLUSH_MAX_SEGMENT=1 \
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Zombi did not become healthy in time"
+          docker logs zombi
+          exit 1
+
+      - name: Write event
+        run: |
+          curl -fsS -X POST http://localhost:8080/tables/events \
+            -H "Content-Type: application/json" \
+            -d '{"payload":"hello from ci"}'
+
+      - name: Verify Iceberg data in MinIO
+        run: |
+          sleep 3
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive | grep -E "metadata/|data/" >/dev/null
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: integration
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Deploy to Server
