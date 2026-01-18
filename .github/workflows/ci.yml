@@ -69,8 +69,68 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t zombi:latest .
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to Server
+        uses: appleboy/ssh-action@v1.0.3
+        # Set these secrets in GitHub Repo Settings > Secrets and variables > Actions
+        # SSH_HOST: Your server IP
+        # SSH_USER: Your server username (e.g. ubuntu, root)
+        # SSH_KEY: Your private SSH key
+        if: ${{ secrets.SSH_HOST != '' && secrets.SSH_USER != '' && secrets.SSH_KEY != '' }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            # Pull latest image
+            docker pull ghcr.io/${{ github.repository }}:latest
+            
+            # Stop existing container
+            docker stop zombi || true
+            docker rm zombi || true
+            
+            # Start new container
+            # Only strictly necessary args here, full config can be managed via docker-compose on the server
+            # For a simple quick-start push without composing on server:
+            docker run -d \
+              --name zombi \
+              --restart always \
+              -p 8080:8080 \
+              -v zombi-data:/var/lib/zombi \
+              -e ZOMBI_HOST=0.0.0.0 \
+              -e ZOMBI_PORT=8080 \
+              ghcr.io/${{ github.repository }}:latest
