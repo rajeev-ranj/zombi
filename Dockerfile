@@ -1,27 +1,51 @@
+# syntax=docker/dockerfile:1.7
+
 # Build stage
-FROM rust:1.75-bookworm as builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
-# Install protobuf compiler
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    clang \
+    cmake \
+    libclang-dev \
+    llvm-dev \
+    protobuf-compiler \
+    pkg-config \
+    libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
 COPY build.rs ./
 COPY proto ./proto
 
-# Create dummy src to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
+# Pre-fetch dependencies to improve layer caching.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    mkdir -p src benches \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && echo "fn main() {}" > benches/write_throughput.rs \
+    && cargo fetch \
+    && rm -rf src benches
 
-# Build dependencies only
-RUN cargo build --release && rm -rf src
 
 # Copy real source code
 COPY src ./src
+COPY benches ./benches
 
 # Build the application
-RUN touch src/main.rs src/lib.rs && cargo build --release
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+ENV CARGO_TARGET_DIR=/app/target
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    touch src/main.rs src/lib.rs \
+    && cargo build --release \
+    && cp /app/target/release/zombi /app/zombi
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -31,7 +55,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 
 # Copy the binary
-COPY --from=builder /app/target/release/zombi /usr/local/bin/zombi
+COPY --from=builder /app/zombi /usr/local/bin/zombi
 
 # Create data directory
 RUN mkdir -p /var/lib/zombi

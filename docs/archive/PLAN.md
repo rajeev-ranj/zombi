@@ -1,4 +1,19 @@
-# Zombi Implementation Plan
+# ⚠️ ARCHIVED - DO NOT USE
+
+> **This document is outdated and kept for historical reference only.**
+>
+> This was a working plan created mid-development. Some items are complete,
+> others were deprioritized or changed.
+>
+> **For current information, see:**
+> - [SPEC.md](../../SPEC.md) - Authoritative specification
+> - [CHANGELOG.md](../../CHANGELOG.md) - Accurate version history
+>
+> **Archived:** January 2026
+
+---
+
+# Zombi Implementation Plan (HISTORICAL)
 
 > From current state to production-ready Iceberg ingestion system.
 

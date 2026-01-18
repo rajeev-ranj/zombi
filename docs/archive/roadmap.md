@@ -1,6 +1,24 @@
-# Zombi Development Roadmap
+# ⚠️ ARCHIVED - DO NOT USE
+
+> **This document is outdated and kept for historical reference only.**
+>
+> **The version numbering in this file conflicts with the actual implementation.**
+> - This doc says v0.2 = Consumer Groups, v1.0 = Iceberg
+> - Reality: v0.2 = Iceberg (implemented), Consumer Groups not yet done
+>
+> **For current information, see:**
+> - [SPEC.md](../../SPEC.md) - Authoritative specification
+> - [CHANGELOG.md](../../CHANGELOG.md) - Accurate version history
+>
+> **Archived:** January 2026
+
+---
+
+# Zombi Development Roadmap (HISTORICAL)
 
 > Phased plan from simple prototype (v0.1) to production system (v1.0) matching HLD vision.
+>
+> ⚠️ **This plan was superseded. Iceberg was prioritized over consumer groups.**
 
 ---
 

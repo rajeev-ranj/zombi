@@ -6,12 +6,14 @@
 
 ## Project Overview
 
-Zombi is a Kafka-replacement event streaming proxy written in Rust. It uses RocksDB for hot storage and S3 for cold storage.
+Zombi is a Kafka-replacement event streaming system written in Rust. It uses RocksDB for hot storage and S3/Iceberg for cold storage.
+
+**Current Version:** 0.2.0
 
 **Read these files first:**
-- `SPEC.md` — Full specification
-- `v0.1_plan.md` — Current development plan
-- `hld.md` — North star architecture (v1.0 vision)
+- `SPEC.md` — Full specification and API reference
+- `CHANGELOG.md` — Version history and feature status
+- `testing_strategy.md` — Comprehensive testing approach
 
 ---
 
@@ -56,18 +58,30 @@ pub fn write(&self, event: Event) -> u64 {
 ```
 src/
 ├── contracts/   # Trait definitions — STABLE, change rarely
-├── storage/     # Storage implementations
+├── storage/     # Storage implementations (RocksDB, S3, Iceberg)
 ├── flusher/     # Background flush logic
 ├── api/         # HTTP handlers
-└── internal/    # Private utilities
+└── proto/       # Generated protobuf code
 ```
 
 **Rules:**
 - `api/` can import from `contracts/`, `storage/`
-- `storage/` can import from `contracts/`, `internal/`
-- `flusher/` can import from `contracts/`, `storage/`, `internal/`
+- `storage/` can import from `contracts/`
+- `flusher/` can import from `contracts/`, `storage/`
 - `contracts/` imports from NOTHING (except std)
 - Never import from `api/` into `storage/`
+
+### Key Storage Files
+
+| File | Purpose |
+|------|---------|
+| `storage/rocksdb.rs` | Hot storage (RocksDB) |
+| `storage/s3.rs` | Cold storage (S3 JSON) |
+| `storage/iceberg_storage.rs` | Cold storage (Iceberg/Parquet) |
+| `storage/cold_storage_backend.rs` | Unified backend enum |
+| `storage/parquet.rs` | Parquet writing utilities |
+| `storage/iceberg.rs` | Iceberg metadata structures |
+| `storage/compaction.rs` | File compaction logic |
 
 ### Trait-First Development
 
@@ -76,13 +90,12 @@ Always implement traits from `contracts/`, don't invent new public APIs:
 ```rust
 // contracts/storage.rs
 pub trait HotStorage: Send + Sync {
-    fn write(&self, partition: u32, event: Event) -> Result<u64, StorageError>;
-    fn read(&self, partition: u32, offset: u64, limit: usize) -> Result<Vec<Event>, StorageError>;
-    fn high_watermark(&self, partition: u32) -> Result<u64, StorageError>;
+    fn write(&self, topic: &str, partition: u32, ...) -> Result<u64, StorageError>;
+    fn read(&self, topic: &str, partition: u32, offset: u64, limit: usize) -> Result<Vec<StoredEvent>, StorageError>;
 }
 
 // storage/rocksdb.rs
-impl HotStorage for RocksDBStorage {
+impl HotStorage for RocksDbStorage {
     // Implement exactly the trait, nothing more
 }
 ```
@@ -96,20 +109,26 @@ These must NEVER be violated. If you're unsure, ask.
 | ID | Invariant | How to Verify |
 |----|-----------|---------------|
 | INV-1 | Sequences are monotonic | Property test: `sequences_are_monotonic` |
-| INV-2 | No data loss | Property test: `no_data_loss` |
+| INV-2 | No data loss after flush | Property test: `no_data_loss` |
 | INV-3 | Order preserved | Property test: `order_preserved` |
 | INV-4 | Idempotent writes | Property test: `idempotent_writes` |
 | INV-5 | Partition isolation | Property test: `partition_isolation` |
-| INV-6 | Crash recovery | Crash test: `tests/crash/recovery.rs` |
 
-**Before merging any storage change, verify all property tests pass:**
+**Before merging any storage change, verify all tests pass:**
 ```bash
-cargo test --test property_tests
+cargo test
 ```
 
 ---
 
 ## Testing Requirements
+
+### Test Suite (100 tests)
+- **63 unit tests** - Storage, flusher, API
+- **9 concurrency tests** - Parallel writes, race conditions
+- **11 crash recovery tests** - Data persistence
+- **12 integration tests** - HTTP endpoints
+- **5 property tests** - Invariants
 
 ### Every PR Must Have:
 1. Unit tests for new pure functions
@@ -133,12 +152,11 @@ async fn flush_writes_to_s3() { ... }
 # All tests
 cargo test
 
-# Only property tests
-cargo test --test property_tests
-
-# With S3 (needs MinIO running)
-docker run -d -p 9000:9000 minio/minio server /data
+# Specific test file
 cargo test --test integration_tests
+
+# With verbose output
+cargo test -- --nocapture
 ```
 
 ---
@@ -154,8 +172,8 @@ cargo test --test integration_tests
 
 ### Adding a New Storage Operation
 
-1. Add method to trait in `src/contracts/storage.rs`
-2. Implement in `src/storage/rocksdb.rs`
+1. Add method to trait in `src/contracts/storage.rs` or `cold_storage.rs`
+2. Implement in all storage backends
 3. Add property test if it affects invariants
 4. Add integration test
 
@@ -170,68 +188,12 @@ cargo test --test integration_tests
 
 ## Do NOT
 
-- ❌ Add new public APIs without updating `contracts/`
-- ❌ Use `unwrap()` or `expect()` in library code
-- ❌ Skip tests for "simple" changes
-- ❌ Change invariant behavior without discussion
-- ❌ Add dependencies without justification
-- ❌ Mix refactoring with feature changes in one PR
-
----
-
-## File Templates
-
-### New Trait
-```rust
-// src/contracts/new_trait.rs
-
-use crate::error::ZombiError;
-
-/// Brief description of what this trait does.
-/// 
-/// # Invariants
-/// - List any invariants this trait must maintain
-pub trait NewTrait: Send + Sync {
-    /// Brief description of method.
-    fn method(&self, arg: Type) -> Result<ReturnType, ZombiError>;
-}
-```
-
-### New Handler
-```rust
-// src/api/handlers.rs
-
-use axum::{extract::Path, Json};
-use crate::storage::Storage;
-
-pub async fn handle_new_endpoint(
-    Path(topic): Path<String>,
-    storage: Storage,
-) -> Result<Json<Response>, ApiError> {
-    let result = storage.some_operation(&topic).await?;
-    Ok(Json(Response { data: result }))
-}
-```
-
-### New Test
-```rust
-// tests/integration_tests.rs
-
-#[tokio::test]
-async fn test_new_feature() {
-    let storage = setup_test_storage().await;
-    
-    // Arrange
-    let event = Event::new(b"test".to_vec());
-    
-    // Act
-    let result = storage.new_operation(&event).await;
-    
-    // Assert
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap().some_field, expected_value);
-}
-```
+- Add new public APIs without updating `contracts/`
+- Use `unwrap()` or `expect()` in library code
+- Skip tests for "simple" changes
+- Change invariant behavior without discussion
+- Add dependencies without justification
+- Mix refactoring with feature changes in one PR
 
 ---
 
@@ -243,13 +205,13 @@ RUST_LOG=zombi=debug cargo run
 RUST_LOG=zombi::storage=trace cargo run  # Verbose storage logs
 ```
 
-### RocksDB Inspection
+### Check Iceberg Data
 ```bash
-# List keys
-cargo run --bin debug-rocks -- --path ./data/rocks --list
+# List files in MinIO
+aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
 
-# Dump key
-cargo run --bin debug-rocks -- --path ./data/rocks --key "topic:0:00000001"
+# Check for metadata and data directories
+aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/tables/events/
 ```
 
 ---
@@ -257,16 +219,18 @@ cargo run --bin debug-rocks -- --path ./data/rocks --key "topic:0:00000001"
 ## Performance Notes
 
 - RocksDB writes should be <100μs in hot path
+- WAL is disabled for throughput (data durable after S3 flush)
 - Avoid allocations in write path
 - Use `bytes::Bytes` for zero-copy when possible
 - Batch S3 writes (min 1000 events or 5 seconds)
+- Iceberg mode uses size-based batching (target 128MB files)
 
 ---
 
 ## Questions?
 
 If unclear about:
-- Architecture decisions → Check `SPEC.md` or `hld.md`
-- Implementation approach → Check existing code patterns
+- Architecture decisions → Check `SPEC.md`
+- Version history → Check `CHANGELOG.md`
 - Test strategy → Check `testing_strategy.md`
-- Roadmap → Check `roadmap.md`
+- Implementation details → Check existing code patterns

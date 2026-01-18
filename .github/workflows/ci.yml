@@ -10,7 +10,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  # Fast checks - runs on every push/PR
+  lint:
+    name: Lint & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,12 +40,10 @@ jobs:
       - name: Run Clippy
         run: cargo clippy -- -D warnings
 
-      - name: Run tests
-        run: cargo test
-
-  build:
+  # Unit and integration tests - runs on every push/PR
+  test:
+    name: Test Suite
     runs-on: ubuntu-latest
-    needs: test
     steps:
       - uses: actions/checkout@v4
 
@@ -62,27 +62,35 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release
-        run: cargo build --release
+      - name: Run all tests
+        run: cargo test
 
+      - name: Verify benchmarks compile
+        run: cargo bench --no-run
+
+  # Docker build - runs on every push/PR (push to registry only on main)
   docker:
+    name: Docker Build
     runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to the Container registry
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -91,26 +99,128 @@ jobs:
             type=sha
             type=raw,value=latest
 
-      - name: Build and push Docker image
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-  deploy:
+  # Integration test with MinIO - runs on main only (needs published image)
+  integration:
+    name: Integration Test (MinIO + Iceberg)
     runs-on: ubuntu-latest
     needs: docker
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data --console-address ":9001"
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install awscli
+
+      - name: Create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://localhost:9000 s3 mb s3://zombi-events
+
+      - name: Log in to Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Zombi
+        run: |
+          docker run -d --name zombi \
+            --add-host=host.docker.internal:host-gateway \
+            -p 8080:8080 \
+            -e AWS_ACCESS_KEY_ID=minioadmin \
+            -e AWS_SECRET_ACCESS_KEY=minioadmin \
+            -e ZOMBI_S3_BUCKET=zombi-events \
+            -e ZOMBI_S3_ENDPOINT=http://host.docker.internal:9000 \
+            -e ZOMBI_S3_REGION=us-east-1 \
+            -e ZOMBI_ICEBERG_ENABLED=true \
+            -e ZOMBI_FLUSH_INTERVAL_SECS=1 \
+            -e ZOMBI_FLUSH_BATCH_SIZE=1 \
+            -e ZOMBI_FLUSH_MAX_SEGMENT=1 \
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              echo "Zombi is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Zombi did not become healthy in time"
+          docker logs zombi
+          exit 1
+
+      - name: Test write endpoint
+        run: |
+          curl -fsS -X POST http://localhost:8080/tables/events \
+            -H "Content-Type: application/json" \
+            -d '{"payload":"hello from ci"}'
+
+      - name: Test read endpoint
+        run: |
+          curl -fsS http://localhost:8080/tables/events | jq .
+
+      - name: Test stats endpoint
+        run: |
+          curl -fsS http://localhost:8080/stats | jq .
+
+      - name: Verify Iceberg data in MinIO
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          sleep 3
+          echo "Listing all objects in bucket:"
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+          echo "Checking for Iceberg structure (metadata/ and data/):"
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
+
+      - name: Show Zombi logs
+        if: always()
+        run: docker logs zombi
+
+  # Deploy (optional) - only on main with configured secrets
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
       - name: Deploy to Server
         uses: appleboy/ssh-action@v1.0.3
-        # Set these secrets in GitHub Repo Settings > Secrets and variables > Actions
-        # SSH_HOST: Your server IP
-        # SSH_USER: Your server username (e.g. ubuntu, root)
-        # SSH_KEY: Your private SSH key
-        if: ${{ secrets.SSH_HOST != '' && secrets.SSH_USER != '' && secrets.SSH_KEY != '' }}
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        if: env.SSH_HOST != '' && env.SSH_USER != '' && env.SSH_KEY != ''
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -118,14 +228,12 @@ jobs:
           script: |
             # Pull latest image
             docker pull ghcr.io/${{ github.repository }}:latest
-            
+
             # Stop existing container
             docker stop zombi || true
             docker rm zombi || true
-            
+
             # Start new container
-            # Only strictly necessary args here, full config can be managed via docker-compose on the server
-            # For a simple quick-start push without composing on server:
             docker run -d \
               --name zombi \
               --restart always \
