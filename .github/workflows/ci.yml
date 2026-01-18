@@ -106,11 +106,11 @@ jobs:
     steps:
       - name: Deploy to Server
         uses: appleboy/ssh-action@v1.0.3
-        # Set these secrets in GitHub Repo Settings > Secrets and variables > Actions
-        # SSH_HOST: Your server IP
-        # SSH_USER: Your server username (e.g. ubuntu, root)
-        # SSH_KEY: Your private SSH key
-        if: ${{ secrets.SSH_HOST != '' && secrets.SSH_USER != '' && secrets.SSH_KEY != '' }}
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        if: env.SSH_HOST != '' && env.SSH_USER != '' && env.SSH_KEY != ''
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
