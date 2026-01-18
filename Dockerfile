@@ -1,10 +1,14 @@
 # Build stage
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
+    clang \
+    cmake \
+    libclang-dev \
+    llvm-dev \
     protobuf-compiler \
     pkg-config \
     libssl-dev \
@@ -29,6 +33,8 @@ COPY src ./src
 COPY benches ./benches
 
 # Build the application
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
 # Runtime stage
