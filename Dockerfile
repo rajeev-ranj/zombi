@@ -38,11 +38,14 @@ COPY benches ./benches
 
 # Build the application
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+ENV CARGO_TARGET_DIR=/app/target
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    touch src/main.rs src/lib.rs && cargo build --release
+    touch src/main.rs src/lib.rs \
+    && cargo build --release \
+    && cp /app/target/release/zombi /app/zombi
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -52,7 +55,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 
 # Copy the binary
-COPY --from=builder /app/target/release/zombi /usr/local/bin/zombi
+COPY --from=builder /app/zombi /usr/local/bin/zombi
 
 # Create data directory
 RUN mkdir -p /var/lib/zombi
