@@ -16,7 +16,9 @@ COPY build.rs ./
 COPY proto ./proto
 
 # Pre-fetch dependencies to improve layer caching.
-RUN cargo fetch
+RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
+    && cargo fetch \
+    && rm -rf src
 
 
 # Copy real source code
