@@ -8,6 +8,7 @@ Authoritative docs:
 - `README.md`
 - `SPEC.md`
 - `testing_strategy.md`
+- `docs/openapi.yaml` (API specification)
 
 Historical docs live under `docs/archive/` and may be out of date.
 
