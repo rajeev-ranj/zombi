@@ -16,10 +16,11 @@ COPY benches ./benches
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
 
 # Temporarily remove bench section to prevent build error with dummy lib
-RUN sed -i '/\[\[bench\]\]/,/harness = false/d' Cargo.toml
+# Delete from [[bench]] to the end of the file
+RUN sed -i '/\[\[bench\]\]/,$d' Cargo.toml
 
 # Build dependencies only
-RUN cargo build --release && rm -rf src
+RUN cargo build --release --lib && rm -rf src
 
 # Restore Cargo.toml (since we copied it, we need to copy it again in next step or just not mess it up locally... 
 # actually Docker layers work such that we copy it again below?)
