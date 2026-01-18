@@ -1,0 +1,448 @@
+openapi: 3.0.3
+info:
+  title: Zombi API
+  version: 0.1.0
+  description: HTTP API for Zombi event ingestion and reads.
+servers:
+  - url: http://localhost:8080
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+  /stats:
+    get:
+      summary: Server stats
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+  /tables/{table}:
+    post:
+      summary: Write a record
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteRecordRequest"
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WriteRecordResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    get:
+      summary: Read records (unified hot + cold)
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Filter by timestamp_ms
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadRecordsResponse"
+  /tables/{table}/bulk:
+    post:
+      summary: Bulk write records
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkWriteRequest"
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkWriteResponse"
+  /tables/{table}/stream:
+    get:
+      summary: Stream read records from a partition
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+        - name: partition
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+        - name: wait_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamReadResponse"
+  /consumers/{group}/commit:
+    post:
+      summary: Commit a consumer group offset
+      parameters:
+        - $ref: "#/components/parameters/GroupParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitOffsetRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommitOffsetResponse"
+  /consumers/{group}/offset:
+    get:
+      summary: Get a consumer group offset
+      parameters:
+        - $ref: "#/components/parameters/GroupParam"
+        - name: topic
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: partition
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetOffsetResponse"
+  /tables/{table}/metadata:
+    get:
+      summary: Table metadata
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableMetadataResponse"
+  /tables/{table}/flush:
+    post:
+      summary: Force flush to cold storage
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlushResponse"
+  /tables/{table}/compact:
+    post:
+      summary: Trigger compaction
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactResponse"
+components:
+  parameters:
+    TableParam:
+      name: table
+      in: path
+      required: true
+      schema:
+        type: string
+    GroupParam:
+      name: group
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    WriteRecordRequest:
+      type: object
+      properties:
+        payload:
+          type: string
+        partition:
+          type: integer
+          default: 0
+        timestamp_ms:
+          type: integer
+          format: int64
+        idempotency_key:
+          type: string
+      required:
+        - payload
+    WriteRecordResponse:
+      type: object
+      properties:
+        offset:
+          type: integer
+          format: int64
+        partition:
+          type: integer
+        table:
+          type: string
+    BulkWriteRecord:
+      type: object
+      properties:
+        payload:
+          type: string
+        partition:
+          type: integer
+          default: 0
+        timestamp_ms:
+          type: integer
+          format: int64
+        idempotency_key:
+          type: string
+      required:
+        - payload
+    BulkWriteRequest:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/BulkWriteRecord"
+      required:
+        - records
+    BulkWriteResponse:
+      type: object
+      properties:
+        offsets:
+          type: array
+          items:
+            type: integer
+            format: int64
+        count:
+          type: integer
+        table:
+          type: string
+    RecordResponse:
+      type: object
+      properties:
+        payload:
+          type: string
+        timestamp_ms:
+          type: integer
+          format: int64
+    ReadRecordsResponse:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecordResponse"
+        count:
+          type: integer
+        has_more:
+          type: boolean
+    StreamEventResponse:
+      type: object
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        payload:
+          type: string
+        timestamp_ms:
+          type: integer
+          format: int64
+    StreamReadResponse:
+      type: object
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/StreamEventResponse"
+        next_offset:
+          type: integer
+          format: int64
+        has_more:
+          type: boolean
+    CommitOffsetRequest:
+      type: object
+      properties:
+        topic:
+          type: string
+        partition:
+          type: integer
+          default: 0
+        offset:
+          type: integer
+          format: int64
+      required:
+        - topic
+        - offset
+    CommitOffsetResponse:
+      type: object
+      properties:
+        group:
+          type: string
+        topic:
+          type: string
+        partition:
+          type: integer
+        offset:
+          type: integer
+          format: int64
+    GetOffsetResponse:
+      type: object
+      properties:
+        group:
+          type: string
+        topic:
+          type: string
+        partition:
+          type: integer
+        offset:
+          type: integer
+          format: int64
+          nullable: true
+    TableMetadataResponse:
+      type: object
+      properties:
+        table:
+          type: string
+        storage_type:
+          type: string
+        iceberg_enabled:
+          type: boolean
+        metadata_location:
+          type: string
+          nullable: true
+        bucket:
+          type: string
+          nullable: true
+        base_path:
+          type: string
+          nullable: true
+    FlushResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+    CompactResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+    StatsResponse:
+      type: object
+      properties:
+        uptime_secs:
+          type: number
+        writes:
+          $ref: "#/components/schemas/WriteStats"
+        reads:
+          $ref: "#/components/schemas/ReadStats"
+        errors_total:
+          type: integer
+          format: int64
+    WriteStats:
+      type: object
+      properties:
+        total:
+          type: integer
+          format: int64
+        bytes_total:
+          type: integer
+          format: int64
+        rate_per_sec:
+          type: number
+        avg_latency_us:
+          type: number
+    ReadStats:
+      type: object
+      properties:
+        total:
+          type: integer
+          format: int64
+        records_total:
+          type: integer
+          format: int64
+        rate_per_sec:
+          type: number
+        avg_latency_us:
+          type: number
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string

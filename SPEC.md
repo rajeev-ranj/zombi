@@ -165,6 +165,8 @@ s3://bucket/tables/{topic}/
 
 ## API Specification
 
+OpenAPI: `docs/openapi.yaml`
+
 ### Write Events
 
 **Single Event:**
