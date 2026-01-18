@@ -26,6 +26,7 @@ RUN mkdir -p src benches \
 
 # Copy real source code
 COPY src ./src
+COPY benches ./benches
 
 # Build the application
 RUN touch src/main.rs src/lib.rs && cargo build --release
