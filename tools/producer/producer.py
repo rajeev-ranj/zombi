@@ -12,7 +12,8 @@ Profiles:
     - steady: Constant 10 events/sec
     - bursty: Random bursts of 50-200 events, then quiet periods
     - spike: Normal traffic with occasional 10x spikes
-    - stress: Maximum throughput
+    - stress: Maximum throughput (fixed threads)
+    - max: Ramp threads up over time
 """
 
 import argparse
@@ -202,10 +203,21 @@ EVENT_GENERATORS = {
 
 
 class Producer:
-    def __init__(self, base_url: str, tables: List[str], stats: Stats):
+    def __init__(
+        self,
+        base_url: str,
+        tables: List[str],
+        stats: Stats,
+        threads: int,
+        max_threads: int,
+        ramp_interval: float,
+    ):
         self.base_url = base_url.rstrip("/")
         self.tables = tables
         self.stats = stats
+        self.threads = threads
+        self.max_threads = max_threads
+        self.ramp_interval = ramp_interval
         self.session = requests.Session()
 
     def send_event(self, table: str) -> bool:
@@ -287,12 +299,42 @@ def profile_stress(producer: Producer, duration: float):
             table = random.choice(producer.tables)
             producer.send_event(table)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(worker) for _ in range(10)]
+    with ThreadPoolExecutor(max_workers=producer.threads) as executor:
+        futures = [executor.submit(worker) for _ in range(producer.threads)]
 
         while time.time() < end_time:
             producer.stats.print_stats()
             time.sleep(0.5)
+
+def profile_max(producer: Producer, duration: float):
+    """Ramp threads over time until max_threads is reached."""
+    end_time = time.time() + duration
+
+    def worker():
+        while time.time() < end_time:
+            table = random.choice(producer.tables)
+            producer.send_event(table)
+
+    threads = []
+
+    def spawn_threads(count: int):
+        for _ in range(count):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+    spawn_threads(min(10, producer.max_threads))
+    last_ramp = time.time()
+
+    while time.time() < end_time:
+        producer.stats.print_stats()
+        time.sleep(0.5)
+        if time.time() - last_ramp >= producer.ramp_interval and len(threads) < producer.max_threads:
+            spawn_threads(min(10, producer.max_threads - len(threads)))
+            last_ramp = time.time()
+
+    for t in threads:
+        t.join(timeout=1)
 
 
 PROFILES = {
@@ -300,6 +342,7 @@ PROFILES = {
     "bursty": profile_bursty,
     "spike": profile_spike,
     "stress": profile_stress,
+    "max": profile_max,
 }
 
 
@@ -311,19 +354,36 @@ def main():
     parser.add_argument("--duration", type=float, default=60, help="Duration in seconds")
     parser.add_argument("--profile", choices=PROFILES.keys(), default="bursty",
                         help="Traffic profile")
+    parser.add_argument("--threads", type=int, default=10,
+                        help="Threads for stress/max profiles")
+    parser.add_argument("--max-threads", type=int, default=100,
+                        help="Maximum threads for max profile")
+    parser.add_argument("--ramp-interval", type=float, default=5.0,
+                        help="Seconds between ramps for max profile")
     args = parser.parse_args()
 
     tables = [t.strip() for t in args.tables.split(",")]
     stats = Stats()
     stats.reset()
 
-    producer = Producer(args.url, tables, stats)
+    producer = Producer(
+        args.url,
+        tables,
+        stats,
+        args.threads,
+        args.max_threads,
+        args.ramp_interval,
+    )
 
     print(f"Zombi Producer")
     print(f"  URL: {args.url}")
     print(f"  Tables: {tables}")
     print(f"  Profile: {args.profile}")
     print(f"  Duration: {args.duration}s")
+    print(f"  Threads: {args.threads}")
+    if args.profile == "max":
+        print(f"  Max threads: {args.max_threads}")
+        print(f"  Ramp interval: {args.ramp_interval}s")
     print("-" * 50)
 
     try:
