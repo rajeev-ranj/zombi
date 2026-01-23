@@ -49,6 +49,7 @@ All notable changes to Zombi are documented here.
 
 ### Fixed
 - Metadata endpoint now returns actual storage backend info
+- Iceberg metadata files now created after flush (snapshots + version metadata)
 
 ---
 
