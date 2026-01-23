@@ -5,13 +5,15 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use chrono::NaiveDate;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
 };
 use crate::storage::{
-    data_file_name, manifest_list_file_name, metadata_file_name, write_parquet_to_bytes, DataFile,
-    ManifestListEntry, ParquetFileMetadata, SnapshotOperation, TableMetadata,
+    data_file_name, derive_partition_columns, manifest_list_file_name, metadata_file_name,
+    write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata, SnapshotOperation,
+    TableMetadata,
 };
 
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
@@ -106,9 +108,9 @@ impl IcebergStorage {
         Ok(new_metadata)
     }
 
-    /// Returns the S3 key for a data file.
-    fn data_file_key(&self, topic: &str, partition: u32, filename: &str) -> String {
-        make_data_file_key(&self.base_path, topic, partition, filename)
+    /// Returns the S3 key for a data file with time-based partitioning.
+    fn data_file_key(&self, topic: &str, partition: u32, filename: &str, event_date: i32, event_hour: i32) -> String {
+        make_data_file_key(&self.base_path, topic, partition, filename, event_date, event_hour)
     }
 
     /// Returns the S3 key for metadata files.
@@ -246,9 +248,13 @@ impl ColdStorage for IcebergStorage {
         // Convert events to Parquet
         let (parquet_bytes, parquet_metadata) = write_parquet_to_bytes(events)?;
 
+        // Derive partition columns from first event's timestamp
+        // All events in a segment should be from the same hour for proper partitioning
+        let (event_date, event_hour) = derive_partition_columns(events[0].timestamp_ms);
+
         // Generate data file name and key
         let filename = data_file_name();
-        let key = self.data_file_key(topic, partition, &filename);
+        let key = self.data_file_key(topic, partition, &filename, event_date, event_hour);
         let s3_path = format!("s3://{}/{}", self.bucket, key);
 
         // Upload Parquet file
@@ -286,8 +292,9 @@ impl ColdStorage for IcebergStorage {
         start_offset: u64,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
-        // List Parquet files for this partition
-        let prefix = format!("{}/{}/data/partition={}/", self.base_path, topic, partition);
+        // List all Parquet files in the partitioned structure
+        // Search all event_date/event_hour directories for the partition
+        let prefix = format!("{}/{}/data/", self.base_path, topic);
 
         let response = self
             .client
@@ -303,7 +310,15 @@ impl ColdStorage for IcebergStorage {
         if let Some(contents) = response.contents {
             for object in contents {
                 if let Some(key) = object.key() {
+                    // Filter for Parquet files in the correct partition directory
                     if !key.ends_with(".parquet") {
+                        continue;
+                    }
+
+                    // Check if file is in the correct partition directory
+                    // Path format: tables/events/data/event_date=YYYY-MM-DD/event_hour=HH/partition=N/
+                    let partition_suffix = format!("/partition={}/", partition);
+                    if !key.contains(&partition_suffix) {
                         continue;
                     }
 
@@ -349,7 +364,7 @@ impl ColdStorage for IcebergStorage {
         topic: &str,
         partition: u32,
     ) -> Result<Vec<SegmentInfo>, StorageError> {
-        let prefix = format!("{}/{}/data/partition={}/", self.base_path, topic, partition);
+        let prefix = format!("{}/{}/data/", self.base_path, topic);
 
         let response = self
             .client
@@ -365,15 +380,24 @@ impl ColdStorage for IcebergStorage {
         if let Some(contents) = response.contents {
             for object in contents {
                 if let Some(key) = object.key() {
-                    if key.ends_with(".parquet") {
-                        segments.push(SegmentInfo {
-                            segment_id: key.to_string(),
-                            start_offset: 0, // Would need to read Parquet metadata
-                            end_offset: 0,
-                            event_count: 0,
-                            size_bytes: object.size().unwrap_or(0) as u64,
-                        });
+                    // Filter for Parquet files in the correct partition directory
+                    if !key.ends_with(".parquet") {
+                        continue;
                     }
+
+                    // Check if file is in the correct partition directory
+                    let partition_suffix = format!("/partition={}/", partition);
+                    if !key.contains(&partition_suffix) {
+                        continue;
+                    }
+
+                    segments.push(SegmentInfo {
+                        segment_id: key.to_string(),
+                        start_offset: 0, // Would need to read Parquet metadata
+                        end_offset: 0,
+                        event_count: 0,
+                        size_bytes: object.size().unwrap_or(0) as u64,
+                    });
                 }
             }
         }
@@ -476,11 +500,27 @@ fn read_parquet_events(bytes: &[u8]) -> Result<Vec<StoredEvent>, StorageError> {
     Ok(events)
 }
 
-/// Helper function to generate data file key (for testing).
-fn make_data_file_key(base_path: &str, topic: &str, partition: u32, filename: &str) -> String {
+/// Helper function to format Date32 (days since epoch) to YYYY-MM-DD string.
+fn format_partition_date(event_date: i32) -> String {
+    let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .unwrap()
+        + chrono::Duration::days(event_date as i64);
+    date.format("%Y-%m-%d").to_string()
+}
+
+/// Helper function to generate data file key with time-based partitioning (for testing).
+fn make_data_file_key(
+    base_path: &str,
+    topic: &str,
+    partition: u32,
+    filename: &str,
+    event_date: i32,
+    event_hour: i32,
+) -> String {
+    let date_str = format_partition_date(event_date);
     format!(
-        "{}/{}/data/partition={}/{}",
-        base_path, topic, partition, filename
+        "{}/{}/data/event_date={}/event_hour={}/partition={}/{}",
+        base_path, topic, date_str, event_hour, partition, filename
     )
 }
 
@@ -495,8 +535,16 @@ mod tests {
 
     #[test]
     fn test_data_file_key() {
-        let key = make_data_file_key("tables", "events", 0, "abc123.parquet");
-        assert_eq!(key, "tables/events/data/partition=0/abc123.parquet");
+        let key = make_data_file_key("tables", "events", 0, "abc123.parquet", 19737, 14);
+        assert_eq!(key, "tables/events/data/event_date=2024-01-15/event_hour=14/partition=0/abc123.parquet");
+    }
+
+    #[test]
+    fn test_format_partition_date() {
+        // 2024-01-15 is day 19737 since epoch
+        assert_eq!(format_partition_date(19737), "2024-01-15");
+        assert_eq!(format_partition_date(0), "1970-01-01");
+        assert_eq!(format_partition_date(1), "1970-01-02");
     }
 
     #[test]
