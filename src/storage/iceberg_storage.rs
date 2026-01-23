@@ -245,12 +245,22 @@ impl ColdStorage for IcebergStorage {
             return Err(StorageError::S3("Cannot write empty segment".into()));
         }
 
+        // Validate all events are within the same hour for proper partitioning
+        let (event_date, event_hour) = derive_partition_columns(events[0].timestamp_ms);
+        for event in &events[1..] {
+            let (date, hour) = derive_partition_columns(event.timestamp_ms);
+            if date != event_date || hour != event_hour {
+                return Err(StorageError::InvalidInput(
+                    format!(
+                        "Events must be within same hour for partitioned write: first={}-{}, later={}-{}",
+                        event_date, event_hour, date, hour
+                    )
+                ));
+            }
+        }
+
         // Convert events to Parquet
         let (parquet_bytes, parquet_metadata) = write_parquet_to_bytes(events)?;
-
-        // Derive partition columns from first event's timestamp
-        // All events in a segment should be from the same hour for proper partitioning
-        let (event_date, event_hour) = derive_partition_columns(events[0].timestamp_ms);
 
         // Generate data file name and key
         let filename = data_file_name();
@@ -291,9 +301,19 @@ impl ColdStorage for IcebergStorage {
         partition: u32,
         start_offset: u64,
         limit: usize,
-    ) -> Result<Vec<StoredEvent>, StorageError> {
-        // List all Parquet files in the partitioned structure
-        // Search all event_date/event_hour directories for the partition
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+) -> Result<Vec<StoredEvent>, StorageError> {
+        // Log warning if time range not provided (less efficient)
+        if since_ms.is_none() || until_ms.is_none() {
+            tracing::warn!(
+                topic = topic,
+                partition = partition,
+                "read_events called without full time range, listing all data (may be slow)"
+            );
+        }
+
+        // For now, use full data prefix (future improvement: time-based prefix pruning)
         let prefix = format!("{}/{}/data/", self.base_path, topic);
 
         let response = self

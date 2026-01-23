@@ -80,6 +80,8 @@ impl ColdStorage for NoopColdStorage {
         _partition: u32,
         _start_offset: u64,
         _limit: usize,
+        _since_ms: Option<i64>,
+        _until_ms: Option<i64>,
     ) -> Result<Vec<crate::contracts::StoredEvent>, StorageError> {
         Ok(Vec::new())
     }
@@ -446,7 +448,7 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
                 let cold = cold.clone();
                 let table = table.clone();
                 async move {
-                    cold.read_events(&table, partition, 0, query.limit + 1)
+                    cold.read_events(&table, partition, 0, query.limit + 1, query.since, None)
                         .await
                         .unwrap_or_default()
                 }

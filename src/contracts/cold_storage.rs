@@ -32,12 +32,15 @@ pub trait ColdStorage: Send + Sync {
     ) -> impl Future<Output = Result<String, StorageError>> + Send;
 
     /// Reads events from cold storage starting at the given offset.
+    /// Optional time range parameters enable partition pruning for better performance.
     fn read_events(
         &self,
         topic: &str,
         partition: u32,
         start_offset: u64,
         limit: usize,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
     ) -> impl Future<Output = Result<Vec<StoredEvent>, StorageError>> + Send;
 
     /// Lists all segments for a topic/partition.
