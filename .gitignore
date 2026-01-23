@@ -4,3 +4,8 @@
 __pycache__/
 *.pyc
 *_pb2.py
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
