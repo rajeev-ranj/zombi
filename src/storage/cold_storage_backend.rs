@@ -79,10 +79,7 @@ impl ColdStorage for ColdStorageBackend {
         }
     }
 
-    async fn commit_snapshot(
-        &self,
-        topic: &str,
-    ) -> Result<Option<i64>, StorageError> {
+    async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
         match self {
             Self::S3(s) => s.commit_snapshot(topic).await,
             Self::Iceberg(s) => s.commit_snapshot(topic).await,

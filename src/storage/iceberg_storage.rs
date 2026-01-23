@@ -397,10 +397,7 @@ impl ColdStorage for IcebergStorage {
         ))
     }
 
-    async fn commit_snapshot(
-        &self,
-        topic: &str,
-    ) -> Result<Option<i64>, StorageError> {
+    async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
         self.commit_snapshot(topic).await
     }
 }
