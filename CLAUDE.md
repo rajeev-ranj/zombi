@@ -14,6 +14,7 @@ Zombi is a Kafka-replacement event streaming system written in Rust. It uses Roc
 - `SPEC.md` — Full specification and API reference
 - `CHANGELOG.md` — Version history and feature status
 - `testing_strategy.md` — Comprehensive testing approach
+- `docs/BRANCHING_STRATEGY_SIMPLE.md` — Current development workflow (v0.x)
 
 ---
 

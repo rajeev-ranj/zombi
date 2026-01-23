@@ -1,0 +1,140 @@
+name: Performance Issue
+description: Report a performance regression or optimization opportunity
+title: "[Perf]: "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a performance issue! Benchmarks and measurements are critical.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Performance Issue Description
+      description: What performance problem did you observe?
+      placeholder: Describe the performance issue (slow writes, high latency, memory leak, etc.)
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Performance Measurements
+      description: Provide concrete measurements (benchmark results, profiling data, metrics)
+      placeholder: |
+        # Example:
+        cargo bench write_single/1kb
+        Before: 1.2 µs
+        After: 2.5 µs (+108% regression)
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Performance Issue Type
+      options:
+        - Write latency regression
+        - Read latency regression
+        - Throughput degradation
+        - Memory leak / high memory usage
+        - CPU usage spike
+        - Disk I/O bottleneck
+        - Network bottleneck
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to Reproduce
+      description: Steps to reproduce the performance issue
+      placeholder: |
+        1. Run benchmark: cargo bench write_single
+        2. Compare against baseline: cargo bench -- --baseline main
+        3. Observe X% regression in...
+    validations:
+      required: true
+
+  - type: input
+    id: baseline
+    attributes:
+      label: Baseline Version
+      description: What version/commit had acceptable performance?
+      placeholder: v0.2.0 or commit hash
+    validations:
+      required: true
+
+  - type: input
+    id: regression
+    attributes:
+      label: Regression Version
+      description: What version/commit shows the regression?
+      placeholder: main or commit hash
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Hardware and configuration details
+      placeholder: |
+        Hardware: MacBook Pro M4 Max, 36GB RAM
+        OS: macOS 14.6
+        Rust: 1.75.0
+        Configuration: Default / custom (specify)
+    validations:
+      required: true
+
+  - type: textarea
+    id: profiling
+    attributes:
+      label: Profiling Data
+      description: Attach profiling data if available (flamegraphs, perf output, etc.)
+      placeholder: |
+        Attach or link to:
+        - Flamegraphs
+        - cargo flamegraph output
+        - perf stat results
+        - Allocation profiles
+
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Root Cause Hypothesis
+      description: Do you have a hypothesis about what's causing this?
+      placeholder: |
+        Suspected cause: Recent commit added extra allocations in write path
+        Related PR: #123
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical (>20% regression, blocks release)
+        - High (10-20% regression)
+        - Medium (5-10% regression)
+        - Low (<5% regression or optimization opportunity)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I can provide more detailed profiling data
+        - label: I'm willing to investigate and submit a fix
+        - label: I have a fix ready
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other relevant information
+      placeholder: Related issues, previous performance reports, etc.

@@ -1,0 +1,21 @@
+# Code Owners for Zombi
+# These owners will be automatically requested for review when someone opens a PR
+
+# Storage layer requires extra scrutiny
+/src/storage/ @rajeev-ranj
+/src/contracts/ @rajeev-ranj
+
+# Core flusher logic
+/src/flusher/ @rajeev-ranj
+
+# Critical documentation
+/SPEC.md @rajeev-ranj
+/VERSIONING.md @rajeev-ranj
+/docs/BRANCHING_STRATEGY.md @rajeev-ranj
+
+# CI/CD changes
+/.github/workflows/ @rajeev-ranj
+
+# Build and dependencies
+/Cargo.toml @rajeev-ranj
+/Dockerfile @rajeev-ranj

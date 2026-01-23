@@ -1,0 +1,34 @@
+# <type>(<scope>): <subject>
+#
+# <body>
+#
+# Fixes #<issue-number>
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Type: feat, fix, perf, docs, test, refactor, chore
+# Scope: storage, api, flusher, bench, ci, etc.
+# Subject: Imperative mood, lowercase, no period at end (max 50 chars)
+#
+# Body: Explain WHAT and WHY (not HOW). Wrap at 72 characters.
+#       Include:
+#       - Rationale for the change
+#       - Alternative approaches considered
+#       - Performance impact (if applicable)
+#       - Breaking changes (if any)
+#
+# Examples:
+#   feat(storage): add QUIC write path
+#   fix(flusher): prevent deadlock on concurrent flush
+#   perf(rocksdb): batch writes for 30% latency improvement
+#   docs(readme): update installation instructions
+#
+# For large diffs (>200 lines), include justification for new code:
+#   Why is this code necessary?
+#   Why can't existing code solve this?
+#   What alternatives were considered?
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup (one-time):
+#   git config commit.template .gitmessage
+#
+# Co-authored-by: Warp <agent@warp.dev>  (if AI-assisted)

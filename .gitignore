@@ -30,3 +30,19 @@ fuzz/artifacts/
 
 # Claude Code
 .claude/
+
+# Benchmark artifacts
+target/criterion/
+
+# Coverage reports
+*.profraw
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Editor backup files
+*~
+\#*\#
+
+# Cargo build cache
+.cargo/

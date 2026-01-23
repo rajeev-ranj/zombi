@@ -1,0 +1,38 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Rust source files
+*.rs text eol=lf
+*.toml text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Config files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Protobuf
+*.proto text eol=lf
+
+# Docker
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# Git
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binary files (don't diff)
+*.parquet binary
+*.png binary
+*.jpg binary
+*.ico binary
+
+# Lock files (don't merge, regenerate)
+Cargo.lock merge=binary

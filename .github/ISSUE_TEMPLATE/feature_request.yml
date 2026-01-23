@@ -1,0 +1,97 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a new feature! Please describe what you'd like to see.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this feature solve? What's the use case?
+      placeholder: "As a user, I want to... because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How would you like this to work? Be as specific as possible.
+      placeholder: Describe your ideal solution
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Are there workarounds or alternative solutions you've considered?
+      placeholder: Describe alternatives or workarounds
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which component does this affect?
+      options:
+        - Storage (RocksDB, S3, Iceberg)
+        - API / HTTP endpoints
+        - Flusher / Background jobs
+        - Performance / Benchmarks
+        - Documentation
+        - Deployment / Infrastructure
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How important is this feature to you?
+      options:
+        - High (critical for my use case)
+        - Medium (would be very useful)
+        - Low (nice to have)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: breaking
+    attributes:
+      label: Breaking Change
+      description: Would this require breaking changes?
+      options:
+        - label: This would require breaking changes to the API or storage format
+        - label: This can be implemented without breaking changes
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Expected Impact
+      description: |
+        Consider the impact of this feature:
+        - Performance implications?
+        - New dependencies required?
+        - Complexity added?
+      placeholder: Describe expected impact
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to contribute a PR for this feature
+        - label: I can help with testing/feedback
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context, examples, or references
+      placeholder: Links to similar features, example use cases, etc.

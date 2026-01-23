@@ -1,0 +1,109 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Detailed steps to reproduce the behavior
+      placeholder: |
+        1. Start Zombi with config...
+        2. Send POST request to...
+        3. Observe error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened?
+      placeholder: Describe the expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include error messages, logs, or screenshots.
+      placeholder: Paste error logs, stack traces, or screenshots here
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Zombi Version
+      description: Which version are you using? (e.g., v0.2.0, main branch commit hash)
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage Backend
+      description: Which storage backend were you using?
+      options:
+        - RocksDB only (no S3)
+        - RocksDB + S3 (JSON)
+        - RocksDB + S3 (Iceberg/Parquet)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Relevant environment variables or configuration
+      placeholder: |
+        ZOMBI_S3_BUCKET=my-bucket
+        ZOMBI_ICEBERG_ENABLED=true
+        ZOMBI_FLUSH_INTERVAL_SECS=30
+      render: shell
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output (run with RUST_LOG=zombi=debug)
+      placeholder: Paste logs here
+      render: shell
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How severe is this bug?
+      options:
+        - Critical (data loss, crashes, security)
+        - High (blocks major functionality)
+        - Medium (workaround exists)
+        - Low (minor issue, cosmetic)
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context about the problem
+      placeholder: Environment details, related issues, attempted fixes, etc.

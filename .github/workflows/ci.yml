@@ -21,6 +21,11 @@ on:
       - "VERSIONING.md"
   workflow_dispatch:
 
+# Cancel in-progress runs when a new commit is pushed to the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -29,6 +34,7 @@ jobs:
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +46,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.8
+
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -47,7 +61,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+            ${{ runner.os }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -59,6 +76,7 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -68,6 +86,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.8
+
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -75,19 +101,150 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
 
       - name: Run all tests
-        run: cargo test
+        run: cargo test -- --test-threads=1 2>&1 | tee test-output.log
 
       - name: Verify benchmarks compile
         run: cargo bench --no-run
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test-output.log
+          retention-days: 7
+
+  # Documentation coherence check - runs on every push/PR
+  docs-check:
+    name: Documentation Coherence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check documentation coherence
+        run: ./scripts/check-docs-coherence.sh
+
+  # Security audit - runs on every push/PR
+  security:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-deny
+          version: "0.14"
+
+      - name: Check dependencies
+        run: cargo deny check
+
+  # Benchmark regression check - opt-in via label or keyword
+  # To trigger: add 'performance' label OR include '[benchmark]' in PR title/body
+  bench-regression:
+    name: Benchmark Regression Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: |
+      github.event_name == 'pull_request' && (
+        contains(github.event.pull_request.labels.*.name, 'performance') ||
+        contains(github.event.pull_request.title, '[benchmark]') ||
+        contains(github.event.pull_request.body, '[benchmark]')
+      )
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for comparison
+
+      - name: Install Protobuf Compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.8
+
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Install critcmp (cached)
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: critcmp
+          version: "0.1"
+
+      - name: Run benchmarks on PR branch
+        run: |
+          cargo bench --bench write_throughput -- --save-baseline pr
+
+      - name: Checkout main branch
+        run: |
+          git fetch origin main
+          git checkout origin/main
+
+      - name: Run benchmarks on main branch
+        run: |
+          cargo bench --bench write_throughput -- --save-baseline main
+
+      - name: Compare benchmarks
+        run: |
+          critcmp main pr > comparison.txt || true
+          cat comparison.txt
+
+          # Check for regressions > 10% (matches 10.0% through 999.9%)
+          if grep -E "\+(1[0-9]|[2-9][0-9]|[0-9]{3,})\.[0-9]+%" comparison.txt; then
+            echo "❌ Significant performance regression detected (>10%)"
+            echo "See comparison above. If this is expected, provide justification in PR."
+            exit 1
+          fi
+
+          # Warn about regressions 5-10%
+          if grep -E "\+[5-9]\.[0-9]+%" comparison.txt; then
+            echo "⚠️  Performance regression 5-10% detected"
+            echo "This requires justification and maintainer approval."
+          fi
+
+          echo "✅ No significant performance regressions detected"
+
+      - name: Upload benchmark comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comparison
+          path: comparison.txt
+          retention-days: 30
+
 
   # Docker build - runs only on main
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    timeout-minutes: 30
+    needs: [lint, test, docs-check, security]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -125,10 +282,124 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Integration test with MinIO - runs on main only (needs published image)
-  integration:
-    name: Integration Test (MinIO + Iceberg)
+  # Integration test for PRs - builds Docker image locally
+  integration-pr:
+    name: Integration Test (PR)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, test, docs-check, security]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image locally
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: zombi:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data --console-address ":9001"
+
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live > /dev/null 2>&1; then
+              echo "MinIO is healthy"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install awscli
+
+      - name: Create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://localhost:9000 s3 mb s3://zombi-events
+
+      - name: Run Zombi
+        run: |
+          docker run -d --name zombi \
+            --network host \
+            -e AWS_ACCESS_KEY_ID=minioadmin \
+            -e AWS_SECRET_ACCESS_KEY=minioadmin \
+            -e ZOMBI_S3_BUCKET=zombi-events \
+            -e ZOMBI_S3_ENDPOINT=http://localhost:9000 \
+            -e ZOMBI_S3_REGION=us-east-1 \
+            -e ZOMBI_ICEBERG_ENABLED=true \
+            -e ZOMBI_FLUSH_INTERVAL_SECS=1 \
+            -e ZOMBI_FLUSH_BATCH_SIZE=1 \
+            -e ZOMBI_FLUSH_MAX_SEGMENT=1 \
+            zombi:pr-${{ github.event.pull_request.number }}
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then
+              echo "Zombi is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Zombi did not become healthy in time"
+          docker logs zombi
+          exit 1
+
+      - name: Test write endpoint
+        run: |
+          curl -fsS -X POST http://localhost:8080/tables/events \
+            -H "Content-Type: application/json" \
+            -d '{"payload":"hello from pr"}'
+
+      - name: Test read endpoint
+        run: |
+          curl -fsS http://localhost:8080/tables/events | jq .
+
+      - name: Test stats endpoint
+        run: |
+          curl -fsS http://localhost:8080/stats | jq .
+
+      - name: Verify Iceberg data in MinIO
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          sleep 3
+          echo "Listing all objects in bucket:"
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+          echo "Checking for Iceberg structure:"
+          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
+
+      - name: Show Zombi logs
+        if: always()
+        run: docker logs zombi
+
+  # Integration test with MinIO - runs on main only (uses published image)
+  integration:
+    name: Integration Test (Main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: docker
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
@@ -227,6 +498,7 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: integration
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:

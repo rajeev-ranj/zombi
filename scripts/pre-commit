@@ -1,0 +1,104 @@
+#!/bin/bash
+#
+# Pre-commit hook to enforce code quality standards
+# Install: ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+#
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Colors for output
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# Check for large diffs
+DIFF_LINES=$(git diff --cached --numstat | awk '{sum+=$1+$2} END {print sum}')
+if [ -z "$DIFF_LINES" ]; then
+    DIFF_LINES=0
+fi
+
+if [ "$DIFF_LINES" -gt 500 ]; then
+    echo -e "${RED}❌ Very large diff detected ($DIFF_LINES lines)${NC}"
+    echo "   Consider splitting this into smaller commits."
+    echo "   If this is necessary, ensure thorough code justification in commit message."
+    exit 1
+elif [ "$DIFF_LINES" -gt 200 ]; then
+    echo -e "${YELLOW}⚠️  Large diff detected ($DIFF_LINES lines)${NC}"
+    echo "   Ensure code justification is documented in commit message:"
+    echo "   - Why is this code necessary?"
+    echo "   - What alternatives were considered?"
+    echo "   - Why can't existing code solve this?"
+    echo ""
+fi
+
+# Check for TODOs without issue links
+TODO_VIOLATIONS=$(git diff --cached | grep -E "^\+.*TODO" | grep -v "TODO.*#[0-9]" || true)
+if [ -n "$TODO_VIOLATIONS" ]; then
+    echo -e "${RED}❌ TODO found without GitHub issue link:${NC}"
+    echo "$TODO_VIOLATIONS"
+    echo ""
+    echo "Fix: Link to an issue (e.g., 'TODO: #123 - handle this case')"
+    echo "Or: Create an issue and link it, or remove the TODO"
+    exit 1
+fi
+
+# Check for FIXME without issue links
+FIXME_VIOLATIONS=$(git diff --cached | grep -E "^\+.*FIXME" | grep -v "FIXME.*#[0-9]" || true)
+if [ -n "$FIXME_VIOLATIONS" ]; then
+    echo -e "${RED}❌ FIXME found without GitHub issue link:${NC}"
+    echo "$FIXME_VIOLATIONS"
+    echo ""
+    echo "Fix: Link to an issue (e.g., 'FIXME: #123 - broken edge case')"
+    exit 1
+fi
+
+# Check for unwrap() or expect() in non-test code
+UNWRAP_VIOLATIONS=$(git diff --cached -- '*.rs' ':(exclude)tests/' | grep -E "^\+.*\.(unwrap|expect)\(" || true)
+if [ -n "$UNWRAP_VIOLATIONS" ]; then
+    echo -e "${YELLOW}⚠️  Found .unwrap() or .expect() in non-test code:${NC}"
+    echo "$UNWRAP_VIOLATIONS"
+    echo ""
+    echo "Consider using proper error handling with ? operator instead"
+    echo "Press Enter to continue anyway, or Ctrl+C to abort and fix"
+    read
+fi
+
+# Run rustfmt check
+echo "📝 Checking code formatting..."
+if ! cargo fmt --check --quiet; then
+    echo -e "${RED}❌ Code is not formatted. Run: cargo fmt${NC}"
+    exit 1
+fi
+
+# Run clippy on changed Rust files
+if git diff --cached --name-only | grep -q '\.rs$'; then
+    echo "🔧 Running clippy on changed files..."
+    if ! cargo clippy --quiet -- -D warnings 2>&1 | head -20; then
+        echo -e "${RED}❌ Clippy found issues. Fix them or use #[allow(...)] with justification${NC}"
+        exit 1
+    fi
+fi
+
+# Run tests on changed Rust files
+if git diff --cached --name-only | grep -q '\.rs$'; then
+    echo "🧪 Running tests..."
+    # Only run quick tests in pre-commit (not integration tests)
+    if ! cargo test --lib --quiet 2>&1 | tail -20; then
+        echo -e "${RED}❌ Tests failed. Fix before committing.${NC}"
+        exit 1
+    fi
+fi
+
+# Check that Cargo.toml changes are accompanied by Cargo.lock changes
+if git diff --cached --name-only | grep -q 'Cargo.toml'; then
+    if ! git diff --cached --name-only | grep -q 'Cargo.lock'; then
+        echo -e "${YELLOW}⚠️  Cargo.toml changed but Cargo.lock not updated${NC}"
+        echo "   Run: cargo check"
+        exit 1
+    fi
+fi
+
+echo -e "${GREEN}✅ All pre-commit checks passed!${NC}"
