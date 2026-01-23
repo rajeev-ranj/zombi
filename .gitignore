@@ -9,3 +9,24 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# macOS
+.DS_Store
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+
+# Fuzzing
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Claude Code
+.claude/
