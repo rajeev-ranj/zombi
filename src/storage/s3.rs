@@ -246,6 +246,18 @@ impl ColdStorage for S3Storage {
             base_path: "segments".into(),
         }
     }
+
+    fn iceberg_metadata_location(&self, _topic: &str) -> Option<String> {
+        None
+    }
+
+    async fn commit_snapshot(
+        &self,
+        _topic: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        // S3 storage doesn't create Iceberg metadata
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

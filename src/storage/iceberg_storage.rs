@@ -396,6 +396,13 @@ impl ColdStorage for IcebergStorage {
             self.bucket, self.base_path, topic
         ))
     }
+
+    async fn commit_snapshot(
+        &self,
+        topic: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        self.commit_snapshot(topic).await
+    }
 }
 
 /// Reads events from Parquet bytes.

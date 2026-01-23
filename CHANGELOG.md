@@ -4,6 +4,9 @@ All notable changes to Zombi are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Iceberg metadata files now created after flush (snapshots + version metadata)
+
 ### Planned
 - Streaming endpoint (`GET /tables/{table}/stream`)
 - Prometheus metrics endpoint (`/metrics`)

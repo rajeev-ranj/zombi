@@ -78,4 +78,14 @@ impl ColdStorage for ColdStorageBackend {
             Self::Iceberg(s) => s.iceberg_metadata_location(topic),
         }
     }
+
+    async fn commit_snapshot(
+        &self,
+        topic: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        match self {
+            Self::S3(s) => s.commit_snapshot(topic).await,
+            Self::Iceberg(s) => s.commit_snapshot(topic).await,
+        }
+    }
 }

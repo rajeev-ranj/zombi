@@ -54,6 +54,15 @@ pub trait ColdStorage: Send + Sync {
     fn iceberg_metadata_location(&self, _topic: &str) -> Option<String> {
         None
     }
+
+    /// Commits an Iceberg snapshot (metadata + manifest) for a table.
+    /// Only applicable for Iceberg backends; S3 backends should be a no-op.
+    fn commit_snapshot(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<Option<i64>, StorageError>> + Send {
+        async move { Ok(None) }
+    }
 }
 
 /// Information about a stored segment.

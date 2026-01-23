@@ -172,6 +172,35 @@ where
             .write_segment(topic, partition, &events)
             .await?;
 
+        // Commit Iceberg snapshot if enabled
+        if iceberg_enabled && events_count > 0 {
+            match cold_storage.commit_snapshot(topic).await {
+                Ok(Some(snapshot_id)) => {
+                    tracing::info!(
+                        topic = topic,
+                        partition = partition,
+                        snapshot_id = snapshot_id,
+                        "Committed Iceberg snapshot"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        topic = topic,
+                        partition = partition,
+                        "No Iceberg snapshot to commit (no pending files)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        topic = topic,
+                        partition = partition,
+                        error = %e,
+                        "Failed to commit Iceberg snapshot"
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             topic = topic,
             partition = partition,
