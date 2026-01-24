@@ -321,7 +321,8 @@ Redis stores:
 | `ZOMBI_STORAGE_PATH` | `tables` | Base path in bucket |
 | **Iceberg** |
 | `ZOMBI_ICEBERG_ENABLED` | `true` | Enable Iceberg output |
-| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size |
+| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size (flush) |
+| `ZOMBI_COMPACTED_FILE_SIZE_MB` | `512` | Target file size after compaction |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `30` | Flush interval |
 | `ZOMBI_FLUSH_MIN_EVENTS` | `10000` | Min events before flush |
 | **Catalog** |
@@ -333,6 +334,40 @@ Redis stores:
 | `ZOMBI_NODE_ID` | `auto` | Unique node identifier |
 | **Observability** |
 | `RUST_LOG` | `zombi=info` | Log level |
+
+---
+
+## Tuning Guide
+
+### File Size Thresholds
+
+Zombi uses two file size settings that affect performance:
+
+| Setting | Env Variable | Default | Purpose |
+|---------|--------------|---------|---------|
+| Flush file size | `ZOMBI_TARGET_FILE_SIZE_MB` | 128 | Target size for initial Parquet files |
+| Compacted file size | `ZOMBI_COMPACTED_FILE_SIZE_MB` | 512 | Target size after compaction merges |
+
+**Recommended settings by scale:**
+
+| Workload | Events/day | Flush Size | Compacted Size | Notes |
+|----------|------------|------------|----------------|-------|
+| Development | <100K | 16 MB | 64 MB | Faster iteration |
+| Small | 100K-1M | 64 MB | 256 MB | Balanced |
+| Medium | 1M-10M | 128 MB | 512 MB | Default settings |
+| Large | 10M-100M | 256 MB | 1024 MB | Fewer files, larger batches |
+
+**Tuning principles:**
+- Larger files = fewer S3 PUTs = lower cost and less metadata
+- Smaller files = more frequent flushes = lower data loss window
+- Compacted files should be 2-4x the flush size for efficient merging
+
+**Example configuration for high-throughput:**
+```bash
+export ZOMBI_TARGET_FILE_SIZE_MB=256
+export ZOMBI_COMPACTED_FILE_SIZE_MB=1024
+export ZOMBI_FLUSH_INTERVAL_SECS=60
+```
 
 ---
 
