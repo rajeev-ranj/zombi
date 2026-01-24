@@ -5,18 +5,34 @@ use axum::http::{Request, StatusCode};
 use prost::Message;
 use tower::ServiceExt;
 
-use zombi::api::{create_router, AppState, Metrics, NoopColdStorage};
+use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
 use zombi::proto;
 use zombi::storage::RocksDbStorage;
+
+fn create_test_app_with_backpressure(
+    config: BackpressureConfig,
+) -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let state = Arc::new(AppState::new(
+        Arc::new(storage),
+        None::<Arc<NoopColdStorage>>,
+        Arc::new(Metrics::new()),
+        config,
+    ));
+    let router = create_router(state);
+    (router, dir)
+}
 
 fn create_test_app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let storage = RocksDbStorage::open(dir.path()).unwrap();
-    let state = Arc::new(AppState {
-        storage: Arc::new(storage),
-        cold_storage: None::<Arc<NoopColdStorage>>,
-        metrics: Arc::new(Metrics::new()),
-    });
+    let state = Arc::new(AppState::new(
+        Arc::new(storage),
+        None::<Arc<NoopColdStorage>>,
+        Arc::new(Metrics::new()),
+        BackpressureConfig::default(),
+    ));
     let router = create_router(state);
     (router, dir)
 }
@@ -24,11 +40,12 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
 fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let storage = RocksDbStorage::open(dir.path()).unwrap();
-    let state = Arc::new(AppState {
-        storage: Arc::new(storage),
-        cold_storage: Some(Arc::new(NoopColdStorage)),
-        metrics: Arc::new(Metrics::new()),
-    });
+    let state = Arc::new(AppState::new(
+        Arc::new(storage),
+        Some(Arc::new(NoopColdStorage)),
+        Arc::new(Metrics::new()),
+        BackpressureConfig::default(),
+    ));
     let router = create_router(state);
     (router, dir)
 }
@@ -538,4 +555,37 @@ async fn test_stats_endpoint() {
     assert_eq!(json["reads"]["total"], 1);
     assert_eq!(json["reads"]["records_total"], 5);
     assert_eq!(json["errors_total"], 0);
+}
+
+#[tokio::test]
+async fn test_backpressure_bytes_limit() {
+    // Create app with very low byte limit to test backpressure
+    let config = BackpressureConfig {
+        max_inflight_writes: 10000,
+        max_inflight_bytes: 10, // Only 10 bytes allowed
+    };
+    let (app, _dir) = create_test_app_with_backpressure(config);
+
+    // First write should succeed (within limit)
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/test")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "small"}"#)) // ~20 bytes total
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should get 503 Service Unavailable due to byte limit exceeded
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "SERVER_OVERLOADED");
 }

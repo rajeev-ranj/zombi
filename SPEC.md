@@ -329,6 +329,9 @@ Redis stores:
 | `ZOMBI_CATALOG_TYPE` | `filesystem` | `filesystem` or `rest` |
 | `ZOMBI_CATALOG_URL` | - | REST catalog URL |
 | `ZOMBI_CATALOG_NAMESPACE` | `zombi` | Iceberg namespace |
+| **Backpressure** |
+| `ZOMBI_MAX_INFLIGHT_WRITES` | `10000` | Max concurrent writes |
+| `ZOMBI_MAX_INFLIGHT_BYTES_MB` | `64` | Max inflight bytes (MB) |
 | **Scaling** |
 | `ZOMBI_REDIS_URL` | - | Redis URL (enables multi-node) |
 | `ZOMBI_NODE_ID` | `auto` | Unique node identifier |

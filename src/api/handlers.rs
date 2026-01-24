@@ -10,6 +10,7 @@ use axum::Json;
 use futures::future::join_all;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::contracts::{ColdStorage, HotStorage, StorageError};
 use crate::proto;
@@ -54,11 +55,133 @@ impl Metrics {
     }
 }
 
+/// Configuration for write backpressure.
+#[derive(Debug, Clone)]
+pub struct BackpressureConfig {
+    /// Maximum number of concurrent inflight writes.
+    /// When exceeded, new writes return 503.
+    /// Default: 10,000
+    pub max_inflight_writes: usize,
+    /// Maximum bytes of inflight write payloads.
+    /// When exceeded, new writes return 503.
+    /// Default: 64MB
+    pub max_inflight_bytes: usize,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            max_inflight_writes: 10_000,
+            max_inflight_bytes: 64 * 1024 * 1024, // 64MB
+        }
+    }
+}
+
+impl BackpressureConfig {
+    /// Creates a config from environment variables.
+    ///
+    /// Reads:
+    /// - `ZOMBI_MAX_INFLIGHT_WRITES`: Max concurrent writes (default: 10000)
+    /// - `ZOMBI_MAX_INFLIGHT_BYTES_MB`: Max inflight bytes in MB (default: 64)
+    pub fn from_env() -> Self {
+        let default = Self::default();
+
+        let max_inflight_writes = std::env::var("ZOMBI_MAX_INFLIGHT_WRITES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.max_inflight_writes);
+
+        let max_inflight_bytes = std::env::var("ZOMBI_MAX_INFLIGHT_BYTES_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(default.max_inflight_bytes);
+
+        Self {
+            max_inflight_writes,
+            max_inflight_bytes,
+        }
+    }
+}
+
 /// Application state shared across handlers.
 pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub storage: Arc<H>,
     pub cold_storage: Option<Arc<C>>,
     pub metrics: Arc<Metrics>,
+    /// Semaphore for limiting concurrent writes
+    pub write_semaphore: Arc<Semaphore>,
+    /// Current inflight bytes (for byte-based backpressure)
+    pub inflight_bytes: AtomicU64,
+    /// Maximum inflight bytes before rejecting writes
+    pub max_inflight_bytes: u64,
+}
+
+impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
+    /// Creates a new AppState with backpressure configuration.
+    pub fn new(
+        storage: Arc<H>,
+        cold_storage: Option<Arc<C>>,
+        metrics: Arc<Metrics>,
+        backpressure: BackpressureConfig,
+    ) -> Self {
+        Self {
+            storage,
+            cold_storage,
+            metrics,
+            write_semaphore: Arc::new(Semaphore::new(backpressure.max_inflight_writes)),
+            inflight_bytes: AtomicU64::new(0),
+            max_inflight_bytes: backpressure.max_inflight_bytes as u64,
+        }
+    }
+
+    /// Tries to acquire backpressure permits for a write of the given size.
+    /// Returns an error if the server is overloaded.
+    fn try_acquire_write_permit(&self, bytes: u64) -> Result<WritePermit<'_>, StorageError> {
+        // Try to acquire the count-based semaphore permit
+        let permit = self
+            .write_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                StorageError::Overloaded(format!(
+                    "Too many concurrent writes (limit: {})",
+                    self.write_semaphore.available_permits() + 1 // Add 1 because we just tried to acquire
+                ))
+            })?;
+
+        // Check byte-based limit
+        let current_bytes = self.inflight_bytes.fetch_add(bytes, Ordering::SeqCst);
+        if current_bytes + bytes > self.max_inflight_bytes {
+            // Rollback the byte count
+            self.inflight_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            // Permit will be dropped automatically
+            drop(permit);
+            return Err(StorageError::Overloaded(format!(
+                "Too many inflight bytes ({} + {} > {} limit)",
+                current_bytes, bytes, self.max_inflight_bytes
+            )));
+        }
+
+        Ok(WritePermit {
+            _permit: permit,
+            bytes,
+            inflight_bytes: &self.inflight_bytes,
+        })
+    }
+}
+
+/// RAII guard for write permit - releases bytes when dropped.
+struct WritePermit<'a> {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    bytes: u64,
+    inflight_bytes: &'a AtomicU64,
+}
+
+impl Drop for WritePermit<'_> {
+    fn drop(&mut self) {
+        self.inflight_bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 /// No-op cold storage for when S3 is not configured.
@@ -212,6 +335,13 @@ impl IntoResponse for ApiError {
                     code: "OFFSET_OUT_OF_RANGE".into(),
                 },
             ),
+            ApiError::Storage(StorageError::Overloaded(msg)) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorResponse {
+                    error: msg,
+                    code: "SERVER_OVERLOADED".into(),
+                },
+            ),
             ApiError::Storage(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorResponse {
@@ -251,6 +381,12 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
 ) -> Result<(StatusCode, Json<WriteRecordResponse>), ApiError> {
     let start = Instant::now();
     let body_len = body.len() as u64;
+
+    // Acquire backpressure permit before processing
+    let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
+        state.metrics.record_error();
+        ApiError::from(e)
+    })?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -364,6 +500,12 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
         .collect();
 
     let total_bytes: u64 = events.iter().map(|e| e.payload.len() as u64).sum();
+
+    // Acquire backpressure permit before processing
+    let _permit = state.try_acquire_write_permit(total_bytes).map_err(|e| {
+        state.metrics.record_error();
+        ApiError::from(e)
+    })?;
 
     // Single batch write for all events
     let offsets = state.storage.write_batch(&table, &events).map_err(|e| {
