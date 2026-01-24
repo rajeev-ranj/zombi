@@ -163,9 +163,13 @@ pub fn write_parquet<P: AsRef<Path>>(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer with Zstd compression
+    // Configure Parquet writer for optimal Iceberg performance:
+    // - ZSTD compression for good ratio with fast decompression
+    // - Large row groups (1M rows max) to minimize metadata overhead
+    //   Note: set_max_row_group_size takes ROW COUNT, not bytes
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(1_000_000)
         .build();
 
     // Write to file
@@ -245,9 +249,13 @@ pub fn write_parquet_to_bytes(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer with Zstd compression
+    // Configure Parquet writer for optimal Iceberg performance:
+    // - ZSTD compression for good ratio with fast decompression
+    // - Large row groups (1M rows max) to minimize metadata overhead
+    //   Note: set_max_row_group_size takes ROW COUNT, not bytes
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(1_000_000)
         .build();
 
     // Write to buffer
@@ -457,5 +465,114 @@ mod tests {
 
         assert!(events_to_record_batch(&events).is_err());
         assert!(write_parquet_to_bytes(&events).is_err());
+    }
+
+    /// Test that larger batches produce better compression ratios.
+    #[test]
+    fn test_larger_batches_compress_better() {
+        let small_events: Vec<StoredEvent> = (0..100)
+            .map(|i| StoredEvent {
+                sequence: i as u64,
+                topic: "test".into(),
+                partition: 0,
+                payload: format!("event payload data {}", i).into_bytes(),
+                timestamp_ms: 1705276800000 + (i as i64 * 1000),
+                idempotency_key: Some(format!("key-{}", i)),
+            })
+            .collect();
+
+        let large_events: Vec<StoredEvent> = (0..1000)
+            .map(|i| StoredEvent {
+                sequence: i as u64,
+                topic: "test".into(),
+                partition: 0,
+                payload: format!("event payload data {}", i).into_bytes(),
+                timestamp_ms: 1705276800000 + (i as i64 * 1000),
+                idempotency_key: Some(format!("key-{}", i)),
+            })
+            .collect();
+
+        let (small_bytes, small_meta) = write_parquet_to_bytes(&small_events).unwrap();
+        let (large_bytes, large_meta) = write_parquet_to_bytes(&large_events).unwrap();
+
+        let small_bytes_per_event = small_bytes.len() as f64 / small_meta.row_count as f64;
+        let large_bytes_per_event = large_bytes.len() as f64 / large_meta.row_count as f64;
+
+        assert!(
+            large_bytes_per_event < small_bytes_per_event,
+            "Larger batch should compress better: {} vs {} bytes/event",
+            large_bytes_per_event, small_bytes_per_event
+        );
+    }
+
+    /// Test that Parquet files use ZSTD compression.
+    #[test]
+    fn test_parquet_uses_zstd_compression() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let events = make_test_events();
+        let (bytes, _) = write_parquet_to_bytes(&events).unwrap();
+
+        let bytes = Bytes::from(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let metadata = builder.metadata();
+
+        assert!(metadata.num_row_groups() > 0);
+        let column = metadata.row_group(0).column(0);
+
+        assert_eq!(
+            column.compression(),
+            parquet::basic::Compression::ZSTD(Default::default()),
+            "Expected ZSTD compression"
+        );
+    }
+
+    /// Test that row group size is configured in rows (not bytes).
+    #[test]
+    fn test_row_group_size_is_reasonable() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let events: Vec<StoredEvent> = (0..500)
+            .map(|i| StoredEvent {
+                sequence: i as u64,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"test payload".to_vec(),
+                timestamp_ms: 1705276800000 + (i as i64 * 1000),
+                idempotency_key: None,
+            })
+            .collect();
+
+        let (bytes, _) = write_parquet_to_bytes(&events).unwrap();
+
+        let bytes = Bytes::from(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let metadata = builder.metadata();
+
+        assert_eq!(metadata.num_row_groups(), 1);
+        assert_eq!(metadata.row_group(0).num_rows(), 500);
+    }
+
+    /// Test that compression is working effectively.
+    #[test]
+    fn test_compression_effectiveness() {
+        let events: Vec<StoredEvent> = (0..1000)
+            .map(|i| StoredEvent {
+                sequence: i as u64,
+                topic: "orders".into(),
+                partition: 0,
+                payload: b"repeated payload data for compression test".to_vec(),
+                timestamp_ms: 1705276800000,
+                idempotency_key: None,
+            })
+            .collect();
+
+        let (bytes, metadata) = write_parquet_to_bytes(&events).unwrap();
+        let raw_size = events.iter().map(|e| e.payload.len()).sum::<usize>();
+
+        assert!(bytes.len() < raw_size);
+        assert_eq!(metadata.row_count, 1000);
     }
 }
