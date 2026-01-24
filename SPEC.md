@@ -325,6 +325,7 @@ Redis stores:
 | `ZOMBI_COMPACTED_FILE_SIZE_MB` | `512` | Target file size after compaction |
 | `ZOMBI_SNAPSHOT_THRESHOLD_FILES` | `10` | Min files before snapshot commit |
 | `ZOMBI_SNAPSHOT_THRESHOLD_GB` | `1` | Min GB before snapshot commit |
+| `ZOMBI_MAX_CONCURRENT_S3_UPLOADS` | `4` | Max concurrent S3 uploads |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `30` | Flush interval |
 | `ZOMBI_FLUSH_MIN_EVENTS` | `10000` | Min events before flush |
 | **Catalog** |
