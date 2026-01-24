@@ -2,9 +2,37 @@
 //!
 //! These tests verify that data survives crashes and restarts.
 //! Run with: cargo test --test crash_recovery_tests
+//!
+//! ## Test Categories
+//!
+//! ### Hot Storage Recovery (RocksDB WAL)
+//! - `data_survives_clean_restart`
+//! - `recover_after_crash_before_flush`
+//! - `sequence_generator_recovers_after_restart`
+//! - `high_watermark_recovers_after_restart`
+//! - `idempotency_keys_survive_restart`
+//! - `multiple_idempotency_keys_survive_restart`
+//! - `consumer_offsets_survive_restart`
+//! - `multiple_partitions_survive_restart`
+//! - `multiple_topics_survive_restart`
+//! - `rapid_restarts_no_corruption`
+//! - `large_payload_recovery`
+//!
+//! ### Cold Storage Recovery (Issue #21)
+//! - `unflushed_events_survive_crash` - RocksDB WAL preserves unflushed events
+//! - `flushed_events_readable_after_restart` - Cold storage persists across restart
+//! - `mixed_hot_cold_recovery` - Partial flush scenario
+//! - `flush_watermark_starts_at_zero_after_restart` - Documents volatile watermark behavior
+//! - `multi_partition_crash_recovery` - Partition independence in recovery
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::TempDir;
-use zombi::contracts::HotStorage;
+use zombi::contracts::{
+    ColdStorage, ColdStorageInfo, Flusher, HotStorage, SegmentInfo, StoredEvent,
+};
+use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::storage::RocksDbStorage;
 
 fn create_storage_at(dir: &std::path::Path) -> RocksDbStorage {
@@ -528,6 +556,570 @@ fn large_payload_recovery() {
                     j
                 );
             }
+        }
+    }
+}
+
+// =============================================================================
+// Cold Storage Recovery Tests (Issue #21)
+// =============================================================================
+
+/// File-based cold storage for testing persistence across restarts.
+///
+/// This mock writes JSON segments to disk, simulating S3 behavior
+/// without network I/O. Files persist across storage reopens, allowing
+/// true crash recovery testing.
+struct FileColdStorage {
+    base_path: PathBuf,
+}
+
+impl FileColdStorage {
+    fn new(base_path: &Path) -> Self {
+        Self {
+            base_path: base_path.to_path_buf(),
+        }
+    }
+
+    fn segment_dir(&self, topic: &str, partition: u32) -> PathBuf {
+        self.base_path.join(topic).join(partition.to_string())
+    }
+
+    fn segment_path(&self, topic: &str, partition: u32, start: u64, end: u64) -> PathBuf {
+        self.segment_dir(topic, partition)
+            .join(format!("{:016x}-{:016x}.json", start, end))
+    }
+}
+
+impl ColdStorage for FileColdStorage {
+    async fn write_segment(
+        &self,
+        topic: &str,
+        partition: u32,
+        events: &[StoredEvent],
+    ) -> Result<String, zombi::contracts::StorageError> {
+        if events.is_empty() {
+            return Err(zombi::contracts::StorageError::S3(
+                "Cannot write empty segment".into(),
+            ));
+        }
+
+        let dir = self.segment_dir(topic, partition);
+        fs::create_dir_all(&dir).map_err(|e| {
+            zombi::contracts::StorageError::S3(format!("Failed to create dir: {}", e))
+        })?;
+
+        let start = events.first().unwrap().sequence;
+        let end = events.last().unwrap().sequence;
+        let path = self.segment_path(topic, partition, start, end);
+
+        let json = serde_json::to_string_pretty(events)
+            .map_err(|e| zombi::contracts::StorageError::S3(format!("JSON encode error: {}", e)))?;
+
+        fs::write(&path, json).map_err(|e| {
+            zombi::contracts::StorageError::S3(format!("Failed to write segment: {}", e))
+        })?;
+
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    async fn read_events(
+        &self,
+        topic: &str,
+        partition: u32,
+        start_offset: u64,
+        limit: usize,
+        _since_ms: Option<i64>,
+        _until_ms: Option<i64>,
+    ) -> Result<Vec<StoredEvent>, zombi::contracts::StorageError> {
+        let dir = self.segment_dir(topic, partition);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        // Read all segment files and collect events
+        let mut all_events = Vec::new();
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            zombi::contracts::StorageError::S3(format!("Failed to read dir: {}", e))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                zombi::contracts::StorageError::S3(format!("Failed to read entry: {}", e))
+            })?;
+            let path = entry.path();
+
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let content = fs::read_to_string(&path).map_err(|e| {
+                    zombi::contracts::StorageError::S3(format!("Failed to read file: {}", e))
+                })?;
+
+                let events: Vec<StoredEvent> = serde_json::from_str(&content).map_err(|e| {
+                    zombi::contracts::StorageError::S3(format!("JSON decode error: {}", e))
+                })?;
+
+                all_events.extend(events);
+            }
+        }
+
+        // Sort by sequence and filter
+        all_events.sort_by_key(|e| e.sequence);
+        Ok(all_events
+            .into_iter()
+            .filter(|e| e.sequence >= start_offset)
+            .take(limit)
+            .collect())
+    }
+
+    async fn list_segments(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Vec<SegmentInfo>, zombi::contracts::StorageError> {
+        let dir = self.segment_dir(topic, partition);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut segments = Vec::new();
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            zombi::contracts::StorageError::S3(format!("Failed to read dir: {}", e))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                zombi::contracts::StorageError::S3(format!("Failed to read entry: {}", e))
+            })?;
+            let path = entry.path();
+
+            if let Some(file_name) = path.file_stem() {
+                let name = file_name.to_string_lossy();
+                // Parse filename like "0000000000000001-0000000000000050"
+                if let Some((start_str, end_str)) = name.split_once('-') {
+                    if let (Ok(start), Ok(end)) = (
+                        u64::from_str_radix(start_str, 16),
+                        u64::from_str_radix(end_str, 16),
+                    ) {
+                        let metadata = fs::metadata(&path).ok();
+                        let size_bytes = metadata.map(|m| m.len()).unwrap_or(0);
+
+                        segments.push(SegmentInfo {
+                            segment_id: path.to_string_lossy().to_string(),
+                            start_offset: start,
+                            end_offset: end,
+                            event_count: (end - start + 1) as usize,
+                            size_bytes,
+                        });
+                    }
+                }
+            }
+        }
+
+        segments.sort_by_key(|s| s.start_offset);
+        Ok(segments)
+    }
+
+    fn storage_info(&self) -> ColdStorageInfo {
+        ColdStorageInfo {
+            storage_type: "file".into(),
+            iceberg_enabled: false,
+            bucket: "local".into(),
+            base_path: self.base_path.to_string_lossy().to_string(),
+        }
+    }
+}
+
+/// Test that unflushed events survive a crash (RocksDB WAL preserves them).
+///
+/// This test verifies INV-2: No data loss after ACK.
+/// Events written to hot storage but not yet flushed to cold storage
+/// should be recoverable from the RocksDB WAL after a crash.
+#[test]
+fn unflushed_events_survive_crash() {
+    let dir = TempDir::new().unwrap();
+    let events_count = 50;
+
+    // Phase 1: Write events to hot storage, do NOT flush to cold
+    {
+        let storage = create_storage_at(dir.path());
+        for i in 0..events_count {
+            storage
+                .write(
+                    "test-topic",
+                    0,
+                    format!("unflushed-event-{}", i).as_bytes(),
+                    i as i64 * 1000,
+                    None,
+                )
+                .expect("write should succeed");
+        }
+        // Drop storage without flushing - simulates crash
+    }
+
+    // Phase 2: Reopen and verify all events recovered from WAL
+    {
+        let storage = create_storage_at(dir.path());
+        let events = storage
+            .read("test-topic", 0, 0, 1000)
+            .expect("read should succeed");
+
+        assert_eq!(
+            events.len(),
+            events_count,
+            "All {} unflushed events should be recovered from WAL",
+            events_count
+        );
+
+        // Verify content and order
+        for (i, event) in events.iter().enumerate() {
+            let expected = format!("unflushed-event-{}", i);
+            assert_eq!(
+                String::from_utf8_lossy(&event.payload),
+                expected,
+                "Event {} should have correct payload after recovery",
+                i
+            );
+            assert_eq!(
+                event.timestamp_ms,
+                i as i64 * 1000,
+                "Event {} should have correct timestamp",
+                i
+            );
+        }
+    }
+}
+
+/// Test that events flushed to cold storage are readable after restart.
+///
+/// This test verifies that cold storage (file-based mock simulating S3)
+/// persists data independently of hot storage across restarts.
+#[tokio::test]
+async fn flushed_events_readable_after_restart() {
+    let hot_dir = TempDir::new().unwrap();
+    let cold_dir = TempDir::new().unwrap();
+    let events_count = 100;
+
+    // Phase 1: Write events and flush to cold storage
+    {
+        let hot_storage = Arc::new(create_storage_at(hot_dir.path()));
+        let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
+
+        // Write events
+        for i in 0..events_count {
+            hot_storage
+                .write(
+                    "test-topic",
+                    0,
+                    format!("flushed-event-{}", i).as_bytes(),
+                    i as i64 * 1000,
+                    None,
+                )
+                .expect("write should succeed");
+        }
+
+        // Flush to cold storage using the flusher
+        let config = FlusherConfig::default();
+        let flusher =
+            BackgroundFlusher::new(Arc::clone(&hot_storage), Arc::clone(&cold_storage), config);
+
+        let result = flusher.flush_now().await.expect("flush should succeed");
+        assert_eq!(
+            result.events_flushed, events_count,
+            "Should flush all events"
+        );
+
+        // Drop both storages - simulates crash
+    }
+
+    // Phase 2: Reopen cold storage only and verify events are readable
+    {
+        let cold_storage = FileColdStorage::new(cold_dir.path());
+        let events = cold_storage
+            .read_events("test-topic", 0, 0, 1000, None, None)
+            .await
+            .expect("read should succeed");
+
+        assert_eq!(
+            events.len(),
+            events_count,
+            "All {} events should be readable from cold storage after restart",
+            events_count
+        );
+
+        // Verify content and order
+        for (i, event) in events.iter().enumerate() {
+            let expected = format!("flushed-event-{}", i);
+            assert_eq!(
+                String::from_utf8_lossy(&event.payload),
+                expected,
+                "Event {} should have correct payload in cold storage",
+                i
+            );
+        }
+
+        // Verify segments were created
+        let segments = cold_storage
+            .list_segments("test-topic", 0)
+            .await
+            .expect("list should succeed");
+        assert!(!segments.is_empty(), "Should have at least one segment");
+    }
+}
+
+/// Test mixed hot/cold recovery scenario (most realistic crash case).
+///
+/// This test covers the common case where some events have been flushed
+/// to cold storage while newer events remain only in hot storage.
+/// After a crash, both tiers should be consistent.
+#[tokio::test]
+async fn mixed_hot_cold_recovery() {
+    let hot_dir = TempDir::new().unwrap();
+    let cold_dir = TempDir::new().unwrap();
+    let flushed_count = 50;
+    let unflushed_count = 30;
+    let total_count = flushed_count + unflushed_count;
+
+    // Phase 1: Write some events and flush, then write more (not flushed)
+    {
+        let hot_storage = Arc::new(create_storage_at(hot_dir.path()));
+        let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
+
+        // Write first batch
+        for i in 0..flushed_count {
+            hot_storage
+                .write(
+                    "test-topic",
+                    0,
+                    format!("event-{}", i).as_bytes(),
+                    i as i64 * 1000,
+                    None,
+                )
+                .expect("write should succeed");
+        }
+
+        // Flush first batch to cold storage
+        let config = FlusherConfig::default();
+        let flusher =
+            BackgroundFlusher::new(Arc::clone(&hot_storage), Arc::clone(&cold_storage), config);
+
+        let result = flusher.flush_now().await.expect("flush should succeed");
+        assert_eq!(result.events_flushed, flushed_count);
+
+        // Write second batch (not flushed)
+        for i in flushed_count..total_count {
+            hot_storage
+                .write(
+                    "test-topic",
+                    0,
+                    format!("event-{}", i).as_bytes(),
+                    i as i64 * 1000,
+                    None,
+                )
+                .expect("write should succeed");
+        }
+
+        // Drop storages - simulates crash before second batch is flushed
+    }
+
+    // Phase 2: Verify cold storage has first batch, hot storage has all events
+    {
+        let hot_storage = create_storage_at(hot_dir.path());
+        let cold_storage = FileColdStorage::new(cold_dir.path());
+
+        // Cold storage should have only the first batch
+        let cold_events = cold_storage
+            .read_events("test-topic", 0, 0, 1000, None, None)
+            .await
+            .expect("cold read should succeed");
+        assert_eq!(
+            cold_events.len(),
+            flushed_count,
+            "Cold storage should have {} flushed events",
+            flushed_count
+        );
+
+        // Hot storage should have ALL events (including unflushed)
+        let hot_events = hot_storage
+            .read("test-topic", 0, 0, 1000)
+            .expect("hot read should succeed");
+        assert_eq!(
+            hot_events.len(),
+            total_count,
+            "Hot storage should have all {} events",
+            total_count
+        );
+
+        // Verify continuity - all events present and in order
+        for (i, event) in hot_events.iter().enumerate() {
+            let expected = format!("event-{}", i);
+            assert_eq!(
+                String::from_utf8_lossy(&event.payload),
+                expected,
+                "Event {} should be correct after mixed recovery",
+                i
+            );
+        }
+    }
+}
+
+/// Test that flush watermark resets to zero after restart.
+///
+/// This test documents the EXPECTED behavior that flush watermarks are
+/// volatile (in-memory HashMap). On restart, watermarks reset to 0.
+/// This is a known limitation, not a bug.
+///
+/// Implication: After restart, the flusher may re-flush events that were
+/// already flushed. This is safe (idempotent) but may cause duplicate
+/// segments in cold storage.
+#[tokio::test]
+async fn flush_watermark_starts_at_zero_after_restart() {
+    let hot_dir = TempDir::new().unwrap();
+    let cold_dir = TempDir::new().unwrap();
+    let events_count = 100;
+
+    // Phase 1: Write events, flush all, record watermark
+    let watermark_before: u64;
+    {
+        let hot_storage = Arc::new(create_storage_at(hot_dir.path()));
+        let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
+
+        for i in 0..events_count {
+            hot_storage
+                .write("test-topic", 0, format!("event-{}", i).as_bytes(), 0, None)
+                .expect("write should succeed");
+        }
+
+        let config = FlusherConfig::default();
+        let flusher =
+            BackgroundFlusher::new(Arc::clone(&hot_storage), Arc::clone(&cold_storage), config);
+
+        let result = flusher.flush_now().await.expect("flush should succeed");
+        assert_eq!(result.events_flushed, events_count);
+
+        watermark_before = flusher
+            .flush_watermark("test-topic", 0)
+            .await
+            .expect("watermark should be readable");
+        assert_eq!(
+            watermark_before, events_count as u64,
+            "Watermark should be {} after flushing all events",
+            events_count
+        );
+
+        // Drop - simulates crash
+    }
+
+    // Phase 2: Create new flusher and verify watermark is 0
+    {
+        let hot_storage = Arc::new(create_storage_at(hot_dir.path()));
+        let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
+
+        let config = FlusherConfig::default();
+        let flusher =
+            BackgroundFlusher::new(Arc::clone(&hot_storage), Arc::clone(&cold_storage), config);
+
+        let watermark_after = flusher
+            .flush_watermark("test-topic", 0)
+            .await
+            .expect("watermark should be readable");
+
+        // This documents EXPECTED behavior: watermark is volatile
+        assert_eq!(
+            watermark_after, 0,
+            "Flush watermark should reset to 0 after restart (watermark is volatile)"
+        );
+
+        // Consequence: flushing again would re-flush all events
+        // This is safe due to idempotent segment naming in S3/Iceberg
+    }
+}
+
+/// Test that multiple partitions recover independently after crash.
+///
+/// This test verifies INV-5: Partition isolation - each partition's data
+/// is recovered independently without affecting other partitions.
+#[test]
+fn multi_partition_crash_recovery() {
+    let dir = TempDir::new().unwrap();
+    let num_partitions = 4;
+    let events_per_partition = 25;
+
+    // Phase 1: Write to multiple partitions
+    {
+        let storage = create_storage_at(dir.path());
+        for partition in 0..num_partitions {
+            for i in 0..events_per_partition {
+                storage
+                    .write(
+                        "multi-partition-topic",
+                        partition,
+                        format!("partition-{}-event-{}", partition, i).as_bytes(),
+                        (partition as i64 * 1000) + i as i64,
+                        None,
+                    )
+                    .expect("write should succeed");
+            }
+        }
+        // Drop without explicit close - simulates crash
+    }
+
+    // Phase 2: Verify each partition recovered independently
+    {
+        let storage = create_storage_at(dir.path());
+
+        for partition in 0..num_partitions {
+            let events = storage
+                .read("multi-partition-topic", partition, 0, 1000)
+                .expect("read should succeed");
+
+            assert_eq!(
+                events.len(),
+                events_per_partition as usize,
+                "Partition {} should have {} events after crash recovery",
+                partition,
+                events_per_partition
+            );
+
+            // Verify content
+            for (i, event) in events.iter().enumerate() {
+                let expected = format!("partition-{}-event-{}", partition, i);
+                assert_eq!(
+                    String::from_utf8_lossy(&event.payload),
+                    expected,
+                    "Partition {} event {} should have correct payload",
+                    partition,
+                    i
+                );
+            }
+
+            // Verify sequences are monotonic within partition
+            for window in events.windows(2) {
+                assert!(
+                    window[0].sequence < window[1].sequence,
+                    "Partition {} sequences should be monotonic after recovery",
+                    partition
+                );
+            }
+
+            // Verify partition isolation
+            for event in &events {
+                assert_eq!(
+                    event.partition, partition,
+                    "Event should belong to partition {}",
+                    partition
+                );
+            }
+        }
+
+        // Verify high watermarks are correct for each partition
+        for partition in 0..num_partitions {
+            let hwm = storage
+                .high_watermark("multi-partition-topic", partition)
+                .expect("high watermark should succeed");
+            assert_eq!(
+                hwm, events_per_partition as u64,
+                "Partition {} high watermark should be {} after recovery",
+                partition, events_per_partition
+            );
         }
     }
 }
