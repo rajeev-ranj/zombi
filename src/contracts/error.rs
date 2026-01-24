@@ -25,7 +25,7 @@ impl<'a, T> LockResultExt<RwLockReadGuard<'a, T>>
 {
     #[inline]
     fn map_lock_err(self) -> Result<RwLockReadGuard<'a, T>, StorageError> {
-        self.map_err(|e| StorageError::S3(format!("Lock error: {}", e)))
+        self.map_err(|e| StorageError::LockPoisoned(e.to_string()))
     }
 }
 
@@ -34,7 +34,7 @@ impl<'a, T> LockResultExt<RwLockWriteGuard<'a, T>>
 {
     #[inline]
     fn map_lock_err(self) -> Result<RwLockWriteGuard<'a, T>, StorageError> {
-        self.map_err(|e| StorageError::S3(format!("Lock error: {}", e)))
+        self.map_err(|e| StorageError::LockPoisoned(e.to_string()))
     }
 }
 
@@ -66,6 +66,9 @@ pub enum StorageError {
 
     #[error("Server overloaded: {0}")]
     Overloaded(String),
+
+    #[error("Lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 #[derive(Error, Debug)]

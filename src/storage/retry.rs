@@ -3,6 +3,43 @@
 use backon::ExponentialBuilder;
 use std::time::Duration;
 
+/// Macro to execute an S3 operation with retry and logging.
+///
+/// # Usage
+/// ```ignore
+/// s3_retry!(
+///     operation = { client.put_object().bucket(b).key(k).send().await },
+///     retry_config = self.retry_config,
+///     context = format!("PUT {}", key),
+/// )?;
+/// ```
+#[macro_export]
+macro_rules! s3_retry {
+    (
+        operation = $op:expr,
+        retry_config = $config:expr,
+        context = $ctx:expr $(,)?
+    ) => {{
+        use backon::Retryable;
+        use $crate::storage::retry::is_retryable_s3_error;
+
+        let context = $ctx;
+        (|| async { $op })
+            .retry($config.backoff())
+            .when(|e| is_retryable_s3_error(&e.to_string()))
+            .notify(|err, dur| {
+                tracing::warn!(
+                    context = %context,
+                    error = %err,
+                    retry_in = ?dur,
+                    "S3 operation failed, retrying"
+                );
+            })
+            .await
+            .map_err(|e| $crate::contracts::StorageError::S3(e.to_string()))
+    }};
+}
+
 /// Configuration for S3 retry with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {

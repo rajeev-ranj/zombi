@@ -192,14 +192,30 @@ pub fn write_parquet<P: AsRef<Path>>(
         .close()
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-    // Calculate statistics (SAFETY: events is guaranteed non-empty - checked at function start)
-    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap(); // SAFETY: non-empty
-    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap(); // SAFETY: non-empty
-    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap(); // SAFETY: non-empty
-    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap(); // SAFETY: non-empty
+    // Calculate statistics - events is guaranteed non-empty (checked at function start)
+    let min_sequence = events
+        .iter()
+        .map(|e| e.sequence)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let max_sequence = events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let min_timestamp = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let max_timestamp = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
 
     // Calculate partition bounds
-    let partition_values = compute_partition_bounds(events);
+    let partition_values = compute_partition_bounds(events)?;
 
     let file_size = std::fs::metadata(path)
         .map_err(|e| StorageError::Io(e.to_string()))?
@@ -218,9 +234,11 @@ pub fn write_parquet<P: AsRef<Path>>(
 }
 
 /// Computes partition column bounds for a set of events.
-fn compute_partition_bounds(events: &[StoredEvent]) -> PartitionValues {
+fn compute_partition_bounds(events: &[StoredEvent]) -> Result<PartitionValues, StorageError> {
     if events.is_empty() {
-        return PartitionValues::default();
+        return Err(StorageError::InvalidInput(
+            "Cannot compute partition bounds for empty events".into(),
+        ));
     }
 
     let partition_cols: Vec<(i32, i32)> = events
@@ -228,18 +246,33 @@ fn compute_partition_bounds(events: &[StoredEvent]) -> PartitionValues {
         .map(|e| derive_partition_columns(e.timestamp_ms))
         .collect();
 
-    // SAFETY: events is guaranteed non-empty (checked at function start)
-    let min_date = partition_cols.iter().map(|(d, _)| *d).min().unwrap(); // SAFETY: non-empty
-    let max_date = partition_cols.iter().map(|(d, _)| *d).max().unwrap(); // SAFETY: non-empty
-    let min_hour = partition_cols.iter().map(|(_, h)| *h).min().unwrap(); // SAFETY: non-empty
-    let max_hour = partition_cols.iter().map(|(_, h)| *h).max().unwrap(); // SAFETY: non-empty
+    let min_date = partition_cols
+        .iter()
+        .map(|(d, _)| *d)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let max_date = partition_cols
+        .iter()
+        .map(|(d, _)| *d)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let min_hour = partition_cols
+        .iter()
+        .map(|(_, h)| *h)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let max_hour = partition_cols
+        .iter()
+        .map(|(_, h)| *h)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
 
-    PartitionValues {
+    Ok(PartitionValues {
         min_event_date: min_date,
         max_event_date: max_date,
         min_event_hour: min_hour,
         max_event_hour: max_hour,
-    }
+    })
 }
 
 /// Writes events to a Parquet file in memory and returns bytes.
@@ -272,14 +305,30 @@ pub fn write_parquet_to_bytes(
         .close()
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-    // Calculate statistics (SAFETY: events is guaranteed non-empty - checked at function start)
-    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap(); // SAFETY: non-empty
-    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap(); // SAFETY: non-empty
-    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap(); // SAFETY: non-empty
-    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap(); // SAFETY: non-empty
+    // Calculate statistics - events is guaranteed non-empty (checked at function start)
+    let min_sequence = events
+        .iter()
+        .map(|e| e.sequence)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let max_sequence = events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let min_timestamp = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let max_timestamp = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
 
     // Calculate partition bounds
-    let partition_values = compute_partition_bounds(events);
+    let partition_values = compute_partition_bounds(events)?;
 
     let metadata = ParquetFileMetadata {
         path: String::new(), // No path for in-memory

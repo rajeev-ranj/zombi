@@ -5,13 +5,14 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use backon::Retryable;
+use bytes::Bytes;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, PendingSnapshotStats, SegmentInfo, StorageError,
     StoredEvent,
 };
-use crate::storage::retry::{is_retryable_s3_error, RetryConfig};
+use crate::s3_retry;
+use crate::storage::retry::RetryConfig;
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
     metadata_file_name, write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata,
@@ -159,6 +160,14 @@ impl IcebergStorage {
         make_metadata_key(&self.base_path, topic, filename)
     }
 
+    /// Checks if an S3 key belongs to the specified partition.
+    /// Path format: .../partition=N/...
+    #[inline]
+    fn is_partition_file(key: &str, partition: u32) -> bool {
+        let partition_suffix = format!("/partition={}/", partition);
+        key.contains(&partition_suffix)
+    }
+
     /// Uploads bytes to S3 with retry.
     async fn upload_bytes(
         &self,
@@ -168,28 +177,21 @@ impl IcebergStorage {
     ) -> Result<(), StorageError> {
         let client = &self.client;
         let bucket = &self.bucket;
-        (|| async {
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(key)
-                .body(ByteStream::from(data.clone()))
-                .content_type(content_type)
-                .send()
-                .await
-        })
-        .retry(self.retry_config.backoff())
-        .when(|e| is_retryable_s3_error(&e.to_string()))
-        .notify(|err, dur| {
-            tracing::warn!(
-                key = %key,
-                error = %err,
-                retry_in = ?dur,
-                "S3 upload failed, retrying"
-            );
-        })
-        .await
-        .map_err(|e| StorageError::S3(e.to_string()))?;
+        let data = Bytes::from(data); // Convert once; Bytes::clone is cheap (ref-counted)
+        s3_retry!(
+            operation = {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(data.clone()))
+                    .content_type(content_type)
+                    .send()
+                    .await
+            },
+            retry_config = self.retry_config,
+            context = format!("PUT {}", key),
+        )?;
         Ok(())
     }
 
@@ -374,26 +376,18 @@ impl ColdStorage for IcebergStorage {
 
         let client = &self.client;
         let bucket = &self.bucket;
-        let response = (|| async {
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(&prefix)
-                .send()
-                .await
-        })
-        .retry(self.retry_config.backoff())
-        .when(|e| is_retryable_s3_error(&e.to_string()))
-        .notify(|err, dur| {
-            tracing::warn!(
-                prefix = %prefix,
-                error = %err,
-                retry_in = ?dur,
-                "S3 LIST failed, retrying"
-            );
-        })
-        .await
-        .map_err(|e| StorageError::S3(e.to_string()))?;
+        let response = s3_retry!(
+            operation = {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+            },
+            retry_config = self.retry_config,
+            context = format!("LIST {}", prefix),
+        )?;
 
         let mut all_events = Vec::new();
 
@@ -401,39 +395,24 @@ impl ColdStorage for IcebergStorage {
             for object in contents {
                 if let Some(key) = object.key() {
                     // Filter for Parquet files in the correct partition directory
-                    if !key.ends_with(".parquet") {
-                        continue;
-                    }
-
-                    // Check if file is in the correct partition directory
-                    // Path format: tables/events/data/event_date=YYYY-MM-DD/event_hour=HH/partition=N/
-                    let partition_suffix = format!("/partition={}/", partition);
-                    if !key.contains(&partition_suffix) {
+                    if !key.ends_with(".parquet") || !Self::is_partition_file(key, partition) {
                         continue;
                     }
 
                     // Download and read Parquet file with retry
                     let key_owned = key.to_string();
-                    let response = (|| async {
-                        client
-                            .get_object()
-                            .bucket(bucket)
-                            .key(&key_owned)
-                            .send()
-                            .await
-                    })
-                    .retry(self.retry_config.backoff())
-                    .when(|e| is_retryable_s3_error(&e.to_string()))
-                    .notify(|err, dur| {
-                        tracing::warn!(
-                            key = %key_owned,
-                            error = %err,
-                            retry_in = ?dur,
-                            "S3 GET failed, retrying"
-                        );
-                    })
-                    .await
-                    .map_err(|e| StorageError::S3(e.to_string()))?;
+                    let response = s3_retry!(
+                        operation = {
+                            client
+                                .get_object()
+                                .bucket(bucket)
+                                .key(&key_owned)
+                                .send()
+                                .await
+                        },
+                        retry_config = self.retry_config,
+                        context = format!("GET {}", key_owned),
+                    )?;
 
                     let bytes = response
                         .body
@@ -471,26 +450,18 @@ impl ColdStorage for IcebergStorage {
 
         let client = &self.client;
         let bucket = &self.bucket;
-        let response = (|| async {
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(&prefix)
-                .send()
-                .await
-        })
-        .retry(self.retry_config.backoff())
-        .when(|e| is_retryable_s3_error(&e.to_string()))
-        .notify(|err, dur| {
-            tracing::warn!(
-                prefix = %prefix,
-                error = %err,
-                retry_in = ?dur,
-                "S3 LIST failed, retrying"
-            );
-        })
-        .await
-        .map_err(|e| StorageError::S3(e.to_string()))?;
+        let response = s3_retry!(
+            operation = {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+            },
+            retry_config = self.retry_config,
+            context = format!("LIST {}", prefix),
+        )?;
 
         let mut segments = Vec::new();
 
@@ -498,13 +469,7 @@ impl ColdStorage for IcebergStorage {
             for object in contents {
                 if let Some(key) = object.key() {
                     // Filter for Parquet files in the correct partition directory
-                    if !key.ends_with(".parquet") {
-                        continue;
-                    }
-
-                    // Check if file is in the correct partition directory
-                    let partition_suffix = format!("/partition={}/", partition);
-                    if !key.contains(&partition_suffix) {
+                    if !key.ends_with(".parquet") || !Self::is_partition_file(key, partition) {
                         continue;
                     }
 
@@ -545,7 +510,14 @@ impl ColdStorage for IcebergStorage {
     fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
         let pending = match self.pending_data_files.read() {
             Ok(p) => p,
-            Err(_) => return PendingSnapshotStats::default(),
+            Err(e) => {
+                tracing::warn!(
+                    topic = topic,
+                    error = %e,
+                    "Failed to acquire lock for pending_snapshot_stats, returning default"
+                );
+                return PendingSnapshotStats::default();
+            }
         };
 
         if let Some(files) = pending.get(topic) {
