@@ -439,8 +439,7 @@ mod tests {
 
     impl TestHotStorage {
         fn insert(&mut self, topic: &str, partition: u32, events: Vec<StoredEvent>) {
-            self.events
-                .insert((topic.to_string(), partition), events);
+            self.events.insert((topic.to_string(), partition), events);
         }
     }
 
@@ -585,9 +584,10 @@ mod tests {
             partition: u32,
             events: &[StoredEvent],
         ) -> Result<String, StorageError> {
-            let mut writes = self.writes.lock().map_err(|e| {
-                StorageError::S3(format!("Lock error: {}", e))
-            })?;
+            let mut writes = self
+                .writes
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
             writes.push((topic.to_string(), partition, events.len()));
             Ok("segment-1".to_string())
         }
@@ -656,11 +656,8 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let flusher = BackgroundFlusher::new(
-            Arc::new(hot),
-            Arc::clone(&cold),
-            FlusherConfig::default(),
-        );
+        let flusher =
+            BackgroundFlusher::new(Arc::new(hot), Arc::clone(&cold), FlusherConfig::default());
 
         let result = flusher.flush_now().await.unwrap();
         assert_eq!(result.events_flushed, 2);
