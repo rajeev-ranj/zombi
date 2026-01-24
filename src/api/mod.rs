@@ -1,5 +1,6 @@
 mod handlers;
 
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -58,17 +59,25 @@ impl Default for ServerConfig {
 }
 
 /// Starts the HTTP server.
-pub async fn start_server<H: HotStorage + 'static, C: ColdStorage + 'static>(
+pub async fn start_server<H, C, F>(
     config: ServerConfig,
     state: Arc<AppState<H, C>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    H: HotStorage + 'static,
+    C: ColdStorage + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     let router = create_router(state);
     let addr = format!("{}:{}", config.host, config.port);
 
     tracing::info!("Starting HTTP server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }
