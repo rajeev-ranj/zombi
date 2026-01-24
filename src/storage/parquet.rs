@@ -186,12 +186,11 @@ pub fn write_parquet<P: AsRef<Path>>(
         .close()
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-    // Calculate statistics
-    // SAFETY: events is guaranteed non-empty (checked at function start)
-    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap();
-    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap();
-    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap();
-    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap();
+    // Calculate statistics (SAFETY: events is guaranteed non-empty - checked at function start)
+    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap(); // SAFETY: non-empty
+    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap(); // SAFETY: non-empty
+    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap(); // SAFETY: non-empty
+    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap(); // SAFETY: non-empty
 
     // Calculate partition bounds
     let partition_values = compute_partition_bounds(events);
@@ -224,10 +223,10 @@ fn compute_partition_bounds(events: &[StoredEvent]) -> PartitionValues {
         .collect();
 
     // SAFETY: events is guaranteed non-empty (checked at function start)
-    let min_date = partition_cols.iter().map(|(d, _)| *d).min().unwrap();
-    let max_date = partition_cols.iter().map(|(d, _)| *d).max().unwrap();
-    let min_hour = partition_cols.iter().map(|(_, h)| *h).min().unwrap();
-    let max_hour = partition_cols.iter().map(|(_, h)| *h).max().unwrap();
+    let min_date = partition_cols.iter().map(|(d, _)| *d).min().unwrap(); // SAFETY: non-empty
+    let max_date = partition_cols.iter().map(|(d, _)| *d).max().unwrap(); // SAFETY: non-empty
+    let min_hour = partition_cols.iter().map(|(_, h)| *h).min().unwrap(); // SAFETY: non-empty
+    let max_hour = partition_cols.iter().map(|(_, h)| *h).max().unwrap(); // SAFETY: non-empty
 
     PartitionValues {
         min_event_date: min_date,
@@ -273,12 +272,11 @@ pub fn write_parquet_to_bytes(
         .close()
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-    // Calculate statistics
-    // SAFETY: events is guaranteed non-empty (checked at function start)
-    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap();
-    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap();
-    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap();
-    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap();
+    // Calculate statistics (SAFETY: events is guaranteed non-empty - checked at function start)
+    let min_sequence = events.iter().map(|e| e.sequence).min().unwrap(); // SAFETY: non-empty
+    let max_sequence = events.iter().map(|e| e.sequence).max().unwrap(); // SAFETY: non-empty
+    let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap(); // SAFETY: non-empty
+    let max_timestamp = events.iter().map(|e| e.timestamp_ms).max().unwrap(); // SAFETY: non-empty
 
     // Calculate partition bounds
     let partition_values = compute_partition_bounds(events);
