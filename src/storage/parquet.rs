@@ -163,9 +163,12 @@ pub fn write_parquet<P: AsRef<Path>>(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer with Zstd compression
+    // Configure Parquet writer for optimal Iceberg performance:
+    // - ZSTD compression for good ratio with fast decompression
+    // - 128MB row groups to match target file size (better for column pruning)
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(128 * 1024 * 1024)
         .build();
 
     // Write to file
@@ -245,9 +248,12 @@ pub fn write_parquet_to_bytes(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer with Zstd compression
+    // Configure Parquet writer for optimal Iceberg performance:
+    // - ZSTD compression for good ratio with fast decompression
+    // - 128MB row groups to match target file size (better for column pruning)
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(128 * 1024 * 1024)
         .build();
 
     // Write to buffer

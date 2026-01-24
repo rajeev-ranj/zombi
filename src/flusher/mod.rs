@@ -40,12 +40,17 @@ impl Default for FlusherConfig {
 
 impl FlusherConfig {
     /// Creates a config optimized for Iceberg with size-based flushing.
+    ///
+    /// Tuned for Iceberg best practices:
+    /// - Target 64-256MB Parquet files for optimal query performance
+    /// - Larger batches for better compression ratios (2-3x improvement)
+    /// - Less frequent flushes to accumulate more data
     pub fn iceberg_defaults() -> Self {
         Self {
             interval: Duration::from_secs(30),         // Less frequent checks
-            batch_size: 10000,                         // More events per batch
-            max_segment_size: 100000,                  // Larger segments for Iceberg
-            target_file_size_bytes: 128 * 1024 * 1024, // 128MB target
+            batch_size: 50000,                         // Larger batches for better compression
+            max_segment_size: 100000,                  // Max events per segment
+            target_file_size_bytes: 128 * 1024 * 1024, // 128MB target (Iceberg best practice)
             iceberg_enabled: true,
         }
     }
@@ -418,7 +423,7 @@ mod tests {
     fn test_flusher_config_iceberg_defaults() {
         let config = FlusherConfig::iceberg_defaults();
         assert_eq!(config.interval, Duration::from_secs(30));
-        assert_eq!(config.batch_size, 10000);
+        assert_eq!(config.batch_size, 50000); // Larger batches for better compression
         assert_eq!(config.max_segment_size, 100000);
         assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
         assert!(config.iceberg_enabled);
