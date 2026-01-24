@@ -19,8 +19,8 @@ pub use iceberg::{
 };
 pub use iceberg_storage::IcebergStorage;
 pub use parquet::{
-    derive_partition_columns, event_schema, events_to_record_batch, write_parquet,
-    write_parquet_to_bytes, ParquetFileMetadata, PartitionValues,
+    derive_partition_columns, event_schema, events_to_record_batch, format_partition_date,
+    write_parquet, write_parquet_to_bytes, ParquetFileMetadata, PartitionValues,
 };
 pub use rocksdb::RocksDbStorage;
 pub use s3::S3Storage;

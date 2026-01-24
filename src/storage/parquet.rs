@@ -16,7 +16,7 @@ use parquet::file::properties::WriterProperties;
 use crate::contracts::{StorageError, StoredEvent};
 
 /// Unix epoch date for Date32 calculations.
-const UNIX_EPOCH_DATE: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
+pub(crate) const UNIX_EPOCH_DATE: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
     Some(d) => d,
     None => panic!("Invalid date"),
 };
@@ -33,6 +33,12 @@ pub fn derive_partition_columns(timestamp_ms: i64) -> (i32, i32) {
     let hour = datetime.hour() as i32;
 
     (days_since_epoch, hour)
+}
+
+/// Formats Date32 (days since epoch) to YYYY-MM-DD string for partition keys.
+pub fn format_partition_date(event_date: i32) -> String {
+    let date = UNIX_EPOCH_DATE + chrono::Duration::days(event_date as i64);
+    date.format("%Y-%m-%d").to_string()
 }
 
 /// Partition values for a Parquet file.
