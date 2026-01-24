@@ -3,11 +3,7 @@
 
 [advisories]
 # Deny any crate with known security vulnerabilities
-vulnerability = "deny"
-# Warn about unmaintained crates
-unmaintained = "warn"
-# Deny yanked crates
-yanked = "deny"
+version = 2
 # Ignore specific advisories (add IDs here if needed)
 ignore = []
 

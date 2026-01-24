@@ -158,15 +158,67 @@ jobs:
         run: |
           echo "Checking for .unwrap() violations in src/ (excluding tests and constants)..."
 
-          # Find unwrap() calls that aren't in test modules, const declarations, or allowed patterns
-          if grep -rn '\.unwrap()' src/ --include="*.rs" | \
-             grep -v '#\[cfg(test)\]' | \
-             grep -v '#\[test\]' | \
-             grep -v 'mod tests' | \
-             grep -v 'const.*unwrap()' | \
-             grep -v 'unwrap_or' | \
-             grep -v '// SAFETY:' | \
-             grep -v '// OK:'; then
+          # Create a script to check for unwrap() outside of test modules
+          cat > /tmp/check_unwrap.py << 'SCRIPT'
+          import sys
+          import re
+
+          def check_file(filepath):
+              with open(filepath) as f:
+                  content = f.read()
+                  lines = content.split('\n')
+
+              in_test_section = False
+              brace_depth = 0
+              test_start_depth = 0
+              violations = []
+
+              for i, line in enumerate(lines, 1):
+                  # Track entering test modules
+                  if re.search(r'#\[cfg\(test\)\]|mod tests\s*\{', line):
+                      in_test_section = True
+                      test_start_depth = brace_depth
+
+                  # Track brace depth
+                  brace_depth += line.count('{') - line.count('}')
+
+                  # Exit test section when braces balance
+                  if in_test_section and brace_depth <= test_start_depth:
+                      in_test_section = False
+
+                  # Skip test code, test functions, constants, and allowed patterns
+                  if in_test_section:
+                      continue
+                  if '#[test]' in line or 'fn test_' in line:
+                      continue
+                  if 'const ' in line and '.unwrap()' in line:
+                      continue
+                  if 'unwrap_or' in line:
+                      continue
+                  if '// SAFETY:' in line or '// OK:' in line:
+                      continue
+
+                  # Check for unwrap
+                  if '.unwrap()' in line:
+                      violations.append(f"{filepath}:{i}: {line.strip()}")
+
+              return violations
+
+          import glob
+          all_violations = []
+          for f in glob.glob('src/**/*.rs', recursive=True):
+              all_violations.extend(check_file(f))
+
+          if all_violations:
+              for v in all_violations:
+                  print(v)
+              sys.exit(1)
+          sys.exit(0)
+          SCRIPT
+
+          if python3 /tmp/check_unwrap.py; then
+            echo "✅ No .unwrap() violations found"
+          else
             echo ""
             echo "❌ Found .unwrap() in library code!"
             echo ""
@@ -178,7 +230,6 @@ jobs:
             echo "  // OK: Infallible operation"
             exit 1
           fi
-          echo "✅ No .unwrap() violations found"
 
       - name: Check for code duplication patterns
         run: |
