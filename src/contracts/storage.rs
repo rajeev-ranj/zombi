@@ -89,6 +89,46 @@ pub trait HotStorage: Send + Sync {
         start_timestamp_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError>;
+
+    /// Reads events within a timestamp range using the timestamp secondary index.
+    ///
+    /// This method provides O(log n) lookup for time-based queries when the
+    /// timestamp index is enabled (`ZOMBI_TIMESTAMP_INDEX_ENABLED=true`).
+    ///
+    /// # Arguments
+    /// * `topic` - The topic to read from
+    /// * `partition` - The partition to read from
+    /// * `since_ms` - Start of time range (inclusive), None for no lower bound
+    /// * `until_ms` - End of time range (exclusive), None for no upper bound
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// # Returns
+    /// Events within the time range, sorted by sequence number.
+    /// Returns empty vec if timestamp index is not enabled.
+    fn read_by_timestamp(
+        &self,
+        topic: &str,
+        partition: u32,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        // Default implementation falls back to read_all_partitions
+        // Implementations with timestamp index should override this
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert(partition, 0);
+        let events = self.read_all_partitions(topic, Some(&offsets), since_ms, limit)?;
+        // Filter by partition and time range
+        Ok(events
+            .into_iter()
+            .filter(|e| {
+                e.partition == partition
+                    && since_ms.is_none_or(|s| e.timestamp_ms >= s)
+                    && until_ms.is_none_or(|u| e.timestamp_ms < u)
+            })
+            .take(limit)
+            .collect())
+    }
 }
 
 /// An event with its storage metadata.
