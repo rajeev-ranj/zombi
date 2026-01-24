@@ -30,16 +30,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fast checks - runs on every push/PR
-  lint:
-    name: Lint & Format
+  # Build job - compiles once and shares artifacts
+  build:
+    name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Protobuf Compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -60,10 +62,53 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build all targets
+        run: cargo build --all-targets
+
+      - name: Save build artifacts
+        uses: actions/cache/save@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-build-${{ github.sha }}
+
+  # Fast checks - runs after build
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Protobuf Compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore cargo registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Restore build artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-build-${{ github.sha }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -71,43 +116,44 @@ jobs:
       - name: Run Clippy
         run: cargo clippy -- -D warnings
 
-  # Unit and integration tests - runs on every push/PR
+  # Unit and integration tests - runs after build
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: build
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Protobuf Compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.8
-
-      - name: Configure sccache
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Restore cargo registry
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Restore build artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-build-${{ github.sha }}
 
       - name: Run all tests
-        run: cargo test -- --test-threads=1 2>&1 | tee test-output.log
+        run: cargo test 2>&1 | tee test-output.log
 
-      - name: Verify benchmarks compile
+      - name: Verify benchmarks compile (main only)
+        if: github.ref == 'refs/heads/main'
         run: cargo bench --no-run
 
       - name: Upload test logs on failure
@@ -118,7 +164,7 @@ jobs:
           path: test-output.log
           retention-days: 7
 
-  # Documentation coherence check - runs on every push/PR
+  # Documentation coherence check - runs in parallel (no build needed)
   docs-check:
     name: Documentation Coherence
     runs-on: ubuntu-latest
@@ -129,7 +175,7 @@ jobs:
       - name: Check documentation coherence
         run: ./scripts/check-docs-coherence.sh
 
-  # Security audit - runs on every push/PR
+  # Security audit - runs in parallel (no build needed)
   security:
     name: Dependency Audit
     runs-on: ubuntu-latest
@@ -146,7 +192,7 @@ jobs:
       - name: Check dependencies
         run: cargo deny check
 
-  # Code quality checks - catches common issues before review
+  # Code quality checks - runs in parallel (no build needed)
   code-quality:
     name: Code Quality
     runs-on: ubuntu-latest
@@ -306,7 +352,9 @@ jobs:
           fetch-depth: 0  # Need full history for comparison
 
       - name: Install Protobuf Compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -461,20 +509,12 @@ jobs:
             sleep 1
           done
 
-      - name: Install AWS CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          python3 -m pip install --upgrade pip
-          python3 -m pip install awscli
-
       - name: Create bucket
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
         run: |
-          aws --endpoint-url http://localhost:9000 s3 mb s3://zombi-events
+          # Use MinIO client instead of AWS CLI for speed
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc mb minio/zombi-events
 
       - name: Run Zombi
         run: |
@@ -519,16 +559,16 @@ jobs:
           curl -fsS http://localhost:8080/stats | jq .
 
       - name: Verify Iceberg data in MinIO
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
         run: |
           sleep 3
           echo "Listing all objects in bucket:"
-          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc ls minio/zombi-events --recursive
           echo "Checking for Iceberg structure:"
-          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc ls minio/zombi-events --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
 
       - name: Show Zombi logs
         if: always()
@@ -552,20 +592,12 @@ jobs:
             -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio server /data --console-address ":9001"
 
-      - name: Install AWS CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          python3 -m pip install --upgrade pip
-          python3 -m pip install awscli
-
       - name: Create bucket
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
         run: |
-          aws --endpoint-url http://localhost:9000 s3 mb s3://zombi-events
+          # Use MinIO client instead of AWS CLI for speed
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc mb minio/zombi-events
 
       - name: Log in to Container registry
         uses: docker/login-action@v3
@@ -618,16 +650,16 @@ jobs:
           curl -fsS http://localhost:8080/stats | jq .
 
       - name: Verify Iceberg data in MinIO
-        env:
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_DEFAULT_REGION: us-east-1
         run: |
           sleep 3
           echo "Listing all objects in bucket:"
-          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc ls minio/zombi-events --recursive
           echo "Checking for Iceberg structure (metadata/ and data/):"
-          aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
+          docker run --rm --network host \
+            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
+            minio/mc ls minio/zombi-events --recursive | grep -E "metadata/|data/" || echo "Warning: Iceberg structure not found yet"
 
       - name: Show Zombi logs
         if: always()
