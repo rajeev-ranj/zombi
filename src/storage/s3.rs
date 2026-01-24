@@ -5,12 +5,13 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use backon::Retryable;
+use bytes::Bytes;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
 };
-use crate::storage::retry::{is_retryable_s3_error, RetryConfig};
+use crate::s3_retry;
+use crate::storage::retry::RetryConfig;
 
 /// S3-backed cold storage implementation.
 pub struct S3Storage {
@@ -145,33 +146,25 @@ impl ColdStorage for S3Storage {
         let end_offset = events.last().map(|e| e.sequence).unwrap_or(0);
 
         let key = Self::segment_key(topic, partition, start_offset, end_offset);
-        let body = Self::serialize_events(events)?;
+        let body = Bytes::from(Self::serialize_events(events)?);
         let size = body.len() as u64;
 
         let client = &self.client;
         let bucket = &self.bucket;
-        (|| async {
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(&key)
-                .body(ByteStream::from(body.clone()))
-                .content_type("application/json")
-                .send()
-                .await
-        })
-        .retry(self.retry_config.backoff())
-        .when(|e| is_retryable_s3_error(&e.to_string()))
-        .notify(|err, dur| {
-            tracing::warn!(
-                key = %key,
-                error = %err,
-                retry_in = ?dur,
-                "S3 PUT failed, retrying"
-            );
-        })
-        .await
-        .map_err(|e| StorageError::S3(e.to_string()))?;
+        s3_retry!(
+            operation = {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from(body.clone())) // Bytes::clone is cheap (ref-counted)
+                    .content_type("application/json")
+                    .send()
+                    .await
+            },
+            retry_config = self.retry_config,
+            context = format!("PUT {}", key),
+        )?;
 
         // Update cache
         {
@@ -213,26 +206,18 @@ impl ColdStorage for S3Storage {
             let client = &self.client;
             let bucket = &self.bucket;
             let segment_key = &segment.segment_id;
-            let response = (|| async {
-                client
-                    .get_object()
-                    .bucket(bucket)
-                    .key(segment_key)
-                    .send()
-                    .await
-            })
-            .retry(self.retry_config.backoff())
-            .when(|e| is_retryable_s3_error(&e.to_string()))
-            .notify(|err, dur| {
-                tracing::warn!(
-                    key = %segment_key,
-                    error = %err,
-                    retry_in = ?dur,
-                    "S3 GET failed, retrying"
-                );
-            })
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            let response = s3_retry!(
+                operation = {
+                    client
+                        .get_object()
+                        .bucket(bucket)
+                        .key(segment_key)
+                        .send()
+                        .await
+                },
+                retry_config = self.retry_config,
+                context = format!("GET {}", segment_key),
+            )?;
 
             let bytes = response
                 .body
@@ -265,26 +250,18 @@ impl ColdStorage for S3Storage {
 
         let client = &self.client;
         let bucket = &self.bucket;
-        let response = (|| async {
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(&prefix)
-                .send()
-                .await
-        })
-        .retry(self.retry_config.backoff())
-        .when(|e| is_retryable_s3_error(&e.to_string()))
-        .notify(|err, dur| {
-            tracing::warn!(
-                prefix = %prefix,
-                error = %err,
-                retry_in = ?dur,
-                "S3 LIST failed, retrying"
-            );
-        })
-        .await
-        .map_err(|e| StorageError::S3(e.to_string()))?;
+        let response = s3_retry!(
+            operation = {
+                client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+            },
+            retry_config = self.retry_config,
+            context = format!("LIST {}", prefix),
+        )?;
 
         let mut segments = Vec::new();
 

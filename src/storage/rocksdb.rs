@@ -172,6 +172,20 @@ impl RocksDbStorage {
         format!("{}:{}:{}:{}", CONSUMER_PREFIX, group, topic, partition)
     }
 
+    /// Parses partition number from event key suffix (after "evt:topic:" prefix).
+    /// Key format: evt:topic:partition:sequence
+    #[inline]
+    fn parse_partition_from_key_suffix(key_suffix: &str) -> Option<u32> {
+        key_suffix.split(':').next().and_then(|s| s.parse().ok())
+    }
+
+    /// Parses topic name from event key suffix (after "evt:" prefix).
+    /// Key format: evt:topic:partition:sequence
+    #[inline]
+    fn parse_topic_from_key_suffix(key_suffix: &str) -> Option<&str> {
+        key_suffix.split(':').next()
+    }
+
     /// Serializes a stored event to bytes using bincode (fast binary format).
     fn serialize_event(event: &StoredEvent) -> Result<Vec<u8>, StorageError> {
         bincode::serialize(event).map_err(|e| StorageError::Serialization(e.to_string()))
@@ -559,13 +573,9 @@ impl HotStorage for RocksDbStorage {
                 break;
             }
 
-            // Key format: evt:topic:partition:sequence
-            // After prefix we have: partition:sequence
             if let Some(rest) = key_str.strip_prefix(&prefix) {
-                if let Some(partition_str) = rest.split(':').next() {
-                    if let Ok(partition) = partition_str.parse::<u32>() {
-                        partitions.insert(partition);
-                    }
+                if let Some(partition) = Self::parse_partition_from_key_suffix(rest) {
+                    partitions.insert(partition);
                 }
             }
         }
@@ -608,9 +618,8 @@ impl HotStorage for RocksDbStorage {
                 break;
             }
 
-            // Key format: evt:topic:partition:sequence
             if let Some(rest) = key_str.strip_prefix(&prefix) {
-                if let Some(topic) = rest.split(':').next() {
+                if let Some(topic) = Self::parse_topic_from_key_suffix(rest) {
                     topics.insert(topic.to_string());
                 }
             }
