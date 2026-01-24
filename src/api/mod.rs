@@ -8,7 +8,9 @@ use axum::Router;
 
 use crate::contracts::{ColdStorage, HotStorage};
 
-pub use handlers::{AppState, Metrics, NoopColdStorage, WriteRecordRequest, WriteRecordResponse};
+pub use handlers::{
+    AppState, BackpressureConfig, Metrics, NoopColdStorage, WriteRecordRequest, WriteRecordResponse,
+};
 
 /// Creates the API router.
 pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(

@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
-use zombi::api::{start_server, AppState, Metrics, ServerConfig};
+use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
 use zombi::contracts::Flusher;
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::storage::{ColdStorageBackend, IcebergStorage, RocksDbStorage, S3Storage};
@@ -128,12 +128,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // Create app state
-    let state = Arc::new(AppState {
+    // Create app state with backpressure configuration
+    let backpressure_config = BackpressureConfig::from_env();
+    tracing::info!(
+        max_inflight_writes = backpressure_config.max_inflight_writes,
+        max_inflight_bytes_mb = backpressure_config.max_inflight_bytes / (1024 * 1024),
+        "Backpressure configured"
+    );
+    let state = Arc::new(AppState::new(
         storage,
         cold_storage,
-        metrics: Arc::new(Metrics::new()),
-    });
+        Arc::new(Metrics::new()),
+        backpressure_config,
+    ));
 
     // Start server
     let config = ServerConfig {

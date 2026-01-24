@@ -63,6 +63,9 @@ pub enum StorageError {
 
     #[error("IO error: {0}")]
     Io(String),
+
+    #[error("Server overloaded: {0}")]
+    Overloaded(String),
 }
 
 #[derive(Error, Debug)]
