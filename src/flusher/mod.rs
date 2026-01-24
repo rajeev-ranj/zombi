@@ -47,6 +47,12 @@ impl FlusherConfig {
     /// - Target 64-256MB Parquet files for optimal query performance
     /// - 5-minute flush interval for low-volume tables to accumulate data
     /// - Size-based batching via target_file_size_bytes
+    ///
+    /// # Durability
+    ///
+    /// The 5-minute flush interval means up to 5 minutes of data may be lost
+    /// on crash (WAL is disabled for throughput). For tighter durability
+    /// guarantees, override with `ZOMBI_FLUSH_INTERVAL_SECS` environment variable.
     pub fn iceberg_defaults() -> Self {
         Self {
             interval: Duration::from_secs(300), // 5 minutes for low-volume tables

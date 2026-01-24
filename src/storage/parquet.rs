@@ -15,6 +15,18 @@ use parquet::file::properties::WriterProperties;
 
 use crate::contracts::{StorageError, StoredEvent};
 
+/// Creates default Parquet writer properties optimized for Iceberg.
+///
+/// Configuration:
+/// - ZSTD compression for excellent compression ratio
+/// - 1M row max row group size to minimize metadata overhead
+fn default_writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(1_000_000)
+        .build()
+}
+
 /// Unix epoch date for Date32 calculations.
 pub(crate) const UNIX_EPOCH_DATE: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
     Some(d) => d,
@@ -163,14 +175,8 @@ pub fn write_parquet<P: AsRef<Path>>(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer for optimal Iceberg performance:
-    // - ZSTD compression for good ratio with fast decompression
-    // - Large row groups (1M rows max) to minimize metadata overhead
-    //   Note: set_max_row_group_size takes ROW COUNT, not bytes
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(1_000_000)
-        .build();
+    // Use default writer properties optimized for Iceberg
+    let props = default_writer_properties();
 
     // Write to file
     let file = File::create(path).map_err(|e| StorageError::Io(e.to_string()))?;
@@ -250,14 +256,8 @@ pub fn write_parquet_to_bytes(
     // Convert events to RecordBatch
     let batch = events_to_record_batch(events)?;
 
-    // Configure Parquet writer for optimal Iceberg performance:
-    // - ZSTD compression for good ratio with fast decompression
-    // - Large row groups (1M rows max) to minimize metadata overhead
-    //   Note: set_max_row_group_size takes ROW COUNT, not bytes
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(1_000_000)
-        .build();
+    // Use default writer properties optimized for Iceberg
+    let props = default_writer_properties();
 
     // Write to buffer
     let mut buffer = Vec::new();
@@ -521,9 +521,9 @@ mod tests {
         );
     }
 
-    /// Test that row group size is configured correctly (in rows, not bytes).
+    /// Test that a small batch fits in a single row group (verifies row count config).
     #[test]
-    fn test_row_group_size_is_reasonable() {
+    fn test_small_batch_fits_single_row_group() {
         use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
