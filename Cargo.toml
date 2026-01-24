@@ -18,9 +18,9 @@ rayon = "1"
 futures = "0.3"
 thiserror = "1"
 tracing = "0.1"
-arrow = { version = "53", default-features = false, features = ["ipc"] }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
-iceberg = "0.4"
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
+iceberg = "0.8"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
