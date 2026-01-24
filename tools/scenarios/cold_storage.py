@@ -223,35 +223,58 @@ class ColdStorageScenario(BaseScenario):
         if endpoint:
             cmd.extend(["--endpoint-url", endpoint])
 
-        print(f"Running: {' '.join(cmd)}")
+        # Set up environment with MinIO credentials if endpoint is provided
+        env = os.environ.copy()
+        if endpoint and "localhost" in endpoint:
+            # For local MinIO, use default credentials if not already set
+            env.setdefault("AWS_ACCESS_KEY_ID", "minioadmin")
+            env.setdefault("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            lines = result.stdout.strip().split("\n") if result.stdout else []
+        # Wait for files to appear (poll until timeout)
+        wait_secs = self.cs_config.wait_for_flush_secs
+        poll_interval = 5
+        start_wait = time.time()
 
-            parquet_files = [l for l in lines if ".parquet" in l]
-            total_size = 0
-            for line in parquet_files:
-                parts = line.split()
-                if len(parts) >= 3:
-                    try:
-                        total_size += int(parts[2])
-                    except ValueError:
-                        pass
+        print(f"Waiting up to {wait_secs}s for Parquet files to appear...")
 
-            return {
-                "verified": len(parquet_files) > 0,
-                "total_files": len(parquet_files),
-                "total_size_bytes": total_size,
-                "files": parquet_files[:10],
-                "method": "aws-cli",
-            }
-        except Exception as e:
-            return {
-                "verified": False,
-                "error": str(e),
-                "method": "aws-cli",
-            }
+        while time.time() - start_wait < wait_secs:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+                lines = result.stdout.strip().split("\n") if result.stdout else []
+
+                parquet_files = [l for l in lines if ".parquet" in l]
+                if parquet_files:
+                    total_size = 0
+                    for line in parquet_files:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            try:
+                                total_size += int(parts[2])
+                            except ValueError:
+                                pass
+
+                    print(f"  Found {len(parquet_files)} Parquet files ({total_size / 1024:.1f} KB)")
+                    return {
+                        "verified": True,
+                        "total_files": len(parquet_files),
+                        "total_size_bytes": total_size,
+                        "files": parquet_files[:10],
+                        "method": "aws-cli",
+                    }
+
+                elapsed = int(time.time() - start_wait)
+                print(f"  [{elapsed}s] No files yet, waiting...")
+                time.sleep(poll_interval)
+
+            except Exception as e:
+                print(f"  Error checking S3: {e}")
+                time.sleep(poll_interval)
+
+        return {
+            "verified": False,
+            "error": f"No Parquet files found after {wait_secs}s",
+            "method": "aws-cli",
+        }
 
     def run(self) -> ScenarioResult:
         """Execute the cold storage scenario."""

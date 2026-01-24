@@ -266,27 +266,40 @@ class BaseScenario(ABC):
         offset: int = 0,
         limit: int = 100,
         session=None,
+        since: Optional[int] = None,
     ) -> Tuple[List[Dict], float, Optional[int]]:
         """
         Read events from a topic.
 
-        Returns: (events, latency_ms, next_offset)
+        Note: The API uses time-based reads (since parameter), not offset-based.
+        The partition and offset parameters are kept for interface compatibility
+        but the current API reads from all partitions sorted by timestamp.
+
+        Returns: (events, latency_ms, last_timestamp for pagination)
         """
         s = session or self.session
-        params = {"partition": partition, "offset": offset, "limit": limit}
+        params = {"limit": limit}
+        if since is not None:
+            params["since"] = since
         start = time.perf_counter()
         try:
             r = s.get(
-                f"{self.config.url}/tables/{topic}/stream",
+                f"{self.config.url}/tables/{topic}",
                 params=params,
                 timeout=30,
             )
             latency = (time.perf_counter() - start) * 1000
             if r.status_code == 200:
                 data = r.json()
-                events = data.get("events", [])
-                next_offset = data.get("next_offset")
-                return events, latency, next_offset
+                # API returns "records", not "events"
+                events = data.get("records", [])
+                has_more = data.get("has_more", False)
+                # Return the last timestamp for pagination (caller handles dedup)
+                if events:
+                    last_ts = events[-1].get("timestamp_ms", 0)
+                    # Return last_ts (not +1) - caller will handle duplicates
+                    return events, latency, last_ts if has_more else None
+                return [], latency, None
             return [], latency, None
         except Exception:
             return [], (time.perf_counter() - start) * 1000, None

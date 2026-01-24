@@ -61,6 +61,9 @@ class ConsistencyScenario(BaseScenario):
         self._read_events: Dict[int, List[str]] = defaultdict(list)
         self._read_lock = threading.Lock()
 
+        # Track write start timestamp for time-based reads
+        self._write_start_timestamp: int = 0
+
     @property
     def name(self) -> str:
         return "consistency"
@@ -72,6 +75,9 @@ class ConsistencyScenario(BaseScenario):
         partitions = self.cons_config.num_partitions
         topic = self.cons_config.topic
         test_id = self.cons_config.test_id
+
+        # Track start timestamp for time-based reads
+        self._write_start_timestamp = int(time.time() * 1000)
 
         print(f"Writing {num_events:,} events with test_id={test_id}...")
 
@@ -148,61 +154,92 @@ class ConsistencyScenario(BaseScenario):
         }
 
     def _read_phase(self) -> Dict:
-        """Read back all events and verify ordering."""
+        """Read back all events using large batch reads.
+
+        Note: The API reads from all partitions merged by timestamp.
+        Due to timestamp-based pagination limitations with duplicate timestamps,
+        we use a simple approach: read large batches and collect all events.
+        """
         session = create_session()
         topic = self.cons_config.topic
-        partitions = self.cons_config.num_partitions
         test_id = self.cons_config.test_id
         timeout = self.cons_config.verify_timeout_secs
 
         print(f"Reading events back (timeout={timeout}s)...")
 
-        start_time = time.time()
+        # Track total events found for this test
+        total_expected = sum(len(v) for v in self._acknowledged_writes.values())
+        read_start = time.time()
+        events_found = 0
+        seen_markers: Set[str] = set()
 
-        for partition in range(partitions):
-            offset = 0
-            partition_start = time.time()
+        # Read in large batches using time-based pagination
+        # Use write start timestamp as the starting point
+        since_ts = self._write_start_timestamp
+        batch_size = 5000  # Large batch to minimize pagination issues
+        no_progress_iterations = 0
 
-            while time.time() - partition_start < timeout:
-                start = time.perf_counter()
-                events, latency, next_offset = self.read_events(
-                    topic, partition, offset, limit=500, session=session
-                )
-                self.read_stats.record(len(events) > 0, latency, 0)
+        while time.time() - read_start < timeout:
+            events, latency, last_ts = self.read_events(
+                topic, limit=batch_size, session=session, since=since_ts
+            )
+            self.read_stats.record(len(events) > 0, latency, 0)
 
-                if not events:
-                    # No more events, might be caught up
-                    time.sleep(0.1)
-                    continue
-
-                for event in events:
-                    # Extract marker from payload
-                    payload_str = event.get("payload", "")
-                    try:
-                        if isinstance(payload_str, str):
-                            payload = json.loads(payload_str)
-                        else:
-                            payload = payload_str
-
-                        # Only process events from this test
-                        if payload.get("test_id") == test_id:
-                            marker = payload.get("marker")
-                            if marker:
-                                with self._read_lock:
-                                    self._read_events[partition].append(marker)
-                    except Exception:
-                        pass
-
-                if next_offset is not None:
-                    offset = next_offset
-
-                # Check if we've read all expected events for this partition
-                expected = len(self._acknowledged_writes.get(partition, []))
-                found = len(self._read_events.get(partition, []))
-                if found >= expected:
+            if not events:
+                if events_found >= total_expected:
                     break
+                no_progress_iterations += 1
+                if no_progress_iterations > 5:
+                    break
+                time.sleep(0.5)
+                continue
 
-            print(f"  Partition {partition}: read {len(self._read_events.get(partition, []))} events")
+            found_new_this_batch = 0
+            for event in events:
+                payload_str = event.get("payload", "")
+                try:
+                    if isinstance(payload_str, str):
+                        payload = json.loads(payload_str)
+                    else:
+                        payload = payload_str
+
+                    if payload.get("test_id") == test_id:
+                        marker = payload.get("marker")
+                        partition = payload.get("partition", 0)
+                        if marker and marker not in seen_markers:
+                            seen_markers.add(marker)
+                            with self._read_lock:
+                                self._read_events[partition].append(marker)
+                            events_found += 1
+                            found_new_this_batch += 1
+                except Exception:
+                    pass
+
+            if found_new_this_batch > 0:
+                no_progress_iterations = 0
+                print(f"  Progress: {events_found:,}/{total_expected:,} events found (+{found_new_this_batch})")
+            else:
+                no_progress_iterations += 1
+
+            # Move to next page
+            if last_ts is not None:
+                # If we found new events, stay at this timestamp to catch any more
+                # If no new events, advance past it
+                if found_new_this_batch > 0:
+                    since_ts = last_ts
+                else:
+                    since_ts = last_ts + 1
+
+            if no_progress_iterations > 10:
+                break
+
+            if events_found >= total_expected:
+                break
+
+        # Print partition summary
+        for partition in range(self.cons_config.num_partitions):
+            found = len(self._read_events.get(partition, []))
+            print(f"  Partition {partition}: read {found} events")
 
         summary = self.read_stats.summary()
         return {
