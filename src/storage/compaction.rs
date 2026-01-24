@@ -12,6 +12,8 @@ pub struct CompactionConfig {
     /// Files smaller than this are candidates for merging.
     pub min_file_size_bytes: u64,
     /// Target file size after compaction (bytes).
+    /// Default: 512MB (Iceberg best practice for compacted files).
+    /// Override with `ZOMBI_COMPACTED_FILE_SIZE_MB` environment variable.
     pub target_file_size_bytes: u64,
     /// Maximum number of files to compact in one operation.
     pub max_files_per_compaction: usize,
@@ -23,9 +25,30 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             min_file_size_bytes: 64 * 1024 * 1024,     // 64MB
-            target_file_size_bytes: 128 * 1024 * 1024, // 128MB
+            target_file_size_bytes: 512 * 1024 * 1024, // 512MB (Iceberg best practice)
             max_files_per_compaction: 10,
             min_files_to_compact: 3,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// Creates a config with environment variable overrides.
+    ///
+    /// Reads the following environment variables:
+    /// - `ZOMBI_COMPACTED_FILE_SIZE_MB`: Target file size after compaction (default: 512MB)
+    pub fn from_env() -> Self {
+        let default = Self::default();
+
+        let target_file_size_bytes = std::env::var("ZOMBI_COMPACTED_FILE_SIZE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(default.target_file_size_bytes);
+
+        Self {
+            target_file_size_bytes,
+            ..default
         }
     }
 }
@@ -420,7 +443,17 @@ mod tests {
     fn test_compaction_config_default() {
         let config = CompactionConfig::default();
         assert_eq!(config.min_file_size_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.target_file_size_bytes, 512 * 1024 * 1024); // 512MB for compacted files
+        assert_eq!(config.max_files_per_compaction, 10);
+        assert_eq!(config.min_files_to_compact, 3);
+    }
+
+    #[test]
+    fn test_compaction_config_from_env() {
+        // Test that from_env uses defaults when no env vars are set
+        let config = CompactionConfig::from_env();
+        // Should be 512MB unless ZOMBI_COMPACTED_FILE_SIZE_MB is set
+        assert_eq!(config.min_file_size_bytes, 64 * 1024 * 1024);
         assert_eq!(config.max_files_per_compaction, 10);
         assert_eq!(config.min_files_to_compact, 3);
     }
