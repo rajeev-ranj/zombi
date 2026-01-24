@@ -185,6 +185,10 @@ Environment variables:
 | `ZOMBI_ICEBERG_ENABLED` | `false` | Enable Iceberg format output |
 | `RUST_LOG` | `zombi=info` | Log level |
 
+## Shutdown Behavior
+
+On SIGINT/SIGTERM, Zombi attempts a final flush of pending hot storage to cold storage when S3/Iceberg is configured. The server exits after the flush attempt and flusher shutdown complete.
+
 ## Architecture
 
 ```

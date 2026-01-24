@@ -1,5 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
 use zombi::api::{start_server, AppState, Metrics, ServerConfig};
@@ -70,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // Start background flusher if cold storage is configured
-    let _flusher = if let Some(ref cold) = cold_storage {
+    let flusher = if let Some(ref cold) = cold_storage {
         // Use Iceberg defaults when enabled, otherwise use standard defaults
         let base_config = if iceberg_enabled {
             FlusherConfig::iceberg_defaults()
@@ -141,7 +144,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(8080),
     };
 
-    start_server(config, state).await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let mut server_handle = tokio::spawn(start_server(config, state, async {
+        let _ = shutdown_rx.await;
+    }));
+
+    tokio::select! {
+        result = &mut server_handle => {
+            let server_result = result
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            server_result?;
+            return Ok(());
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("Shutdown signal received");
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    let server_result = server_handle
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    let server_error = server_result.err();
+    if let Some(ref err) = server_error {
+        tracing::error!(error = %err, "Server exited with error");
+    }
+
+    if let Some(ref flusher) = flusher {
+        if let Err(e) = flusher.stop().await {
+            tracing::error!(error = %e, "Failed to stop background flusher");
+        }
+
+        tracing::info!("Flushing pending data before shutdown");
+        match timeout(Duration::from_secs(30), flusher.flush_now()).await {
+            Ok(Ok(result)) => {
+                tracing::info!(
+                    events_flushed = result.events_flushed,
+                    segments_written = result.segments_written,
+                    new_watermark = result.new_watermark,
+                    "Final flush completed"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "Final flush failed");
+            }
+            Err(_) => {
+                tracing::warn!("Final flush timed out");
+            }
+        }
+    }
+
+    if let Some(err) = server_error {
+        return Err(err);
+    }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "Failed to install Ctrl+C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

@@ -101,6 +101,26 @@ where
         Ok(())
     }
 
+    fn list_topic_partitions(hot_storage: &H) -> Result<Vec<(String, u32)>, StorageError> {
+        let topic_names = hot_storage.list_topics()?;
+        let mut all = Vec::new();
+
+        for topic in topic_names {
+            match hot_storage.list_partitions(&topic) {
+                Ok(partitions) => {
+                    for partition in partitions {
+                        all.push((topic.clone(), partition));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(topic = %topic, error = %e, "Failed to list partitions");
+                }
+            }
+        }
+
+        Ok(all)
+    }
+
     /// Flushes a single topic/partition.
     ///
     /// When `iceberg_enabled` is true, uses `target_file_size_bytes` to limit
@@ -249,23 +269,8 @@ where
                 }
 
                 // Discover topics from hot storage
-                let topics_to_flush: Vec<(String, u32)> = match hot_storage.list_topics() {
-                    Ok(topic_names) => {
-                        let mut all = Vec::new();
-                        for topic in topic_names {
-                            match hot_storage.list_partitions(&topic) {
-                                Ok(partitions) => {
-                                    for partition in partitions {
-                                        all.push((topic.clone(), partition));
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(topic = %topic, error = %e, "Failed to list partitions");
-                                }
-                            }
-                        }
-                        all
-                    }
+                let topics_to_flush = match Self::list_topic_partitions(hot_storage.as_ref()) {
+                    Ok(topics) => topics,
                     Err(e) => {
                         tracing::error!("Failed to list topics: {}", e);
                         continue;
@@ -343,7 +348,7 @@ where
     }
 
     async fn flush_now(&self) -> Result<FlushResult, StorageError> {
-        let topics_to_flush = self.topics.read().map_lock_err()?.clone();
+        let topics_to_flush = Self::list_topic_partitions(self.hot_storage.as_ref())?;
 
         let mut total_events = 0;
         let mut total_segments = 0;
@@ -403,6 +408,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{BulkWriteEvent, ColdStorageInfo, SegmentInfo, StoredEvent};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     #[test]
     fn test_flusher_config_default() {
@@ -422,5 +430,241 @@ mod tests {
         assert_eq!(config.max_segment_size, 100000);
         assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
         assert!(config.iceberg_enabled);
+    }
+
+    #[derive(Default)]
+    struct TestHotStorage {
+        events: HashMap<(String, u32), Vec<StoredEvent>>,
+    }
+
+    impl TestHotStorage {
+        fn insert(&mut self, topic: &str, partition: u32, events: Vec<StoredEvent>) {
+            self.events.insert((topic.to_string(), partition), events);
+        }
+    }
+
+    impl HotStorage for TestHotStorage {
+        fn write(
+            &self,
+            _topic: &str,
+            _partition: u32,
+            _payload: &[u8],
+            _timestamp_ms: i64,
+            _idempotency_key: Option<&str>,
+        ) -> Result<u64, StorageError> {
+            Err(StorageError::S3("not implemented".into()))
+        }
+
+        fn write_batch(
+            &self,
+            _topic: &str,
+            _events: &[BulkWriteEvent],
+        ) -> Result<Vec<u64>, StorageError> {
+            Err(StorageError::S3("not implemented".into()))
+        }
+
+        fn read(
+            &self,
+            topic: &str,
+            partition: u32,
+            offset: u64,
+            limit: usize,
+        ) -> Result<Vec<StoredEvent>, StorageError> {
+            let key = (topic.to_string(), partition);
+            let events = self
+                .events
+                .get(&key)
+                .ok_or_else(|| StorageError::PartitionNotFound {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+
+            Ok(events
+                .iter()
+                .filter(|event| event.sequence >= offset)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn high_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+            let key = (topic.to_string(), partition);
+            let events = self
+                .events
+                .get(&key)
+                .ok_or_else(|| StorageError::PartitionNotFound {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+            Ok(events.last().map(|event| event.sequence).unwrap_or(0))
+        }
+
+        fn low_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+            let key = (topic.to_string(), partition);
+            let events = self
+                .events
+                .get(&key)
+                .ok_or_else(|| StorageError::PartitionNotFound {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+            Ok(events.first().map(|event| event.sequence).unwrap_or(0))
+        }
+
+        fn get_idempotency_offset(
+            &self,
+            _topic: &str,
+            _partition: u32,
+            _idempotency_key: &str,
+        ) -> Result<Option<u64>, StorageError> {
+            Ok(None)
+        }
+
+        fn commit_offset(
+            &self,
+            _group: &str,
+            _topic: &str,
+            _partition: u32,
+            _offset: u64,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn get_offset(
+            &self,
+            _group: &str,
+            _topic: &str,
+            _partition: u32,
+        ) -> Result<Option<u64>, StorageError> {
+            Ok(None)
+        }
+
+        fn list_partitions(&self, topic: &str) -> Result<Vec<u32>, StorageError> {
+            let mut partitions = std::collections::HashSet::new();
+            for key in self.events.keys() {
+                if key.0 == topic {
+                    partitions.insert(key.1);
+                }
+            }
+            let mut result: Vec<u32> = partitions.into_iter().collect();
+            result.sort_unstable();
+            Ok(result)
+        }
+
+        fn list_topics(&self) -> Result<Vec<String>, StorageError> {
+            let mut topics = std::collections::HashSet::new();
+            for key in self.events.keys() {
+                topics.insert(key.0.clone());
+            }
+            let mut result: Vec<String> = topics.into_iter().collect();
+            result.sort();
+            Ok(result)
+        }
+
+        fn read_all_partitions(
+            &self,
+            _topic: &str,
+            _start_offsets: Option<&std::collections::HashMap<u32, u64>>,
+            _start_timestamp_ms: Option<i64>,
+            _limit: usize,
+        ) -> Result<Vec<StoredEvent>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestColdStorage {
+        writes: Mutex<Vec<(String, u32, usize)>>,
+    }
+
+    impl ColdStorage for TestColdStorage {
+        async fn write_segment(
+            &self,
+            topic: &str,
+            partition: u32,
+            events: &[StoredEvent],
+        ) -> Result<String, StorageError> {
+            let mut writes = self
+                .writes
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            writes.push((topic.to_string(), partition, events.len()));
+            Ok("segment-1".to_string())
+        }
+
+        async fn read_events(
+            &self,
+            _topic: &str,
+            _partition: u32,
+            _start_offset: u64,
+            _limit: usize,
+            _since_ms: Option<i64>,
+            _until_ms: Option<i64>,
+        ) -> Result<Vec<StoredEvent>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_segments(
+            &self,
+            _topic: &str,
+            _partition: u32,
+        ) -> Result<Vec<SegmentInfo>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        fn storage_info(&self) -> ColdStorageInfo {
+            ColdStorageInfo {
+                storage_type: "test".into(),
+                iceberg_enabled: false,
+                bucket: String::new(),
+                base_path: String::new(),
+            }
+        }
+
+        async fn commit_snapshot(&self, _topic: &str) -> Result<Option<i64>, StorageError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_now_discovers_topics_and_flushes() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                StoredEvent {
+                    sequence: 1,
+                    topic: "events".into(),
+                    partition: 0,
+                    payload: vec![1],
+                    timestamp_ms: 0,
+                    idempotency_key: None,
+                },
+                StoredEvent {
+                    sequence: 2,
+                    topic: "events".into(),
+                    partition: 0,
+                    payload: vec![2],
+                    timestamp_ms: 0,
+                    idempotency_key: None,
+                },
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let flusher =
+            BackgroundFlusher::new(Arc::new(hot), Arc::clone(&cold), FlusherConfig::default());
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 2);
+        assert_eq!(result.segments_written, 1);
+        assert_eq!(result.new_watermark, 2);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "events");
+        assert_eq!(writes[0].1, 0);
+        assert_eq!(writes[0].2, 2);
     }
 }
