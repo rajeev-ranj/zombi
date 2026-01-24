@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -32,6 +33,9 @@ pub struct FlusherConfig {
     /// Minimum bytes accumulated before committing a snapshot.
     /// Default: 1GB. Snapshot commits when this OR threshold_files is exceeded.
     pub snapshot_threshold_bytes: usize,
+    /// Maximum concurrent S3 uploads during flush.
+    /// Default: 4. Higher values can improve throughput but increase memory usage.
+    pub max_concurrent_s3_uploads: usize,
 }
 
 impl Default for FlusherConfig {
@@ -44,6 +48,7 @@ impl Default for FlusherConfig {
             iceberg_enabled: false,
             snapshot_threshold_files: 10,
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
+            max_concurrent_s3_uploads: 4,
         }
     }
 }
@@ -56,6 +61,7 @@ impl FlusherConfig {
     /// - 5-minute flush interval for low-volume tables to accumulate data
     /// - Size-based batching via target_file_size_bytes
     /// - Batched snapshots: commit only when 10 files or 1GB accumulated
+    /// - Pipelined S3 uploads: 4 concurrent uploads for better throughput
     ///
     /// # Durability
     ///
@@ -71,6 +77,7 @@ impl FlusherConfig {
             iceberg_enabled: true,
             snapshot_threshold_files: 10, // Batch snapshots for reduced metadata churn
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
+            max_concurrent_s3_uploads: 4, // Pipeline S3 writes
         }
     }
 }
@@ -249,9 +256,13 @@ where
         let target_file_size_bytes = self.config.target_file_size_bytes;
         let snapshot_threshold_files = self.config.snapshot_threshold_files;
         let snapshot_threshold_bytes = self.config.snapshot_threshold_bytes;
+        let max_concurrent_uploads = self.config.max_concurrent_s3_uploads;
 
         let handle = tokio::spawn(async move {
-            tracing::info!("Flusher background task started");
+            tracing::info!(
+                max_concurrent_uploads = max_concurrent_uploads,
+                "Flusher background task started with pipelined S3 uploads"
+            );
 
             loop {
                 // Wait for either timeout or explicit flush request
@@ -277,7 +288,10 @@ where
                 // Collect unique topics for snapshot commit
                 let mut flushed_topics = std::collections::HashSet::new();
 
-                // Flush each topic/partition
+                // Use FuturesUnordered for pipelined S3 uploads
+                let mut flush_futures: FuturesUnordered<_> = FuturesUnordered::new();
+
+                // Queue up flush futures for all partitions
                 for (topic, partition) in topics_to_flush {
                     let current_watermark = {
                         match watermarks.read() {
@@ -289,24 +303,60 @@ where
                         }
                     };
 
-                    match Self::flush_partition(
-                        &hot_storage,
-                        &cold_storage,
-                        &topic,
-                        partition,
-                        current_watermark,
-                        max_segment_size,
-                        iceberg_enabled,
-                        target_file_size_bytes,
-                    )
-                    .await
-                    {
+                    let hot = Arc::clone(&hot_storage);
+                    let cold = Arc::clone(&cold_storage);
+                    let topic_clone = topic.clone();
+
+                    // Create the flush future
+                    flush_futures.push(async move {
+                        let result = Self::flush_partition(
+                            &hot,
+                            &cold,
+                            &topic_clone,
+                            partition,
+                            current_watermark,
+                            max_segment_size,
+                            iceberg_enabled,
+                            target_file_size_bytes,
+                        )
+                        .await;
+                        (topic_clone, partition, result)
+                    });
+
+                    // If we've reached max concurrency, wait for one to complete
+                    if flush_futures.len() >= max_concurrent_uploads {
+                        if let Some((topic, partition, result)) = flush_futures.next().await {
+                            match result {
+                                Ok((count, new_watermark)) => {
+                                    if count > 0 {
+                                        if let Ok(mut w) = watermarks.write() {
+                                            w.insert((topic.clone(), partition), new_watermark);
+                                        }
+                                        flushed_topics.insert(topic);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        topic = %topic,
+                                        partition = partition,
+                                        error = %e,
+                                        "Failed to flush partition"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Drain remaining futures
+                while let Some((topic, partition, result)) = flush_futures.next().await {
+                    match result {
                         Ok((count, new_watermark)) => {
                             if count > 0 {
                                 if let Ok(mut w) = watermarks.write() {
                                     w.insert((topic.clone(), partition), new_watermark);
                                 }
-                                flushed_topics.insert(topic.clone());
+                                flushed_topics.insert(topic);
                             }
                         }
                         Err(e) => {
@@ -509,6 +559,7 @@ mod tests {
         assert!(!config.iceberg_enabled);
         assert_eq!(config.snapshot_threshold_files, 10);
         assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
+        assert_eq!(config.max_concurrent_s3_uploads, 4);
     }
 
     #[test]
@@ -521,6 +572,7 @@ mod tests {
         assert!(config.iceberg_enabled);
         assert_eq!(config.snapshot_threshold_files, 10);
         assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
+        assert_eq!(config.max_concurrent_s3_uploads, 4);
     }
 
     #[derive(Default)]
