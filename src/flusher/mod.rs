@@ -49,9 +49,9 @@ impl FlusherConfig {
     /// - Size-based batching via target_file_size_bytes
     pub fn iceberg_defaults() -> Self {
         Self {
-            interval: Duration::from_secs(300),        // 5 minutes for low-volume tables
-            batch_size: 10000,                         // Advisory target batch size
-            max_segment_size: 100000,                  // Max events per segment
+            interval: Duration::from_secs(300), // 5 minutes for low-volume tables
+            batch_size: 10000,                  // Advisory target batch size
+            max_segment_size: 100000,           // Max events per segment
             target_file_size_bytes: 128 * 1024 * 1024, // 128MB target (Iceberg best practice)
             iceberg_enabled: true,
         }
