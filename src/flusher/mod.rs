@@ -541,7 +541,7 @@ mod tests {
 
         fn list_partitions(&self, topic: &str) -> Result<Vec<u32>, StorageError> {
             let mut partitions = std::collections::HashSet::new();
-            for (key, _) in &self.events {
+            for key in self.events.keys() {
                 if key.0 == topic {
                     partitions.insert(key.1);
                 }
@@ -553,7 +553,7 @@ mod tests {
 
         fn list_topics(&self) -> Result<Vec<String>, StorageError> {
             let mut topics = std::collections::HashSet::new();
-            for (key, _) in &self.events {
+            for key in self.events.keys() {
                 topics.insert(key.0.clone());
             }
             let mut result: Vec<String> = topics.into_iter().collect();
@@ -621,11 +621,8 @@ mod tests {
             }
         }
 
-        fn commit_snapshot(
-            &self,
-            _topic: &str,
-        ) -> impl std::future::Future<Output = Result<Option<i64>, StorageError>> + Send {
-            async move { Ok(None) }
+        async fn commit_snapshot(&self, _topic: &str) -> Result<Option<i64>, StorageError> {
+            Ok(None)
         }
     }
 
