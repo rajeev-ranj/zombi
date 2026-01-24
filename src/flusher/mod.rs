@@ -620,6 +620,13 @@ mod tests {
                 base_path: String::new(),
             }
         }
+
+        fn commit_snapshot(
+            &self,
+            _topic: &str,
+        ) -> impl std::future::Future<Output = Result<Option<i64>, StorageError>> + Send {
+            async move { Ok(None) }
+        }
     }
 
     #[tokio::test]

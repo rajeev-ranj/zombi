@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
 use zombi::api::{start_server, AppState, Metrics, ServerConfig};
@@ -174,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         tracing::info!("Flushing pending data before shutdown");
-        match flusher.flush_now().await {
-            Ok(result) => {
+        match timeout(Duration::from_secs(30), flusher.flush_now()).await {
+            Ok(Ok(result)) => {
                 tracing::info!(
                     events_flushed = result.events_flushed,
                     segments_written = result.segments_written,
@@ -183,8 +185,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "Final flush completed"
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "Final flush failed");
+            }
+            Err(_) => {
+                tracing::warn!("Final flush timed out");
             }
         }
     }
