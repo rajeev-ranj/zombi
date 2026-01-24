@@ -338,6 +338,8 @@ Redis stores:
 | **Scaling** |
 | `ZOMBI_REDIS_URL` | - | Redis URL (enables multi-node) |
 | `ZOMBI_NODE_ID` | `auto` | Unique node identifier |
+| **Optimization** |
+| `ZOMBI_TIMESTAMP_INDEX_ENABLED` | `false` | Enable timestamp secondary index |
 | **Observability** |
 | `RUST_LOG` | `zombi=info` | Log level |
 

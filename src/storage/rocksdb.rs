@@ -17,6 +17,8 @@ const IDEM_PREFIX: &str = "idem";
 const HWM_PREFIX: &str = "hwm";
 /// Key prefix for consumer offsets
 const CONSUMER_PREFIX: &str = "consumer";
+/// Key prefix for timestamp index (for O(1) time-based queries)
+const TIMESTAMP_INDEX_PREFIX: &str = "ts";
 
 /// RocksDB-backed hot storage implementation.
 pub struct RocksDbStorage {
@@ -30,6 +32,9 @@ pub struct RocksDbStorage {
     /// Path for sequence persistence (reserved for future use)
     #[allow(dead_code)]
     data_path: std::path::PathBuf,
+    /// Enable secondary timestamp index for O(1) time-based queries.
+    /// Slightly increases write overhead but enables efficient time-range scans.
+    timestamp_index_enabled: bool,
 }
 
 impl RocksDbStorage {
@@ -70,13 +75,62 @@ impl RocksDbStorage {
 
         let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
+        // Check if timestamp index is enabled via environment variable
+        let timestamp_index_enabled = std::env::var("ZOMBI_TIMESTAMP_INDEX_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if timestamp_index_enabled {
+            tracing::info!("Timestamp secondary index enabled for time-based queries");
+        }
+
         Ok(Self {
             db,
             sequences: DashMap::new(),
             partitions_cache: DashMap::new(),
             topics_cache: DashMap::new(),
             data_path: path.to_path_buf(),
+            timestamp_index_enabled,
         })
+    }
+
+    /// Creates storage with explicit timestamp index setting (for testing).
+    #[cfg(test)]
+    pub fn open_with_timestamp_index(
+        path: impl AsRef<Path>,
+        timestamp_index_enabled: bool,
+    ) -> Result<Self, StorageError> {
+        let mut storage = Self::open(path)?;
+        storage.timestamp_index_enabled = timestamp_index_enabled;
+        Ok(storage)
+    }
+
+    /// Returns true if the timestamp secondary index is enabled.
+    pub fn timestamp_index_enabled(&self) -> bool {
+        self.timestamp_index_enabled
+    }
+
+    /// Generates a timestamp index key.
+    /// Format: ts:{topic}:{partition}:{timestamp_hex}:{sequence_hex}
+    fn timestamp_index_key(
+        topic: &str,
+        partition: u32,
+        timestamp_ms: i64,
+        sequence: u64,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{:016x}:{:016x}",
+            TIMESTAMP_INDEX_PREFIX, topic, partition, timestamp_ms as u64, sequence
+        )
+    }
+
+    /// Parses a timestamp index key to extract sequence.
+    fn parse_timestamp_index_key(key: &str) -> Option<u64> {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() != 5 || parts[0] != TIMESTAMP_INDEX_PREFIX {
+            return None;
+        }
+        u64::from_str_radix(parts[4], 16).ok()
     }
 
     /// Gets or creates a sequence generator for a topic/partition.
@@ -263,6 +317,12 @@ impl HotStorage for RocksDbStorage {
         let hwm_key = format!("{}:{}:{}", HWM_PREFIX, topic, partition);
         batch.put(hwm_key.as_bytes(), sequence.to_be_bytes());
 
+        // Add timestamp index if enabled (for O(1) time-based queries)
+        if self.timestamp_index_enabled {
+            let ts_key = Self::timestamp_index_key(topic, partition, timestamp_ms, sequence);
+            batch.put(ts_key.as_bytes(), sequence.to_be_bytes());
+        }
+
         // Single atomic write for all operations (with WAL disabled for throughput #4)
         self.db
             .write_opt(batch, &Self::write_options())
@@ -329,6 +389,13 @@ impl HotStorage for RocksDbStorage {
             if let Some(ref idem_key) = event.idempotency_key {
                 let idem_db_key = Self::idempotency_key(topic, event.partition, idem_key);
                 batch.put(idem_db_key.as_bytes(), sequence.to_be_bytes());
+            }
+
+            // Add timestamp index if enabled
+            if self.timestamp_index_enabled {
+                let ts_key =
+                    Self::timestamp_index_key(topic, event.partition, event.timestamp_ms, sequence);
+                batch.put(ts_key.as_bytes(), sequence.to_be_bytes());
             }
 
             // Track high watermark for this partition
@@ -607,6 +674,94 @@ impl HotStorage for RocksDbStorage {
         all_events.truncate(limit);
 
         Ok(all_events)
+    }
+
+    fn read_by_timestamp(
+        &self,
+        topic: &str,
+        partition: u32,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        // If timestamp index is not enabled, fall back to full scan
+        if !self.timestamp_index_enabled {
+            return self.read_by_timestamp_fallback(topic, partition, since_ms, until_ms, limit);
+        }
+
+        // Build the key prefix for the timestamp range
+        let prefix = format!("{}:{}:{}:", TIMESTAMP_INDEX_PREFIX, topic, partition);
+
+        // Build start and end keys based on time range
+        let start_key = match since_ms {
+            Some(ts) => format!("{}{:016x}:", prefix, ts as u64),
+            None => prefix.clone(),
+        };
+
+        let end_key = match until_ms {
+            Some(ts) => format!("{}{:016x}:", prefix, ts as u64),
+            None => format!("{}g", prefix), // 'g' > any hex char
+        };
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_lower_bound(start_key.as_bytes());
+        read_opts.set_iterate_upper_bound(end_key.as_bytes());
+
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+
+        let mut sequences = Vec::new();
+        for item in iter {
+            let (key, _value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if let Some(seq) = Self::parse_timestamp_index_key(&key_str) {
+                sequences.push(seq);
+                if sequences.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        // Now read the actual events by sequence
+        let mut events = Vec::with_capacity(sequences.len());
+        for seq in sequences {
+            let event_key = Self::event_key(topic, partition, seq);
+            if let Some(bytes) = self
+                .db
+                .get(event_key.as_bytes())
+                .map_err(|e| StorageError::RocksDb(e.to_string()))?
+            {
+                let event = Self::deserialize_event(&bytes)?;
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+impl RocksDbStorage {
+    /// Fallback for read_by_timestamp when index is not enabled.
+    fn read_by_timestamp_fallback(
+        &self,
+        topic: &str,
+        partition: u32,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        // Fall back to scanning events and filtering
+        let events = self.read(topic, partition, 0, limit * 10)?;
+        Ok(events
+            .into_iter()
+            .filter(|e| {
+                since_ms.is_none_or(|s| e.timestamp_ms >= s)
+                    && until_ms.is_none_or(|u| e.timestamp_ms < u)
+            })
+            .take(limit)
+            .collect())
     }
 }
 
@@ -938,5 +1093,61 @@ mod tests {
             .unwrap();
         let offset = storage.get_offset("test-group", "test-topic", 0).unwrap();
         assert_eq!(offset, Some(u64::MAX));
+    }
+
+    #[test]
+    fn timestamp_index_key_format() {
+        let key = RocksDbStorage::timestamp_index_key("events", 0, 1234567890000, 42);
+        assert!(key.starts_with("ts:events:0:"));
+        assert!(key.ends_with(":000000000000002a")); // 42 in hex
+    }
+
+    #[test]
+    fn timestamp_index_key_parsing() {
+        let seq = RocksDbStorage::parse_timestamp_index_key(
+            "ts:events:0:0000011f71fb0470:000000000000002a",
+        );
+        assert_eq!(seq, Some(42));
+    }
+
+    #[test]
+    fn read_by_timestamp_fallback() {
+        // Test the fallback path when timestamp index is disabled
+        let (storage, _dir) = create_test_storage();
+        assert!(!storage.timestamp_index_enabled());
+
+        // Write events with different timestamps
+        storage.write("test", 0, b"a", 1000, None).unwrap();
+        storage.write("test", 0, b"b", 2000, None).unwrap();
+        storage.write("test", 0, b"c", 3000, None).unwrap();
+
+        // Read by timestamp range
+        let events = storage
+            .read_by_timestamp("test", 0, Some(1500), Some(2500), 10)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, b"b");
+    }
+
+    #[test]
+    fn read_by_timestamp_with_index() {
+        // Test with timestamp index enabled
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open_with_timestamp_index(dir.path(), true).unwrap();
+        assert!(storage.timestamp_index_enabled());
+
+        // Write events with different timestamps
+        storage.write("test", 0, b"a", 1000, None).unwrap();
+        storage.write("test", 0, b"b", 2000, None).unwrap();
+        storage.write("test", 0, b"c", 3000, None).unwrap();
+
+        // Read by timestamp range using index
+        let events = storage
+            .read_by_timestamp("test", 0, Some(1500), Some(2500), 10)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, b"b");
     }
 }
