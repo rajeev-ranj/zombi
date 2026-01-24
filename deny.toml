@@ -2,10 +2,12 @@
 # See: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Deny any crate with known security vulnerabilities
 version = 2
-# Ignore specific advisories (add IDs here if needed)
-ignore = []
+# Ignore specific advisories
+# paste crate is unmaintained but widely used and has no security issues
+ignore = [
+    "RUSTSEC-2024-0436",  # paste - unmaintained
+]
 
 [licenses]
 # Allow common permissive licenses
@@ -19,6 +21,7 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
 ]
 # Confidence threshold for license detection
 confidence-threshold = 0.8
