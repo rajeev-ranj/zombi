@@ -18,6 +18,15 @@ pub struct ColdStorageInfo {
     pub base_path: String,
 }
 
+/// Statistics about pending files for a topic, awaiting snapshot commit.
+#[derive(Debug, Clone, Default)]
+pub struct PendingSnapshotStats {
+    /// Number of pending data files
+    pub file_count: usize,
+    /// Total bytes across pending files
+    pub total_bytes: u64,
+}
+
 /// Cold storage for archived events (S3).
 ///
 /// Events are written in batches as log segments.
@@ -65,6 +74,12 @@ pub trait ColdStorage: Send + Sync {
         _topic: &str,
     ) -> impl Future<Output = Result<Option<i64>, StorageError>> + Send {
         async move { Ok(None) }
+    }
+
+    /// Returns statistics about pending files awaiting snapshot commit.
+    /// Used for batched snapshot logic.
+    fn pending_snapshot_stats(&self, _topic: &str) -> PendingSnapshotStats {
+        PendingSnapshotStats::default()
     }
 }
 

@@ -102,6 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(|mb| mb * 1024 * 1024)
                 .unwrap_or(base_config.target_file_size_bytes),
             iceberg_enabled,
+            snapshot_threshold_files: std::env::var("ZOMBI_SNAPSHOT_THRESHOLD_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(base_config.snapshot_threshold_files),
+            snapshot_threshold_bytes: std::env::var("ZOMBI_SNAPSHOT_THRESHOLD_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|gb| gb * 1024 * 1024 * 1024)
+                .unwrap_or(base_config.snapshot_threshold_bytes),
         };
 
         if iceberg_enabled {
@@ -110,7 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 batch_size = config.batch_size,
                 max_segment_size = config.max_segment_size,
                 target_file_size_mb = config.target_file_size_bytes / (1024 * 1024),
-                "Iceberg mode enabled - using optimized flush settings"
+                snapshot_threshold_files = config.snapshot_threshold_files,
+                snapshot_threshold_gb = config.snapshot_threshold_bytes / (1024 * 1024 * 1024),
+                "Iceberg mode enabled - using optimized flush settings with batched snapshots"
             );
         }
 

@@ -323,6 +323,8 @@ Redis stores:
 | `ZOMBI_ICEBERG_ENABLED` | `true` | Enable Iceberg output |
 | `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size (flush) |
 | `ZOMBI_COMPACTED_FILE_SIZE_MB` | `512` | Target file size after compaction |
+| `ZOMBI_SNAPSHOT_THRESHOLD_FILES` | `10` | Min files before snapshot commit |
+| `ZOMBI_SNAPSHOT_THRESHOLD_GB` | `1` | Min GB before snapshot commit |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `30` | Flush interval |
 | `ZOMBI_FLUSH_MIN_EVENTS` | `10000` | Min events before flush |
 | **Catalog** |
