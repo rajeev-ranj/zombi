@@ -51,7 +51,7 @@ class Stats:
     errors: int = 0
     bytes_total: int = 0
     latencies_ms: List[float] = field(default_factory=list)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)  # Use RLock for re-entrant locking
 
     def record(self, success: bool, latency_ms: float, bytes_sent: int = 0):
         with self.lock:
@@ -201,7 +201,7 @@ class BenchmarkSuite:
         data = {
             "topic": self.table,
             "partition": partition,
-            "payload": payload,
+            "payload": json.dumps(payload),  # API expects payload as string
             "timestamp_ms": int(time.time() * 1000),
         }
         start = time.perf_counter()
@@ -210,7 +210,7 @@ class BenchmarkSuite:
                 f"{self.url}/tables/{self.table}",
                 json=data,
                 headers={"Content-Type": "application/json"},
-                timeout=10,
+                timeout=5,
             )
             latency = (time.perf_counter() - start) * 1000
             return r.status_code in (200, 201, 202), latency
@@ -232,7 +232,7 @@ class BenchmarkSuite:
                     "Content-Type": "application/x-protobuf",
                     "X-Partition": str(partition),
                 },
-                timeout=10,
+                timeout=5,
             )
             latency = (time.perf_counter() - start) * 1000
             return r.status_code in (200, 201, 202), latency
@@ -289,7 +289,7 @@ class BenchmarkSuite:
                         success, latency = self.write_proto(payload_json)
                         stats.record(success, latency, len(payload_json))
 
-            threads = [threading.Thread(target=worker) for _ in range(workers)]
+            threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
             for t in threads:
                 t.start()
 
@@ -297,7 +297,7 @@ class BenchmarkSuite:
             stop_flag.set()
 
             for t in threads:
-                t.join()
+                t.join(timeout=2)
 
             summary = stats.summary()
             throughput = summary["success"] / duration_sec
@@ -331,7 +331,7 @@ class BenchmarkSuite:
                 stats.record(success, latency, 100)
 
         print(f"Running max throughput test ({duration_sec}s, {workers} workers)...")
-        threads = [threading.Thread(target=worker) for _ in range(workers)]
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
         for t in threads:
             t.start()
 
@@ -339,7 +339,7 @@ class BenchmarkSuite:
         stop_flag.set()
 
         for t in threads:
-            t.join()
+            t.join(timeout=2)
 
         summary = stats.summary()
         throughput = summary["success"] / duration_sec
@@ -466,7 +466,7 @@ class BenchmarkSuite:
                     success, latency = self.write_json(payload)
                     stats.record(success, latency, size)
 
-            threads = [threading.Thread(target=worker) for _ in range(workers)]
+            threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
             for t in threads:
                 t.start()
 
@@ -474,7 +474,7 @@ class BenchmarkSuite:
             stop_flag.set()
 
             for t in threads:
-                t.join()
+                t.join(timeout=2)
 
             summary = stats.summary()
             throughput = summary["success"] / duration_sec
