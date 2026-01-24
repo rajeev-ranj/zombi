@@ -1,8 +1,33 @@
-# Zombi
+<p align="center">
+  <img src="assets/zombi-logo.svg" width="160" alt="Zombi logo">
+</p>
+<h1 align="center">Zombi</h1>
+<p align="center">A lightweight Kafka-replacement event streaming system with RocksDB hot storage and S3 cold storage.</p>
+<p align="center">
+  <a href="SPEC.md">Spec</a> ·
+  <a href="docs/openapi.yaml">OpenAPI</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-A lightweight Kafka-replacement event streaming system with RocksDB hot storage and S3 cold storage.
+## Table of Contents
 
-## Documentation Sources
+- [Documentation](#documentation)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [API](#api)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Iceberg Integration](#iceberg-integration)
+- [Development](#development)
+- [Testing with MinIO](#testing-with-minio)
+- [Changelog](#changelog)
+- [Versioning](#versioning)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+
+## Documentation
 
 Authoritative docs:
 - `README.md`
@@ -356,3 +381,23 @@ The `/stats` endpoint provides:
 - Error counts
 
 See [SPEC.md](SPEC.md) for full specification.
+
+## Changelog
+
+Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+## Versioning
+
+Versioning guidelines are documented in [VERSIONING.md](VERSIONING.md).
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before submitting PRs.
+
+## Security
+
+Please report security issues per [SECURITY.md](SECURITY.md).
+
+## License
+
+Licensed under the [MIT License](LICENSE).
