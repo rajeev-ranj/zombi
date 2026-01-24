@@ -187,6 +187,7 @@ pub fn write_parquet<P: AsRef<Path>>(
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     // Calculate statistics
+    // SAFETY: events is guaranteed non-empty (checked at function start)
     let min_sequence = events.iter().map(|e| e.sequence).min().unwrap();
     let max_sequence = events.iter().map(|e| e.sequence).max().unwrap();
     let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap();
@@ -222,6 +223,7 @@ fn compute_partition_bounds(events: &[StoredEvent]) -> PartitionValues {
         .map(|e| derive_partition_columns(e.timestamp_ms))
         .collect();
 
+    // SAFETY: events is guaranteed non-empty (checked at function start)
     let min_date = partition_cols.iter().map(|(d, _)| *d).min().unwrap();
     let max_date = partition_cols.iter().map(|(d, _)| *d).max().unwrap();
     let min_hour = partition_cols.iter().map(|(_, h)| *h).min().unwrap();
@@ -272,6 +274,7 @@ pub fn write_parquet_to_bytes(
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     // Calculate statistics
+    // SAFETY: events is guaranteed non-empty (checked at function start)
     let min_sequence = events.iter().map(|e| e.sequence).min().unwrap();
     let max_sequence = events.iter().map(|e| e.sequence).max().unwrap();
     let min_timestamp = events.iter().map(|e| e.timestamp_ms).min().unwrap();
