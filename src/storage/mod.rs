@@ -4,6 +4,7 @@ mod compaction;
 mod iceberg;
 mod iceberg_storage;
 mod parquet;
+mod retry;
 mod rocksdb;
 mod s3;
 mod sequence;
@@ -22,6 +23,7 @@ pub use parquet::{
     derive_partition_columns, event_schema, events_to_record_batch, format_partition_date,
     write_parquet, write_parquet_to_bytes, ParquetFileMetadata, PartitionValues,
 };
+pub use retry::{is_retryable_s3_error, RetryConfig};
 pub use rocksdb::RocksDbStorage;
 pub use s3::S3Storage;
 pub use sequence::AtomicSequenceGenerator;

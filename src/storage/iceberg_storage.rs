@@ -5,11 +5,13 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use backon::Retryable;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, PendingSnapshotStats, SegmentInfo, StorageError,
     StoredEvent,
 };
+use crate::storage::retry::{is_retryable_s3_error, RetryConfig};
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
     metadata_file_name, write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata,
@@ -27,13 +29,24 @@ pub struct IcebergStorage {
     metadata_versions: RwLock<HashMap<String, i64>>,
     /// Accumulated data files per topic (for manifest generation)
     pending_data_files: RwLock<HashMap<String, Vec<(DataFile, ParquetFileMetadata)>>>,
+    /// Retry configuration for S3 operations
+    retry_config: RetryConfig,
 }
 
 impl IcebergStorage {
-    /// Creates a new Iceberg storage with default AWS configuration.
+    /// Creates a new Iceberg storage with default AWS configuration and retry settings.
     pub async fn new(
         bucket: impl Into<String>,
         base_path: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_retry(bucket, base_path, RetryConfig::from_env()).await
+    }
+
+    /// Creates a new Iceberg storage with custom retry configuration.
+    pub async fn new_with_retry(
+        bucket: impl Into<String>,
+        base_path: impl Into<String>,
+        retry_config: RetryConfig,
     ) -> Result<Self, StorageError> {
         let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
         let client = Client::new(&config);
@@ -45,6 +58,7 @@ impl IcebergStorage {
             table_metadata: RwLock::new(HashMap::new()),
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
+            retry_config,
         })
     }
 
@@ -54,6 +68,18 @@ impl IcebergStorage {
         base_path: impl Into<String>,
         endpoint: impl Into<String>,
         region: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        Self::with_endpoint_and_retry(bucket, base_path, endpoint, region, RetryConfig::from_env())
+            .await
+    }
+
+    /// Creates a new Iceberg storage with a custom endpoint and retry configuration.
+    pub async fn with_endpoint_and_retry(
+        bucket: impl Into<String>,
+        base_path: impl Into<String>,
+        endpoint: impl Into<String>,
+        region: impl Into<String>,
+        retry_config: RetryConfig,
     ) -> Result<Self, StorageError> {
         let endpoint = endpoint.into();
         let region = region.into();
@@ -77,6 +103,7 @@ impl IcebergStorage {
             table_metadata: RwLock::new(HashMap::new()),
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
+            retry_config,
         })
     }
 
@@ -132,22 +159,37 @@ impl IcebergStorage {
         make_metadata_key(&self.base_path, topic, filename)
     }
 
-    /// Uploads bytes to S3.
+    /// Uploads bytes to S3 with retry.
     async fn upload_bytes(
         &self,
         key: &str,
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<(), StorageError> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(data))
-            .content_type(content_type)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+        let client = &self.client;
+        let bucket = &self.bucket;
+        (|| async {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(data.clone()))
+                .content_type(content_type)
+                .send()
+                .await
+        })
+        .retry(self.retry_config.backoff())
+        .when(|e| is_retryable_s3_error(&e.to_string()))
+        .notify(|err, dur| {
+            tracing::warn!(
+                key = %key,
+                error = %err,
+                retry_in = ?dur,
+                "S3 upload failed, retrying"
+            );
+        })
+        .await
+        .map_err(|e| StorageError::S3(e.to_string()))?;
         Ok(())
     }
 
@@ -330,14 +372,28 @@ impl ColdStorage for IcebergStorage {
         // For now, use full data prefix (future improvement: time-based prefix pruning)
         let prefix = format!("{}/{}/data/", self.base_path, topic);
 
-        let response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+        let client = &self.client;
+        let bucket = &self.bucket;
+        let response = (|| async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&prefix)
+                .send()
+                .await
+        })
+        .retry(self.retry_config.backoff())
+        .when(|e| is_retryable_s3_error(&e.to_string()))
+        .notify(|err, dur| {
+            tracing::warn!(
+                prefix = %prefix,
+                error = %err,
+                retry_in = ?dur,
+                "S3 LIST failed, retrying"
+            );
+        })
+        .await
+        .map_err(|e| StorageError::S3(e.to_string()))?;
 
         let mut all_events = Vec::new();
 
@@ -356,15 +412,28 @@ impl ColdStorage for IcebergStorage {
                         continue;
                     }
 
-                    // Download and read Parquet file
-                    let response = self
-                        .client
-                        .get_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .map_err(|e| StorageError::S3(e.to_string()))?;
+                    // Download and read Parquet file with retry
+                    let key_owned = key.to_string();
+                    let response = (|| async {
+                        client
+                            .get_object()
+                            .bucket(bucket)
+                            .key(&key_owned)
+                            .send()
+                            .await
+                    })
+                    .retry(self.retry_config.backoff())
+                    .when(|e| is_retryable_s3_error(&e.to_string()))
+                    .notify(|err, dur| {
+                        tracing::warn!(
+                            key = %key_owned,
+                            error = %err,
+                            retry_in = ?dur,
+                            "S3 GET failed, retrying"
+                        );
+                    })
+                    .await
+                    .map_err(|e| StorageError::S3(e.to_string()))?;
 
                     let bytes = response
                         .body
@@ -400,14 +469,28 @@ impl ColdStorage for IcebergStorage {
     ) -> Result<Vec<SegmentInfo>, StorageError> {
         let prefix = format!("{}/{}/data/", self.base_path, topic);
 
-        let response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+        let client = &self.client;
+        let bucket = &self.bucket;
+        let response = (|| async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&prefix)
+                .send()
+                .await
+        })
+        .retry(self.retry_config.backoff())
+        .when(|e| is_retryable_s3_error(&e.to_string()))
+        .notify(|err, dur| {
+            tracing::warn!(
+                prefix = %prefix,
+                error = %err,
+                retry_in = ?dur,
+                "S3 LIST failed, retrying"
+            );
+        })
+        .await
+        .map_err(|e| StorageError::S3(e.to_string()))?;
 
         let mut segments = Vec::new();
 
