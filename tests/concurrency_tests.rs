@@ -343,7 +343,7 @@ fn concurrent_consumer_offset_commits() {
 
     // Should be a multiple of 100 between 100 and 1000
     assert!(
-        final_offset >= 100 && final_offset <= 1000 && final_offset % 100 == 0,
+        (100..=1000).contains(&final_offset) && final_offset.is_multiple_of(100),
         "Final offset {} is not valid",
         final_offset
     );

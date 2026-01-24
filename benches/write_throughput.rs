@@ -180,7 +180,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
     c.bench_function("mixed_80_write_20_read", |b| {
         b.iter(|| {
             counter += 1;
-            if counter % 5 == 0 {
+            if counter.is_multiple_of(5) {
                 // 20% reads
                 storage.read("bench-topic", 0, black_box(0), 10).unwrap();
             } else {

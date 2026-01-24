@@ -693,7 +693,7 @@ mod tests {
             idempotency_key: Some("unique-key-12345".into()),
         };
 
-        let (bytes, _) = write_parquet_to_bytes(&[event.clone()]).unwrap();
+        let (bytes, _) = write_parquet_to_bytes(std::slice::from_ref(&event)).unwrap();
         let read_events = read_parquet_events(&bytes).unwrap();
 
         assert_eq!(read_events.len(), 1);
@@ -732,7 +732,7 @@ mod tests {
 
         // Each partition should have ~12-13 events
         for count in partition_counts {
-            assert!(count >= 12 && count <= 13);
+            assert!((12..=13).contains(&count));
         }
     }
 }

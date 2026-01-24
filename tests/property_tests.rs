@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 use zombi::contracts::{HotStorage, SequenceGenerator, StoredEvent};
 
-/// Test harness for running property tests against any HotStorage implementation.
-/// This module defines the tests; implementations plug in via the `test_storage` function.
+// Test harness for running property tests against any HotStorage implementation.
+// This module defines the tests; implementations plug in via the `test_storage` function.
 
 // =============================================================================
 // INV-1: Sequences are monotonic
