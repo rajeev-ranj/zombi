@@ -141,10 +141,77 @@ jobs:
         uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-deny
-          version: "0.14"
+          version: "0.18"
 
       - name: Check dependencies
         run: cargo deny check
+
+  # Code quality checks - catches common issues before review
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for .unwrap() in library code
+        run: |
+          echo "Checking for .unwrap() violations in src/ (excluding tests and constants)..."
+
+          # Find unwrap() calls that aren't in test modules, const declarations, or allowed patterns
+          if grep -rn '\.unwrap()' src/ --include="*.rs" | \
+             grep -v '#\[cfg(test)\]' | \
+             grep -v '#\[test\]' | \
+             grep -v 'mod tests' | \
+             grep -v 'const.*unwrap()' | \
+             grep -v 'unwrap_or' | \
+             grep -v '// SAFETY:' | \
+             grep -v '// OK:'; then
+            echo ""
+            echo "❌ Found .unwrap() in library code!"
+            echo ""
+            echo "CLAUDE.md requires: No unwrap() or expect() in library code"
+            echo "Use '?' operator or explicit error handling instead."
+            echo ""
+            echo "If this is intentional (e.g., const initialization), add a comment:"
+            echo "  // SAFETY: This unwrap is safe because..."
+            echo "  // OK: Infallible operation"
+            exit 1
+          fi
+          echo "✅ No .unwrap() violations found"
+
+      - name: Check for code duplication patterns
+        run: |
+          echo "Checking for common code duplication..."
+
+          # Check for duplicate constant definitions
+          EPOCH_DEFS=$(grep -rn "from_ymd_opt(1970, 1, 1)" src/ --include="*.rs" | wc -l)
+          if [ "$EPOCH_DEFS" -gt 1 ]; then
+            echo "❌ Found multiple Unix epoch date definitions:"
+            grep -rn "from_ymd_opt(1970, 1, 1)" src/ --include="*.rs"
+            echo ""
+            echo "Use the existing UNIX_EPOCH_DATE constant from parquet.rs"
+            exit 1
+          fi
+
+          echo "✅ No obvious code duplication found"
+
+      - name: Check PR description format (PRs only)
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Checking PR description..."
+
+          PR_BODY=$(gh pr view ${{ github.event.pull_request.number }} --json body -q .body)
+
+          # Check for issue reference
+          if ! echo "$PR_BODY" | grep -qiE "(closes|fixes|resolves)\s*#[0-9]+"; then
+            echo "⚠️  Warning: PR description should reference an issue"
+            echo "   Use: 'Closes #N' or 'Fixes #N' to auto-close issues"
+          fi
+
+          echo "✅ PR description check complete"
 
   # Benchmark regression check - opt-in via label or keyword
   # To trigger: add 'performance' label OR include '[benchmark]' in PR title/body
@@ -241,7 +308,7 @@ jobs:
     name: Docker Build
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, test, docs-check, security]
+    needs: [lint, test, docs-check, security, code-quality]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -284,7 +351,7 @@ jobs:
     name: Integration Test (PR)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [lint, test, docs-check, security]
+    needs: [lint, test, docs-check, security, code-quality]
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
