@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
 use zombi::contracts::Flusher;
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
-use zombi::storage::{ColdStorageBackend, IcebergStorage, RocksDbStorage, S3Storage};
+use zombi::storage::{ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage, S3Storage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -22,6 +22,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = std::env::var("ZOMBI_DATA_DIR").unwrap_or_else(|_| "./data".into());
     let storage = Arc::new(RocksDbStorage::open(&data_dir)?);
     tracing::info!("Opened RocksDB at {}", data_dir);
+
+    // Log S3 retry configuration
+    let retry_config = RetryConfig::from_env();
+    tracing::info!(
+        max_retries = retry_config.max_retries,
+        initial_delay_ms = retry_config.initial_delay_ms,
+        max_delay_ms = retry_config.max_delay_ms,
+        "S3 retry configured"
+    );
 
     // Initialize cold storage (S3 or Iceberg) if configured
     let s3_bucket = std::env::var("ZOMBI_S3_BUCKET").ok();

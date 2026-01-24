@@ -319,6 +319,9 @@ Redis stores:
 | `ZOMBI_S3_ENDPOINT` | AWS | Custom endpoint (MinIO) |
 | `ZOMBI_S3_REGION` | `us-east-1` | AWS region |
 | `ZOMBI_STORAGE_PATH` | `tables` | Base path in bucket |
+| `ZOMBI_S3_MAX_RETRIES` | `5` | Maximum S3 retry attempts |
+| `ZOMBI_S3_RETRY_INITIAL_MS` | `100` | Initial backoff delay (ms) |
+| `ZOMBI_S3_RETRY_MAX_MS` | `10000` | Maximum backoff delay (ms) |
 | **Iceberg** |
 | `ZOMBI_ICEBERG_ENABLED` | `true` | Enable Iceberg output |
 | `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size (flush) |

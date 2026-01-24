@@ -5,10 +5,12 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use backon::Retryable;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
 };
+use crate::storage::retry::{is_retryable_s3_error, RetryConfig};
 
 /// S3-backed cold storage implementation.
 pub struct S3Storage {
@@ -16,11 +18,21 @@ pub struct S3Storage {
     bucket: String,
     /// Cache of segment info per topic/partition
     segment_cache: RwLock<HashMap<(String, u32), Vec<SegmentInfo>>>,
+    /// Retry configuration for S3 operations
+    retry_config: RetryConfig,
 }
 
 impl S3Storage {
-    /// Creates a new S3 storage with default AWS configuration.
+    /// Creates a new S3 storage with default AWS configuration and retry settings.
     pub async fn new(bucket: impl Into<String>) -> Result<Self, StorageError> {
+        Self::new_with_retry(bucket, RetryConfig::from_env()).await
+    }
+
+    /// Creates a new S3 storage with custom retry configuration.
+    pub async fn new_with_retry(
+        bucket: impl Into<String>,
+        retry_config: RetryConfig,
+    ) -> Result<Self, StorageError> {
         let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
         let client = Client::new(&config);
 
@@ -28,6 +40,7 @@ impl S3Storage {
             client,
             bucket: bucket.into(),
             segment_cache: RwLock::new(HashMap::new()),
+            retry_config,
         })
     }
 
@@ -36,6 +49,16 @@ impl S3Storage {
         bucket: impl Into<String>,
         endpoint: impl Into<String>,
         region: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        Self::with_endpoint_and_retry(bucket, endpoint, region, RetryConfig::from_env()).await
+    }
+
+    /// Creates a new S3 storage with a custom endpoint and retry configuration.
+    pub async fn with_endpoint_and_retry(
+        bucket: impl Into<String>,
+        endpoint: impl Into<String>,
+        region: impl Into<String>,
+        retry_config: RetryConfig,
     ) -> Result<Self, StorageError> {
         let endpoint = endpoint.into();
         let region = region.into();
@@ -56,6 +79,7 @@ impl S3Storage {
             client,
             bucket: bucket.into(),
             segment_cache: RwLock::new(HashMap::new()),
+            retry_config,
         })
     }
 
@@ -124,15 +148,30 @@ impl ColdStorage for S3Storage {
         let body = Self::serialize_events(events)?;
         let size = body.len() as u64;
 
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(body))
-            .content_type("application/json")
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+        let client = &self.client;
+        let bucket = &self.bucket;
+        (|| async {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(ByteStream::from(body.clone()))
+                .content_type("application/json")
+                .send()
+                .await
+        })
+        .retry(self.retry_config.backoff())
+        .when(|e| is_retryable_s3_error(&e.to_string()))
+        .notify(|err, dur| {
+            tracing::warn!(
+                key = %key,
+                error = %err,
+                retry_in = ?dur,
+                "S3 PUT failed, retrying"
+            );
+        })
+        .await
+        .map_err(|e| StorageError::S3(e.to_string()))?;
 
         // Update cache
         {
@@ -170,15 +209,30 @@ impl ColdStorage for S3Storage {
                 continue; // Skip segments entirely before our offset
             }
 
-            // Read segment
-            let response = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&segment.segment_id)
-                .send()
-                .await
-                .map_err(|e| StorageError::S3(e.to_string()))?;
+            // Read segment with retry
+            let client = &self.client;
+            let bucket = &self.bucket;
+            let segment_key = &segment.segment_id;
+            let response = (|| async {
+                client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(segment_key)
+                    .send()
+                    .await
+            })
+            .retry(self.retry_config.backoff())
+            .when(|e| is_retryable_s3_error(&e.to_string()))
+            .notify(|err, dur| {
+                tracing::warn!(
+                    key = %segment_key,
+                    error = %err,
+                    retry_in = ?dur,
+                    "S3 GET failed, retrying"
+                );
+            })
+            .await
+            .map_err(|e| StorageError::S3(e.to_string()))?;
 
             let bytes = response
                 .body
@@ -209,14 +263,28 @@ impl ColdStorage for S3Storage {
     ) -> Result<Vec<SegmentInfo>, StorageError> {
         let prefix = format!("segments/{}/{}/", topic, partition);
 
-        let response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+        let client = &self.client;
+        let bucket = &self.bucket;
+        let response = (|| async {
+            client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&prefix)
+                .send()
+                .await
+        })
+        .retry(self.retry_config.backoff())
+        .when(|e| is_retryable_s3_error(&e.to_string()))
+        .notify(|err, dur| {
+            tracing::warn!(
+                prefix = %prefix,
+                error = %err,
+                retry_in = ?dur,
+                "S3 LIST failed, retrying"
+            );
+        })
+        .await
+        .map_err(|e| StorageError::S3(e.to_string()))?;
 
         let mut segments = Vec::new();
 
