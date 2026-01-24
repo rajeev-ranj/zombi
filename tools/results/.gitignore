@@ -1,0 +1,3 @@
+# Keep directory but ignore results
+*
+!.gitignore

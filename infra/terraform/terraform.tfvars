@@ -1,0 +1,8 @@
+aws_region      = "ap-southeast-1"
+s3_bucket_name  = "zombi-events-test1"
+instance_type   = "t3.micro"
+key_pair_name   = "zombi-bench-key"
+public_key_path = "~/.ssh/id_ed25519.pub"
+ssh_cidr        = "0.0.0.0/0"
+http_cidr       = "0.0.0.0/0"
+zombi_image     = "ghcr.io/rajeev-ranj/zombi:latest"

@@ -13,15 +13,12 @@ provider "aws" {
 }
 
 resource "aws_s3_bucket" "zombi" {
-  bucket = var.s3_bucket_name
+  bucket        = var.s3_bucket_name
+  force_destroy = true  # Enable instant cleanup on terraform destroy
 }
 
-resource "aws_s3_bucket_versioning" "zombi" {
-  bucket = aws_s3_bucket.zombi.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
+# Note: S3 versioning disabled for test bucket to enable fast cleanup
+# For production, re-enable versioning for data protection
 
 resource "aws_iam_role" "zombi_ec2" {
   name               = "zombi-ec2-role"
@@ -129,4 +126,16 @@ output "instance_public_ip" {
 
 output "s3_bucket" {
   value = aws_s3_bucket.zombi.bucket
+}
+
+output "ssh_command" {
+  value = "ssh -i ~/.ssh/id_ed25519 ubuntu@${aws_instance.zombi.public_ip}"
+}
+
+output "health_url" {
+  value = "http://${aws_instance.zombi.public_ip}:8080/health"
+}
+
+output "stats_url" {
+  value = "http://${aws_instance.zombi.public_ip}:8080/stats"
 }
