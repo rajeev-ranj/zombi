@@ -26,6 +26,12 @@ pub struct FlusherConfig {
     pub target_file_size_bytes: usize,
     /// Enable Iceberg metadata management
     pub iceberg_enabled: bool,
+    /// Minimum number of files accumulated before committing a snapshot.
+    /// Default: 10 files. Set to 1 to snapshot every flush (old behavior).
+    pub snapshot_threshold_files: usize,
+    /// Minimum bytes accumulated before committing a snapshot.
+    /// Default: 1GB. Snapshot commits when this OR threshold_files is exceeded.
+    pub snapshot_threshold_bytes: usize,
 }
 
 impl Default for FlusherConfig {
@@ -36,6 +42,8 @@ impl Default for FlusherConfig {
             max_segment_size: 10000,
             target_file_size_bytes: 128 * 1024 * 1024, // 128MB
             iceberg_enabled: false,
+            snapshot_threshold_files: 10,
+            snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
         }
     }
 }
@@ -47,6 +55,7 @@ impl FlusherConfig {
     /// - Target 64-256MB Parquet files for optimal query performance
     /// - 5-minute flush interval for low-volume tables to accumulate data
     /// - Size-based batching via target_file_size_bytes
+    /// - Batched snapshots: commit only when 10 files or 1GB accumulated
     ///
     /// # Durability
     ///
@@ -60,6 +69,8 @@ impl FlusherConfig {
             max_segment_size: 100000,           // Max events per segment
             target_file_size_bytes: 128 * 1024 * 1024, // 128MB target (Iceberg best practice)
             iceberg_enabled: true,
+            snapshot_threshold_files: 10, // Batch snapshots for reduced metadata churn
+            snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
         }
     }
 }
@@ -205,35 +216,6 @@ where
             .write_segment(topic, partition, &events)
             .await?;
 
-        // Commit Iceberg snapshot if enabled
-        if iceberg_enabled && events_count > 0 {
-            match cold_storage.commit_snapshot(topic).await {
-                Ok(Some(snapshot_id)) => {
-                    tracing::info!(
-                        topic = topic,
-                        partition = partition,
-                        snapshot_id = snapshot_id,
-                        "Committed Iceberg snapshot"
-                    );
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        topic = topic,
-                        partition = partition,
-                        "No Iceberg snapshot to commit (no pending files)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        topic = topic,
-                        partition = partition,
-                        error = %e,
-                        "Failed to commit Iceberg snapshot"
-                    );
-                }
-            }
-        }
-
         tracing::info!(
             topic = topic,
             partition = partition,
@@ -265,6 +247,8 @@ where
         let max_segment_size = self.config.max_segment_size;
         let iceberg_enabled = self.config.iceberg_enabled;
         let target_file_size_bytes = self.config.target_file_size_bytes;
+        let snapshot_threshold_files = self.config.snapshot_threshold_files;
+        let snapshot_threshold_bytes = self.config.snapshot_threshold_bytes;
 
         let handle = tokio::spawn(async move {
             tracing::info!("Flusher background task started");
@@ -289,6 +273,9 @@ where
                         continue;
                     }
                 };
+
+                // Collect unique topics for snapshot commit
+                let mut flushed_topics = std::collections::HashSet::new();
 
                 // Flush each topic/partition
                 for (topic, partition) in topics_to_flush {
@@ -319,6 +306,7 @@ where
                                 if let Ok(mut w) = watermarks.write() {
                                     w.insert((topic.clone(), partition), new_watermark);
                                 }
+                                flushed_topics.insert(topic.clone());
                             }
                         }
                         Err(e) => {
@@ -327,6 +315,62 @@ where
                                 partition = partition,
                                 error = %e,
                                 "Failed to flush partition"
+                            );
+                        }
+                    }
+                }
+
+                // Check and commit snapshots for topics that were flushed
+                if iceberg_enabled {
+                    for topic in flushed_topics {
+                        let stats = cold_storage.pending_snapshot_stats(&topic);
+
+                        // Check if we've exceeded either threshold
+                        let should_commit = stats.file_count >= snapshot_threshold_files
+                            || stats.total_bytes >= snapshot_threshold_bytes as u64;
+
+                        if should_commit {
+                            tracing::debug!(
+                                topic = %topic,
+                                pending_files = stats.file_count,
+                                pending_bytes = stats.total_bytes,
+                                threshold_files = snapshot_threshold_files,
+                                threshold_bytes = snapshot_threshold_bytes,
+                                "Snapshot threshold exceeded, committing"
+                            );
+
+                            match cold_storage.commit_snapshot(&topic).await {
+                                Ok(Some(snapshot_id)) => {
+                                    tracing::info!(
+                                        topic = %topic,
+                                        snapshot_id = snapshot_id,
+                                        files = stats.file_count,
+                                        bytes = stats.total_bytes,
+                                        "Committed Iceberg snapshot (batched)"
+                                    );
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        topic = %topic,
+                                        "No Iceberg snapshot to commit (no pending files)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        topic = %topic,
+                                        error = %e,
+                                        "Failed to commit Iceberg snapshot"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                topic = %topic,
+                                pending_files = stats.file_count,
+                                pending_bytes = stats.total_bytes,
+                                threshold_files = snapshot_threshold_files,
+                                threshold_bytes = snapshot_threshold_bytes,
+                                "Deferring snapshot commit (thresholds not met)"
                             );
                         }
                     }
@@ -366,6 +410,7 @@ where
         let mut total_events = 0;
         let mut total_segments = 0;
         let mut max_watermark = 0u64;
+        let mut flushed_topics = std::collections::HashSet::new();
 
         for (topic, partition) in topics_to_flush {
             let current_watermark = self
@@ -391,6 +436,7 @@ where
             if count > 0 {
                 total_events += count;
                 total_segments += 1;
+                flushed_topics.insert(topic.clone());
 
                 self.watermarks
                     .write()
@@ -399,6 +445,34 @@ where
 
                 if new_watermark > max_watermark {
                     max_watermark = new_watermark;
+                }
+            }
+        }
+
+        // Force commit all pending snapshots on flush_now (typically used for shutdown)
+        if self.config.iceberg_enabled {
+            for topic in flushed_topics {
+                let stats = self.cold_storage.pending_snapshot_stats(&topic);
+                if stats.file_count > 0 {
+                    match self.cold_storage.commit_snapshot(&topic).await {
+                        Ok(Some(snapshot_id)) => {
+                            tracing::info!(
+                                topic = %topic,
+                                snapshot_id = snapshot_id,
+                                files = stats.file_count,
+                                bytes = stats.total_bytes,
+                                "Force-committed Iceberg snapshot on flush_now"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                topic = %topic,
+                                error = %e,
+                                "Failed to commit Iceberg snapshot on flush_now"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -433,6 +507,8 @@ mod tests {
         assert_eq!(config.max_segment_size, 10000);
         assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
         assert!(!config.iceberg_enabled);
+        assert_eq!(config.snapshot_threshold_files, 10);
+        assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
     }
 
     #[test]
@@ -443,6 +519,8 @@ mod tests {
         assert_eq!(config.max_segment_size, 100000);
         assert_eq!(config.target_file_size_bytes, 128 * 1024 * 1024);
         assert!(config.iceberg_enabled);
+        assert_eq!(config.snapshot_threshold_files, 10);
+        assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
     }
 
     #[derive(Default)]

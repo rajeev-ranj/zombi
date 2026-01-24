@@ -7,7 +7,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
+    ColdStorage, ColdStorageInfo, LockResultExt, PendingSnapshotStats, SegmentInfo, StorageError,
+    StoredEvent,
 };
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
@@ -456,6 +457,24 @@ impl ColdStorage for IcebergStorage {
 
     async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
         self.commit_snapshot(topic).await
+    }
+
+    fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
+        let pending = match self.pending_data_files.read() {
+            Ok(p) => p,
+            Err(_) => return PendingSnapshotStats::default(),
+        };
+
+        if let Some(files) = pending.get(topic) {
+            let file_count = files.len();
+            let total_bytes: u64 = files.iter().map(|(_, m)| m.file_size_bytes).sum();
+            PendingSnapshotStats {
+                file_count,
+                total_bytes,
+            }
+        } else {
+            PendingSnapshotStats::default()
+        }
     }
 }
 
