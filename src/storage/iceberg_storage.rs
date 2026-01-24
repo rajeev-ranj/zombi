@@ -5,15 +5,14 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use chrono::NaiveDate;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
 };
 use crate::storage::{
-    data_file_name, derive_partition_columns, manifest_list_file_name, metadata_file_name,
-    write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata, SnapshotOperation,
-    TableMetadata,
+    data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
+    metadata_file_name, write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata,
+    SnapshotOperation, TableMetadata,
 };
 
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
@@ -109,8 +108,22 @@ impl IcebergStorage {
     }
 
     /// Returns the S3 key for a data file with time-based partitioning.
-    fn data_file_key(&self, topic: &str, partition: u32, filename: &str, event_date: i32, event_hour: i32) -> String {
-        make_data_file_key(&self.base_path, topic, partition, filename, event_date, event_hour)
+    fn data_file_key(
+        &self,
+        topic: &str,
+        partition: u32,
+        filename: &str,
+        event_date: i32,
+        event_hour: i32,
+    ) -> String {
+        make_data_file_key(
+            &self.base_path,
+            topic,
+            partition,
+            filename,
+            event_date,
+            event_hour,
+        )
     }
 
     /// Returns the S3 key for metadata files.
@@ -303,7 +316,7 @@ impl ColdStorage for IcebergStorage {
         limit: usize,
         since_ms: Option<i64>,
         until_ms: Option<i64>,
-) -> Result<Vec<StoredEvent>, StorageError> {
+    ) -> Result<Vec<StoredEvent>, StorageError> {
         // Log warning if time range not provided (less efficient)
         if since_ms.is_none() || until_ms.is_none() {
             tracing::warn!(
@@ -520,14 +533,6 @@ fn read_parquet_events(bytes: &[u8]) -> Result<Vec<StoredEvent>, StorageError> {
     Ok(events)
 }
 
-/// Helper function to format Date32 (days since epoch) to YYYY-MM-DD string.
-fn format_partition_date(event_date: i32) -> String {
-    let date = NaiveDate::from_ymd_opt(1970, 1, 1)
-        .unwrap()
-        + chrono::Duration::days(event_date as i64);
-    date.format("%Y-%m-%d").to_string()
-}
-
 /// Helper function to generate data file key with time-based partitioning (for testing).
 fn make_data_file_key(
     base_path: &str,
@@ -556,7 +561,10 @@ mod tests {
     #[test]
     fn test_data_file_key() {
         let key = make_data_file_key("tables", "events", 0, "abc123.parquet", 19737, 14);
-        assert_eq!(key, "tables/events/data/event_date=2024-01-15/event_hour=14/partition=0/abc123.parquet");
+        assert_eq!(
+            key,
+            "tables/events/data/event_date=2024-01-15/event_hour=14/partition=0/abc123.parquet"
+        );
     }
 
     #[test]

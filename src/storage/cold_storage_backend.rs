@@ -51,8 +51,14 @@ impl ColdStorage for ColdStorageBackend {
         until_ms: Option<i64>,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         match self {
-            Self::S3(s) => s.read_events(topic, partition, start_offset, limit, since_ms, until_ms).await,
-            Self::Iceberg(s) => s.read_events(topic, partition, start_offset, limit, since_ms, until_ms).await,
+            Self::S3(s) => {
+                s.read_events(topic, partition, start_offset, limit, since_ms, until_ms)
+                    .await
+            }
+            Self::Iceberg(s) => {
+                s.read_events(topic, partition, start_offset, limit, since_ms, until_ms)
+                    .await
+            }
         }
     }
 
