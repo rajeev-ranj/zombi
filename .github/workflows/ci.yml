@@ -35,6 +35,9 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write  # Required for sccache to write to GitHub Actions cache
     steps:
       - uses: actions/checkout@v4
 
