@@ -11,6 +11,7 @@ from .mixed import MixedWorkloadScenario
 from .backpressure import BackpressureScenario
 from .cold_storage import ColdStorageScenario
 from .consistency import ConsistencyScenario
+from .iceberg_read import IcebergReadScenario
 
 __all__ = [
     "BaseScenario",
@@ -22,4 +23,5 @@ __all__ = [
     "BackpressureScenario",
     "ColdStorageScenario",
     "ConsistencyScenario",
+    "IcebergReadScenario",
 ]

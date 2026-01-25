@@ -1,0 +1,173 @@
+# zombi-load.yaml.example
+# ========================
+# Configuration file for zombi-load CLI
+#
+# Copy this file to zombi-load.yaml and customize for your environment.
+# Configuration can be overridden via environment variables (ZOMBI_*)
+# and command-line arguments.
+#
+# Example usage:
+#   cp zombi-load.yaml.example zombi-load.yaml
+#   python tools/zombi_load.py run --profile quick
+
+# ============================================================================
+# Target Server Configuration
+# ============================================================================
+target:
+  # Zombi server URL
+  # Override: --url or ZOMBI_URL environment variable
+  url: http://localhost:8080
+
+  # Timeout in seconds for health check
+  health_timeout: 30
+
+# ============================================================================
+# Cold Storage (S3/Iceberg) Configuration
+# ============================================================================
+cold_storage:
+  # Enable cold storage testing (requires S3 bucket)
+  enabled: false
+
+  # S3 bucket for Iceberg/Parquet files
+  # Override: ZOMBI_S3_BUCKET environment variable
+  s3_bucket: zombi-events
+
+  # S3 endpoint (for MinIO or other S3-compatible storage)
+  # Override: ZOMBI_S3_ENDPOINT environment variable
+  # Leave empty for AWS S3
+  s3_endpoint: http://localhost:9000
+
+  # AWS region
+  # Override: ZOMBI_S3_REGION environment variable
+  s3_region: us-east-1
+
+# ============================================================================
+# Test Settings
+# ============================================================================
+settings:
+  # Event encoding format: "proto" (recommended) or "json"
+  # Override: --encoding
+  # Override: ZOMBI_ENCODING environment variable
+  encoding: proto
+
+  # Warmup period before measurements (seconds)
+  warmup_secs: 5
+
+  # Default test duration (seconds)
+  # Override: --duration
+  default_duration: 60
+
+  # Default payload size in bytes
+  payload_size: 100
+
+  # Default number of concurrent workers
+  # Override: --workers
+  num_workers: 10
+
+# ============================================================================
+# Test Profiles
+# ============================================================================
+# Profiles define a set of scenarios to run together.
+# Default profiles are provided; customize here to add your own.
+#
+# Available scenarios:
+#   - single-write    : Single event write throughput
+#   - bulk-write      : Bulk API write throughput
+#   - read-throughput : Read throughput from hot storage
+#   - write-read-lag  : Write to read visibility latency
+#   - mixed-workload  : Concurrent read/write workload
+#   - backpressure    : Overload testing with 503 verification
+#   - cold-storage    : Cold storage flush verification [S3]
+#   - peak-single     : Peak single-event throughput (requires hey)
+#   - peak-bulk       : Peak bulk-event throughput (requires hey)
+#   - iceberg-read    : Cold storage read performance [S3]
+#   - consistency     : Data consistency invariant verification
+#
+# [S3] = Requires cold_storage.enabled: true
+
+profiles:
+  # Quick sanity check (~3 minutes)
+  # Good for CI/CD smoke tests
+  quick:
+    scenarios:
+      - single-write
+      - read-throughput
+      - consistency
+    duration_multiplier: 0.5  # 30 seconds per scenario
+
+  # Full test suite (~30 minutes)
+  # Comprehensive testing for release validation
+  full:
+    scenarios:
+      - single-write
+      - bulk-write
+      - read-throughput
+      - write-read-lag
+      - mixed-workload
+      - backpressure
+      - cold-storage      # Skipped if S3 not configured
+      - consistency
+    duration_multiplier: 1.0  # 60 seconds per scenario
+
+  # Stress testing (~2 hours)
+  # Extended duration for stability testing
+  stress:
+    scenarios:
+      - single-write
+      - mixed-workload
+      - backpressure
+      - consistency
+    duration_multiplier: 4.0  # 4 minutes per scenario
+
+  # Peak performance testing (~10 minutes)
+  # Requires hey or wrk installed
+  peak:
+    scenarios:
+      - peak-single
+      - peak-bulk
+    duration_multiplier: 0.5
+    # Concurrency levels to test
+    concurrency_levels: [50, 100, 200, 500]
+
+  # Iceberg/cold storage testing (~5 minutes)
+  # Requires S3 configuration
+  iceberg:
+    scenarios:
+      - cold-storage
+      - iceberg-read
+    duration_multiplier: 1.0
+
+  # Example: Custom profile for your environment
+  # my-custom-profile:
+  #   scenarios:
+  #     - single-write
+  #     - read-throughput
+  #   duration_multiplier: 2.0
+  #   workers_override: 50  # Override default workers for this profile
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+output:
+  # Directory for result files
+  # Override: --output-dir
+  # Override: ZOMBI_OUTPUT_DIR environment variable
+  directory: ./results
+
+  # Output format: "json", "markdown", or "both"
+  format: json
+
+# ============================================================================
+# Environment Variable Reference
+# ============================================================================
+# The following environment variables can override config values:
+#
+#   ZOMBI_URL          - Server URL
+#   ZOMBI_S3_BUCKET    - S3 bucket name (enables cold_storage)
+#   ZOMBI_S3_ENDPOINT  - S3 endpoint URL
+#   ZOMBI_S3_REGION    - AWS region
+#   ZOMBI_ENCODING     - Event encoding (proto/json)
+#   ZOMBI_OUTPUT_DIR   - Results output directory
+#
+# Example:
+#   ZOMBI_URL=http://ec2:8080 ZOMBI_S3_BUCKET=my-bucket python tools/zombi_load.py run --profile full

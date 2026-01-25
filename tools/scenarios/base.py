@@ -61,6 +61,16 @@ class ScenarioConfig:
             raise ValueError(f"Invalid encoding: {self.encoding}")
         self.url = self.url.rstrip("/")
 
+    @property
+    def duration(self) -> int:
+        """Alias for duration_secs for consistency with CLI."""
+        return self.duration_secs
+
+    @duration.setter
+    def duration(self, value: int):
+        """Set duration via alias."""
+        self.duration_secs = value
+
 
 @dataclass
 class TimelineEntry:
