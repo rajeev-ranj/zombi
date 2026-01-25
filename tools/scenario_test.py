@@ -2,6 +2,18 @@
 """
 Zombi Scenario Test Tool
 
+DEPRECATED: This tool is deprecated in favor of zombi_load.py.
+Use the unified CLI instead:
+
+    python tools/zombi_load.py run --profile quick
+    python tools/zombi_load.py run --profile full
+    python tools/zombi_load.py run --scenario multi-producer
+    python tools/zombi_load.py run --scenario consistency
+
+This file is kept for backwards compatibility.
+
+---
+
 Comprehensive load testing with realistic scenarios for Zombi.
 
 Usage:
@@ -299,11 +311,19 @@ def print_suite_summary(suite_result: SuiteResult):
     print("=" * 70)
 
 
-def save_results(suite_result: SuiteResult, output_dir: str = "results"):
+def save_results(suite_result: SuiteResult, output_path: Optional[str] = None, output_dir: str = "results"):
     """Save results to JSON file."""
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{output_dir}/scenario_results_{timestamp}.json"
+    if output_path:
+        # Use specified output path directly
+        filename = output_path
+        # Create parent directory if needed
+        parent_dir = os.path.dirname(filename)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{output_dir}/scenario_results_{timestamp}.json"
 
     with open(filename, "w") as f:
         json.dump(suite_result.to_dict(), f, indent=2)
@@ -482,6 +502,10 @@ def main():
         help="Directory for result files (default: results)",
     )
     parser.add_argument(
+        "--output",
+        help="Output file for JSON results (overrides --output-dir)",
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="Don't save results to file",
@@ -519,7 +543,7 @@ def main():
                     failed=0 if result.success else 1,
                     skipped=0,
                 )
-                save_results(suite_result, args.output_dir)
+                save_results(suite_result, output_path=args.output, output_dir=args.output_dir)
 
             sys.exit(0 if result.success else 1)
         else:
@@ -530,7 +554,7 @@ def main():
         print_suite_summary(suite_result)
 
         if not args.no_save:
-            save_results(suite_result, args.output_dir)
+            save_results(suite_result, output_path=args.output, output_dir=args.output_dir)
 
         sys.exit(0 if suite_result.failed == 0 else 1)
 

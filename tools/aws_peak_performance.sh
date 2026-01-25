@@ -8,29 +8,38 @@
 # 4. Optionally cleaning up infrastructure
 #
 # Usage:
-#   ./aws_peak_performance.sh [CONCURRENCY] [DURATION] [CLEANUP]
+#   ./aws_peak_performance.sh [MODE] [CLEANUP] [CONCURRENCY] [DURATION]
+#
+# Modes:
+#   quick        - Peak single/bulk + read throughput + iceberg verification (~10 min)
+#   comprehensive - All 9 phases: peak, read, lag, encoding, payload, mixed, consistency, iceberg (~40 min)
 #
 # Examples:
-#   ./aws_peak_performance.sh                    # Default: 50,100,200 concurrency, 30s, cleanup
-#   ./aws_peak_performance.sh "50,100" 30 yes   # Quick test
-#   ./aws_peak_performance.sh "50,100,200" 60 no # Keep instance for inspection
+#   ./aws_peak_performance.sh                           # Default: quick mode, cleanup
+#   ./aws_peak_performance.sh quick yes                 # Quick test with cleanup
+#   ./aws_peak_performance.sh comprehensive no          # Full test, keep instance for inspection
+#   ./aws_peak_performance.sh quick yes "50,100" 30     # Quick with custom concurrency/duration
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_DIR="$SCRIPT_DIR/../infra/terraform"
-CONCURRENCY="${1:-50,100,200}"
-DURATION="${2:-30}"
-CLEANUP="${3:-yes}"
+MODE="${1:-quick}"
+CLEANUP="${2:-yes}"
+CONCURRENCY="${3:-50,100,200}"
+DURATION="${4:-30}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="$SCRIPT_DIR/results/aws_peak_$TIMESTAMP"
+RESULTS_DIR="$SCRIPT_DIR/results/aws_${MODE}_$TIMESTAMP"
 
 echo "=========================================="
-echo "Zombi AWS Peak Performance Test"
+echo "Zombi AWS Performance Test"
 echo "=========================================="
+echo "Mode: $MODE"
 echo "Instance type: t3.micro (2 vCPU, 1GB RAM)"
-echo "Concurrency levels: $CONCURRENCY"
-echo "Duration: ${DURATION}s per level"
+if [ "$MODE" = "quick" ]; then
+    echo "Concurrency levels: $CONCURRENCY"
+    echo "Duration: ${DURATION}s per level"
+fi
 echo "Cleanup: $CLEANUP"
 echo ""
 
@@ -88,20 +97,31 @@ curl -s "http://$IP:8080/stats" | python3 -m json.tool 2>/dev/null || echo "(sta
 # Run tests ON EC2 (not from local - avoids network latency)
 echo ""
 echo "=========================================="
-echo "Running peak tests FROM EC2 instance..."
+echo "Running $MODE tests FROM EC2 instance..."
 echo "=========================================="
 echo "(All load generation happens on EC2, no local -> EC2 network latency)"
 echo ""
 
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+if [ "$MODE" = "comprehensive" ]; then
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
 set -e
 export ZOMBI_S3_BUCKET="$S3_BUCKET"
-echo "Running tests on EC2..."
+echo "Running COMPREHENSIVE test suite on EC2..."
+echo "This will take approximately 40 minutes."
+echo ""
+/opt/run_comprehensive_test.sh /opt/results
+REMOTE
+else
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+set -e
+export ZOMBI_S3_BUCKET="$S3_BUCKET"
+echo "Running QUICK tests on EC2..."
 echo "Concurrency: $CONCURRENCY"
 echo "Duration: ${DURATION}s per level"
 echo ""
 /opt/run_peak_test.sh "$CONCURRENCY" "$DURATION" /opt/results
 REMOTE
+fi
 
 # Copy results back
 echo ""
@@ -115,43 +135,132 @@ echo "Results Summary"
 echo "=========================================="
 echo ""
 
-echo "--- Single API (POST /tables/{table}) ---"
-if [ -f "$RESULTS_DIR/peak_single.json" ]; then
+if [ "$MODE" = "comprehensive" ] && [ -f "$RESULTS_DIR/comprehensive_results.json" ]; then
+    # Display comprehensive results
     python3 -c "
+import json
+with open('$RESULTS_DIR/comprehensive_results.json') as f:
+    d = json.load(f)
+
+# Print stored summary text if available
+for line in d.get('summary_text', []):
+    print(line)
+
+print()
+print('DETAILED RESULTS')
+print('=' * 50)
+
+# Peak single
+if 'peak_single' in d.get('phases', {}):
+    ps = d['phases']['peak_single']
+    print(f'Peak Write: {ps.get(\"peak_throughput\", 0):,.0f} req/s, {ps.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
+    print(f'  Optimal concurrency: {ps.get(\"optimal_concurrency\", \"N/A\")}')
+    for r in ps.get('results', []):
+        cpu = r.get('peak_cpu_percent', 0)
+        cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+        print(f'    c={r.get(\"concurrency\", 0):>3}: {r.get(\"requests_per_sec\", 0):>8,.0f} req/s, {r.get(\"mb_per_sec\", 0):>6.1f} MB/s, P99: {r.get(\"p99_ms\", 0):>6.1f}ms, CPU: {cpu_str}')
+    print()
+
+# Peak bulk
+if 'peak_bulk' in d.get('phases', {}):
+    pb = d['phases']['peak_bulk']
+    print(f'Peak Bulk: {pb.get(\"peak_events_per_sec\", 0):,.0f} events/s, {pb.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
+    print(f'  Batch size: {pb.get(\"batch_size\", \"N/A\")}')
+    for r in pb.get('results', []):
+        cpu = r.get('peak_cpu_percent', 0)
+        cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+        print(f'    c={r.get(\"concurrency\", 0):>3}: {r.get(\"events_per_sec\", 0):>10,.0f} ev/s, {r.get(\"mb_per_sec\", 0):>6.1f} MB/s, P99: {r.get(\"p99_ms\", 0):>6.1f}ms, CPU: {cpu_str}')
+    print()
+
+# Read throughput
+if 'read_throughput' in d.get('phases', {}):
+    rt = d['phases']['read_throughput'].get('results', {}).get('read_throughput', {})
+    print(f'Read Throughput: {rt.get(\"records_per_sec\", 0):,.0f} records/s')
+    print(f'  P50: {rt.get(\"p50_ms\", 0):.1f}ms, P95: {rt.get(\"p95_ms\", 0):.1f}ms')
+    print()
+
+# Write-read lag
+if 'write_read_lag' in d.get('phases', {}):
+    wrl = d['phases']['write_read_lag'].get('results', {}).get('write_read_lag', {})
+    print(f'Write-Read Lag: P50={wrl.get(\"p50_ms\", 0):.1f}ms, P95={wrl.get(\"p95_ms\", 0):.1f}ms, P99={wrl.get(\"p99_ms\", 0):.1f}ms')
+    print(f'  Max: {wrl.get(\"max_ms\", 0):.1f}ms')
+    print()
+
+# Proto vs JSON
+if 'proto_vs_json' in d.get('phases', {}):
+    pvj = d['phases']['proto_vs_json'].get('results', {}).get('proto_vs_json', {})
+    improvement = pvj.get('improvement_pct', 0)
+    json_tp = pvj.get('json', {}).get('throughput', 0)
+    proto_tp = pvj.get('proto', {}).get('throughput', 0)
+    print(f'Proto vs JSON: +{improvement:.1f}% improvement')
+    print(f'  JSON: {json_tp:,.0f} ev/s, Proto: {proto_tp:,.0f} ev/s')
+    print()
+
+# Payload sizes
+if 'payload_sizes' in d.get('phases', {}):
+    ps = d['phases']['payload_sizes'].get('results', {}).get('payload_sizes', {})
+    print('Payload Size Impact:')
+    for size, data in sorted(ps.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0):
+        tp = data.get('throughput', 0)
+        mbps = data.get('mbps', 0)
+        print(f'  {size}B: {tp:,.0f} ev/s, {mbps:.1f} Mbps')
+    print()
+
+# Iceberg
+if 'iceberg' in d.get('phases', {}):
+    ice = d['phases']['iceberg']
+    pq = ice.get('parquet_files', 0)
+    tb = ice.get('total_bytes', 0)
+    mb = tb / (1024 * 1024) if isinstance(tb, (int, float)) else 0
+    print(f'Iceberg: {pq} parquet files, {mb:.1f} MB total')
+    print(f'  Bucket: {ice.get(\"bucket\", \"N/A\")}')
+" 2>/dev/null || echo "  (comprehensive results not found)"
+
+else
+    # Display quick test results
+    echo "--- Single API (POST /tables/{table}) ---"
+    if [ -f "$RESULTS_DIR/peak_single.json" ]; then
+        python3 -c "
 import json
 with open('$RESULTS_DIR/peak_single.json') as f:
     d = json.load(f)
 print(f'  Peak throughput: {d.get(\"peak_throughput\", 0):,.0f} req/s')
+print(f'  Peak bandwidth: {d.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
 print(f'  Optimal concurrency: {d.get(\"optimal_concurrency\", \"N/A\")}')
 for r in d.get('results', []):
-    print(f'    c={r[\"concurrency\"]:>3}: {r[\"requests_per_sec\"]:>8,.0f} req/s, P99: {r[\"p99_ms\"]:.1f}ms')
+    cpu = r.get('peak_cpu_percent', 0)
+    cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+    print(f'    c={r[\"concurrency\"]:>3}: {r[\"requests_per_sec\"]:>8,.0f} req/s, {r.get(\"mb_per_sec\", 0):>6.1f} MB/s, P99: {r[\"p99_ms\"]:.1f}ms, CPU: {cpu_str}')
 " 2>/dev/null || echo "  (results file not found)"
-else
-    echo "  (results file not found)"
-fi
+    else
+        echo "  (results file not found)"
+    fi
 
-echo ""
-echo "--- Bulk API (POST /tables/{table}/bulk) ---"
-if [ -f "$RESULTS_DIR/peak_bulk.json" ]; then
-    python3 -c "
+    echo ""
+    echo "--- Bulk API (POST /tables/{table}/bulk) ---"
+    if [ -f "$RESULTS_DIR/peak_bulk.json" ]; then
+        python3 -c "
 import json
 with open('$RESULTS_DIR/peak_bulk.json') as f:
     d = json.load(f)
 print(f'  Peak throughput: {d.get(\"peak_throughput\", 0):,.0f} req/s')
 print(f'  Peak events/s: {d.get(\"peak_events_per_sec\", 0):,.0f}')
+print(f'  Peak bandwidth: {d.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
 print(f'  Batch size: {d.get(\"batch_size\", \"N/A\")} records/request')
 print(f'  Optimal concurrency: {d.get(\"optimal_concurrency\", \"N/A\")}')
 for r in d.get('results', []):
-    print(f'    c={r[\"concurrency\"]:>3}: {r[\"requests_per_sec\"]:>8,.0f} req/s, {r[\"events_per_sec\"]:>10,.0f} ev/s, P99: {r[\"p99_ms\"]:.1f}ms')
+    cpu = r.get('peak_cpu_percent', 0)
+    cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+    print(f'    c={r[\"concurrency\"]:>3}: {r[\"requests_per_sec\"]:>8,.0f} req/s, {r[\"events_per_sec\"]:>10,.0f} ev/s, {r.get(\"mb_per_sec\", 0):>6.1f} MB/s, P99: {r[\"p99_ms\"]:.1f}ms, CPU: {cpu_str}')
 " 2>/dev/null || echo "  (results file not found)"
-else
-    echo "  (results file not found)"
-fi
+    else
+        echo "  (results file not found)"
+    fi
 
-echo ""
-echo "--- Iceberg Verification ---"
-if [ -f "$RESULTS_DIR/iceberg_verification.json" ]; then
-    python3 -c "
+    echo ""
+    echo "--- Iceberg Verification ---"
+    if [ -f "$RESULTS_DIR/iceberg_verification.json" ]; then
+        python3 -c "
 import json
 with open('$RESULTS_DIR/iceberg_verification.json') as f:
     d = json.load(f)
@@ -164,8 +273,9 @@ if isinstance(bytes_val, (int, float)) and bytes_val > 0:
 else:
     print(f'  Total size: {bytes_val}')
 " 2>/dev/null || echo "  (verification file not found)"
-else
-    echo "  (verification file not found)"
+    else
+        echo "  (verification file not found)"
+    fi
 fi
 
 echo ""
@@ -177,6 +287,7 @@ with open('$RESULTS_DIR/server_stats.json') as f:
     d = json.load(f)
 writes = d.get('writes', {})
 print(f'  Total writes: {writes.get(\"total\", 0):,}')
+print(f'  Total bytes: {writes.get(\"bytes_total\", 0) / 1024 / 1024:.1f} MB')
 print(f'  Avg write latency: {writes.get(\"avg_latency_us\", 0):.1f} us')
 print(f'  Uptime: {d.get(\"uptime_secs\", 0):.1f}s')
 " 2>/dev/null || echo "  (stats file not found)"

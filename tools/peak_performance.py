@@ -41,6 +41,7 @@ class PerfResult:
     status_codes: Dict[int, int] = field(default_factory=dict)
     avg_cpu_percent: float = 0.0
     peak_cpu_percent: float = 0.0
+    mb_per_sec: float = 0.0
     tool: str = "hey"
 
 
@@ -54,6 +55,7 @@ class PeakPerfReport:
     server_stats_before: Dict
     server_stats_after: Dict
     peak_throughput: float = 0.0
+    peak_mb_per_sec: float = 0.0
     optimal_concurrency: int = 0
 
 
@@ -311,6 +313,9 @@ def run_peak_test(
             print(f"Testing with {concurrency} concurrent connections...")
             print(f"{'='*60}")
 
+        # Get stats before this concurrency level
+        stats_before_test = get_server_stats(url)
+
         # Start CPU monitoring
         cpu_samples: List[float] = []
         stop_event = None
@@ -332,11 +337,20 @@ def run_peak_test(
                 perf_result.avg_cpu_percent = sum(cpu_samples) / len(cpu_samples)
                 perf_result.peak_cpu_percent = max(cpu_samples)
 
+        # Get stats after and calculate MB/s
+        stats_after_test = get_server_stats(url)
+        bytes_before = stats_before_test.get("writes", {}).get("bytes_total", 0)
+        bytes_after = stats_after_test.get("writes", {}).get("bytes_total", 0)
+        bytes_written = bytes_after - bytes_before
+        if perf_result.duration_secs > 0:
+            perf_result.mb_per_sec = (bytes_written / perf_result.duration_secs) / (1024 * 1024)
+
         results.append(perf_result)
 
         if verbose:
             print(f"\nResults (c={concurrency}):")
             print(f"  Throughput: {perf_result.requests_per_sec:,.0f} req/s")
+            print(f"  MB/s: {perf_result.mb_per_sec:.2f}")
             print(f"  Latency P50/P95/P99: {perf_result.p50_ms:.1f}ms / {perf_result.p95_ms:.1f}ms / {perf_result.p99_ms:.1f}ms")
             print(f"  Total requests: {perf_result.total_requests:,}")
             print(f"  Errors: {perf_result.errors}")
@@ -351,6 +365,7 @@ def run_peak_test(
 
     # Find peak throughput
     peak_result = max(results, key=lambda r: r.requests_per_sec)
+    peak_mb_result = max(results, key=lambda r: r.mb_per_sec)
 
     report = PeakPerfReport(
         url=url,
@@ -360,6 +375,7 @@ def run_peak_test(
         server_stats_before=stats_before,
         server_stats_after=stats_after,
         peak_throughput=peak_result.requests_per_sec,
+        peak_mb_per_sec=peak_mb_result.mb_per_sec,
         optimal_concurrency=peak_result.concurrency,
     )
 
@@ -369,25 +385,26 @@ def run_peak_test(
 def print_report(report: PeakPerfReport):
     """Print formatted performance report."""
     print("\n")
-    print("=" * 70)
+    print("=" * 85)
     print("ZOMBI PEAK PERFORMANCE REPORT")
-    print("=" * 70)
+    print("=" * 85)
     print(f"Target: {report.url}")
     print(f"Timestamp: {report.timestamp}")
     print(f"Tool: {report.tool}")
     print()
 
     # Results table
-    print(f"{'Concurrency':>12} {'Throughput':>14} {'P50':>10} {'P95':>10} {'P99':>10} {'CPU':>10}")
-    print("-" * 70)
+    print(f"{'Concurrency':>12} {'Throughput':>14} {'MB/s':>10} {'P50':>10} {'P95':>10} {'P99':>10} {'Peak CPU':>10}")
+    print("-" * 85)
     for r in report.results:
-        cpu_str = f"{r.avg_cpu_percent:.0f}%" if r.avg_cpu_percent else "N/A"
-        print(f"{r.concurrency:>12} {r.requests_per_sec:>13,.0f}/s {r.p50_ms:>9.1f}ms {r.p95_ms:>9.1f}ms {r.p99_ms:>9.1f}ms {cpu_str:>10}")
-    print("-" * 70)
+        cpu_str = f"{r.peak_cpu_percent:.0f}%" if r.peak_cpu_percent else "N/A"
+        print(f"{r.concurrency:>12} {r.requests_per_sec:>13,.0f}/s {r.mb_per_sec:>9.1f} {r.p50_ms:>9.1f}ms {r.p95_ms:>9.1f}ms {r.p99_ms:>9.1f}ms {cpu_str:>10}")
+    print("-" * 85)
 
     print()
-    print(f"🏆 PEAK THROUGHPUT: {report.peak_throughput:,.0f} requests/sec")
-    print(f"   Optimal concurrency: {report.optimal_concurrency}")
+    print(f"PEAK THROUGHPUT: {report.peak_throughput:,.0f} requests/sec")
+    print(f"PEAK BANDWIDTH: {report.peak_mb_per_sec:.2f} MB/s")
+    print(f"Optimal concurrency: {report.optimal_concurrency}")
 
     # Server stats comparison
     if report.server_stats_before and report.server_stats_after:
@@ -410,11 +427,13 @@ def save_report(report: PeakPerfReport, output_path: str):
         "timestamp": report.timestamp,
         "tool": report.tool,
         "peak_throughput": report.peak_throughput,
+        "peak_mb_per_sec": report.peak_mb_per_sec,
         "optimal_concurrency": report.optimal_concurrency,
         "results": [
             {
                 "concurrency": r.concurrency,
                 "requests_per_sec": r.requests_per_sec,
+                "mb_per_sec": r.mb_per_sec,
                 "total_requests": r.total_requests,
                 "p50_ms": r.p50_ms,
                 "p95_ms": r.p95_ms,

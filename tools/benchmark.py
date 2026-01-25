@@ -2,6 +2,18 @@
 """
 Zombi Comprehensive Benchmark Tool
 
+DEPRECATED: This tool is deprecated in favor of zombi_load.py.
+Use the unified CLI instead:
+
+    python tools/zombi_load.py run --profile quick
+    python tools/zombi_load.py run --profile full
+    python tools/zombi_load.py run --scenario single-write
+
+This file is kept for backwards compatibility and as a library for
+Stats, create_session, and encoding utilities used by other tools.
+
+---
+
 A unified benchmark suite for testing Zombi performance across multiple dimensions:
 - Encoding: Proto vs JSON
 - Operations: Writes, Reads, Roundtrip
@@ -594,7 +606,7 @@ class BenchmarkSuite:
 
         return self.results
 
-    def print_report(self):
+    def print_report(self, output_path: str = "benchmark_results.json"):
         """Print formatted benchmark report."""
         print("\n")
         print("=" * 60)
@@ -617,10 +629,10 @@ class BenchmarkSuite:
             print(f"  Errors: {stats.get('errors_total', 0)}")
 
         print("\n" + "=" * 60)
-        print("Results saved to: benchmark_results.json")
+        print(f"Results saved to: {output_path}")
 
         # Save results to file
-        with open("benchmark_results.json", "w") as f:
+        with open(output_path, "w") as f:
             json.dump({
                 "url": self.url,
                 "timestamp": datetime.now().isoformat(),
@@ -645,6 +657,7 @@ def main():
     parser.add_argument("--s3-bucket", help="S3 bucket for Iceberg verification")
     parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds")
     parser.add_argument("--workers", type=int, default=10, help="Number of worker threads")
+    parser.add_argument("--output", help="Output file for JSON results (default: benchmark_results.json)")
 
     args = parser.parse_args()
 
@@ -656,6 +669,8 @@ def main():
 
     print(f"Connected to {args.url}")
 
+    output_path = args.output or "benchmark_results.json"
+
     if args.suite:
         if args.suite == "quick":
             bench.run_quick()
@@ -663,7 +678,7 @@ def main():
             bench.run_full()
         elif args.suite == "stress":
             bench.run_stress()
-        bench.print_report()
+        bench.print_report(output_path)
 
     elif args.test:
         if args.test == "proto-vs-json":
@@ -678,6 +693,8 @@ def main():
             bench.test_payload_sizes(args.duration, args.workers)
         elif args.test == "iceberg":
             bench.test_iceberg_verification()
+        # Save results for individual tests
+        bench.print_report(output_path)
 
     else:
         parser.print_help()

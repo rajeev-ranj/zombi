@@ -43,6 +43,7 @@ class BulkPerfResult:
     status_codes: Dict[int, int] = field(default_factory=dict)
     avg_cpu_percent: float = 0.0
     peak_cpu_percent: float = 0.0
+    mb_per_sec: float = 0.0
     tool: str = "hey"
 
 
@@ -58,6 +59,7 @@ class BulkPeakPerfReport:
     server_stats_after: Dict
     peak_throughput: float = 0.0  # requests/sec
     peak_events_per_sec: float = 0.0  # events/sec
+    peak_mb_per_sec: float = 0.0
     optimal_concurrency: int = 0
 
 
@@ -246,6 +248,9 @@ def run_bulk_peak_test(
             print(f"Batch size: {batch_size} records per request")
             print(f"{'='*60}")
 
+        # Get stats before this concurrency level
+        stats_before_test = get_server_stats(url)
+
         # Start CPU monitoring
         cpu_samples: List[float] = []
         stop_event = None
@@ -264,12 +269,21 @@ def run_bulk_peak_test(
                 perf_result.avg_cpu_percent = sum(cpu_samples) / len(cpu_samples)
                 perf_result.peak_cpu_percent = max(cpu_samples)
 
+        # Get stats after and calculate MB/s
+        stats_after_test = get_server_stats(url)
+        bytes_before = stats_before_test.get("writes", {}).get("bytes_total", 0)
+        bytes_after = stats_after_test.get("writes", {}).get("bytes_total", 0)
+        bytes_written = bytes_after - bytes_before
+        if perf_result.duration_secs > 0:
+            perf_result.mb_per_sec = (bytes_written / perf_result.duration_secs) / (1024 * 1024)
+
         results.append(perf_result)
 
         if verbose:
             print(f"\nResults (c={concurrency}, batch={batch_size}):")
             print(f"  Requests/sec: {perf_result.requests_per_sec:,.0f}")
             print(f"  Events/sec: {perf_result.events_per_sec:,.0f}")
+            print(f"  MB/s: {perf_result.mb_per_sec:.2f}")
             print(f"  Latency P50/P95/P99: {perf_result.p50_ms:.1f}ms / {perf_result.p95_ms:.1f}ms / {perf_result.p99_ms:.1f}ms")
             print(f"  Total requests: {perf_result.total_requests:,}")
             print(f"  Errors: {perf_result.errors}")
@@ -282,6 +296,7 @@ def run_bulk_peak_test(
 
     # Find peak throughput
     peak_result = max(results, key=lambda r: r.events_per_sec)
+    peak_mb_result = max(results, key=lambda r: r.mb_per_sec)
 
     report = BulkPeakPerfReport(
         url=url,
@@ -293,6 +308,7 @@ def run_bulk_peak_test(
         server_stats_after=stats_after,
         peak_throughput=peak_result.requests_per_sec,
         peak_events_per_sec=peak_result.events_per_sec,
+        peak_mb_per_sec=peak_mb_result.mb_per_sec,
         optimal_concurrency=peak_result.concurrency,
     )
 
@@ -302,25 +318,26 @@ def run_bulk_peak_test(
 def print_report(report: BulkPeakPerfReport):
     """Print formatted bulk performance report."""
     print("\n")
-    print("=" * 80)
+    print("=" * 95)
     print("ZOMBI BULK API PEAK PERFORMANCE REPORT")
-    print("=" * 80)
+    print("=" * 95)
     print(f"Target: {report.url}")
     print(f"Timestamp: {report.timestamp}")
     print(f"Tool: {report.tool}")
     print(f"Batch Size: {report.batch_size} records/request")
     print()
 
-    print(f"{'Concurrency':>12} {'Req/s':>12} {'Events/s':>14} {'P50':>10} {'P95':>10} {'P99':>10} {'CPU':>10}")
-    print("-" * 80)
+    print(f"{'Concurrency':>12} {'Req/s':>12} {'Events/s':>14} {'MB/s':>10} {'P50':>10} {'P95':>10} {'P99':>10} {'Peak CPU':>10}")
+    print("-" * 95)
     for r in report.results:
-        cpu_str = f"{r.avg_cpu_percent:.0f}%" if r.avg_cpu_percent else "N/A"
-        print(f"{r.concurrency:>12} {r.requests_per_sec:>11,.0f} {r.events_per_sec:>13,.0f} {r.p50_ms:>9.1f}ms {r.p95_ms:>9.1f}ms {r.p99_ms:>9.1f}ms {cpu_str:>10}")
-    print("-" * 80)
+        cpu_str = f"{r.peak_cpu_percent:.0f}%" if r.peak_cpu_percent else "N/A"
+        print(f"{r.concurrency:>12} {r.requests_per_sec:>11,.0f} {r.events_per_sec:>13,.0f} {r.mb_per_sec:>9.1f} {r.p50_ms:>9.1f}ms {r.p95_ms:>9.1f}ms {r.p99_ms:>9.1f}ms {cpu_str:>10}")
+    print("-" * 95)
 
     print()
     print(f"PEAK THROUGHPUT: {report.peak_throughput:,.0f} requests/sec")
     print(f"PEAK EVENTS: {report.peak_events_per_sec:,.0f} events/sec")
+    print(f"PEAK BANDWIDTH: {report.peak_mb_per_sec:.2f} MB/s")
     print(f"Optimal concurrency: {report.optimal_concurrency}")
 
     if report.server_stats_before and report.server_stats_after:
@@ -345,6 +362,7 @@ def save_report(report: BulkPeakPerfReport, output_path: str):
         "batch_size": report.batch_size,
         "peak_throughput": report.peak_throughput,
         "peak_events_per_sec": report.peak_events_per_sec,
+        "peak_mb_per_sec": report.peak_mb_per_sec,
         "optimal_concurrency": report.optimal_concurrency,
         "results": [
             {
@@ -352,6 +370,7 @@ def save_report(report: BulkPeakPerfReport, output_path: str):
                 "batch_size": r.batch_size,
                 "requests_per_sec": r.requests_per_sec,
                 "events_per_sec": r.events_per_sec,
+                "mb_per_sec": r.mb_per_sec,
                 "total_requests": r.total_requests,
                 "p50_ms": r.p50_ms,
                 "p95_ms": r.p95_ms,
