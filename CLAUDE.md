@@ -160,6 +160,23 @@ cargo test --test integration_tests
 cargo test -- --nocapture
 ```
 
+### Load Testing
+
+For load/performance testing, use the unified `zombi-load` CLI:
+
+```bash
+# Quick sanity check (~3 min)
+python tools/zombi_load.py run --profile quick --url http://localhost:8080
+
+# Full suite (~30 min)
+python tools/zombi_load.py run --profile full
+
+# Specific scenario
+python tools/zombi_load.py run --scenario single-write --workers 50
+```
+
+See `tools/README.md` for profiles, scenarios, and configuration options.
+
 ---
 
 ## Common Tasks

@@ -309,11 +309,33 @@ mc cat local/zombi-events/segments/events/0/0000000000000001-0000000000000005.js
 open http://localhost:9001  # minioadmin/minioadmin
 ```
 
-## Load Testing with Producer Tool
+## Load Testing
 
-A Python producer tool is included for load testing with variable burst patterns.
+### Recommended: zombi-load CLI
 
-### Setup
+Use the unified load testing CLI for comprehensive performance validation:
+
+```bash
+cd tools
+pip install click pyyaml requests
+
+# Quick sanity check
+python zombi_load.py run --profile quick --url http://localhost:8080
+
+# Full test suite
+python zombi_load.py run --profile full
+
+# List available scenarios
+python zombi_load.py list scenarios
+```
+
+See [tools/README.md](tools/README.md) for profiles, scenarios, and configuration.
+
+### Legacy: Producer Tool
+
+A Python producer tool is also available for simple manual testing with variable burst patterns.
+
+#### Setup
 
 ```bash
 cd tools/producer
@@ -325,7 +347,7 @@ pip install -r requirements.txt
 protoc --python_out=. events.proto
 ```
 
-### Usage
+#### Usage
 
 ```bash
 # Bursty traffic (default) - random bursts of 50-200 events

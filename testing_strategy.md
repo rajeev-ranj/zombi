@@ -547,6 +547,30 @@ export default function () {
 
 **Runs:** Nightly, ~2 hours.
 
+### Implementation: zombi-load CLI
+
+The load testing strategy is implemented via the `zombi-load` CLI tool:
+
+```bash
+# Profiles map to testing levels:
+python tools/zombi_load.py run --profile quick      # CI smoke tests
+python tools/zombi_load.py run --profile full       # Release validation
+python tools/zombi_load.py run --profile stress     # Extended stability
+
+# Compare runs for regression detection
+python tools/zombi_load.py compare results/baseline.json results/current.json
+```
+
+**Available Profiles:**
+| Profile | Duration | Use Case |
+|---------|----------|----------|
+| `quick` | ~3 min | CI/CD pipelines |
+| `full` | ~30 min | Release validation |
+| `stress` | ~2 hours | Stability testing |
+| `peak` | ~10 min | Max throughput (requires hey) |
+
+See `tools/README.md` for complete documentation.
+
 ---
 
 ## Level 6: Fuzz Tests
