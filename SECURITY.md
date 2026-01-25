@@ -4,15 +4,18 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
+| 0.1.x   | :x:                |
 
 ## Reporting a Vulnerability
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please report them via email to: [your-email@example.com]
+Instead, please use GitHub's private vulnerability reporting:
 
-You should receive a response within 48 hours. If for some reason you do not, please follow up via email to ensure we received your original message.
+**[Report a vulnerability](https://github.com/rajeev-ranj/zombi/security/advisories/new)**
+
+You should receive a response within 48 hours.
 
 Please include:
 
