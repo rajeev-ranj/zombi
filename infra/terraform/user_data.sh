@@ -443,4 +443,44 @@ echo "Results: $${OUTPUT_DIR}"
 BANDWIDTH
 chmod +x /opt/run_bandwidth_test.sh
 
+# Sustained test script - 10 minute peak test with resource monitoring
+cat > /opt/run_sustained_test.sh << 'SUSTAINED'
+#!/bin/bash
+set -e
+OUTPUT_DIR="$${1:-/opt/results}"
+DURATION="$${2:-600}"
+MODE="$${3:-bulk}"
+
+mkdir -p "$${OUTPUT_DIR}"
+cd /opt/zombi/tools
+
+echo "========================================"
+echo "ZOMBI SUSTAINED PERFORMANCE TEST"
+echo "========================================"
+echo "Duration: $${DURATION}s ($((DURATION / 60)) minutes)"
+echo "Mode: $${MODE}"
+echo "Started: $(date)"
+echo ""
+
+python3 sustained_test.py \
+    --url http://localhost:8080 \
+    --duration "$${DURATION}" \
+    --mode "$${MODE}" \
+    --concurrency 100 \
+    --batch-size 100 \
+    --payload-size 1024 \
+    --output "$${OUTPUT_DIR}/sustained_test.json"
+
+# Collect final server stats
+curl -s http://localhost:8080/stats > "$${OUTPUT_DIR}/final_stats.json"
+
+echo ""
+echo "========================================"
+echo "SUSTAINED TEST COMPLETE"
+echo "========================================"
+echo "Finished: $(date)"
+echo "Results: $${OUTPUT_DIR}"
+SUSTAINED
+chmod +x /opt/run_sustained_test.sh
+
 echo "User-data script completed at $(date)"

@@ -15,6 +15,8 @@
 #   comprehensive - All 9 phases: peak, read, lag, encoding, payload, mixed, consistency, iceberg (~40 min)
 #   bandwidth    - Maximum throughput test with large payloads (~15 min)
 #   bandwidth-sweep - Full bandwidth sweep across configurations (~45 min)
+#   sustained    - 10-minute sustained peak test with resource monitoring (~12 min)
+#   sustained-20 - 20-minute sustained peak test with resource monitoring (~22 min)
 #
 # Instance Types (for bandwidth testing, use larger instances):
 #   t3.micro   - 2 vCPU, 1GB RAM, up to 5 Gbps (default, free tier)
@@ -160,6 +162,26 @@ echo "This will test multiple configurations to find maximum throughput."
 echo "This will take approximately 45 minutes."
 echo ""
 /opt/run_bandwidth_test.sh /opt/results sweep
+REMOTE
+        ;;
+    sustained)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+set -e
+export ZOMBI_S3_BUCKET="$S3_BUCKET"
+echo "Running SUSTAINED PEAK TEST on EC2..."
+echo "10-minute sustained load with resource monitoring."
+echo ""
+/opt/run_sustained_test.sh /opt/results 600 bulk
+REMOTE
+        ;;
+    sustained-20)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+set -e
+export ZOMBI_S3_BUCKET="$S3_BUCKET"
+echo "Running SUSTAINED PEAK TEST on EC2..."
+echo "20-minute sustained load with resource monitoring."
+echo ""
+/opt/run_sustained_test.sh /opt/results 1200 bulk
 REMOTE
         ;;
     *)
@@ -377,6 +399,39 @@ if results:
     else
         echo "  (no bandwidth results found)"
     fi
+fi
+
+# Display sustained test results if available
+if [[ "$MODE" == sustained* ]] && [ -f "$RESULTS_DIR/sustained_test.json" ]; then
+    echo ""
+    echo "--- Sustained Test Results ---"
+    python3 -c "
+import json
+with open('$RESULTS_DIR/sustained_test.json') as f:
+    d = json.load(f)
+
+config = d.get('config', {})
+perf = d.get('performance', {})
+res = d.get('resources', {})
+
+print(f'Duration: {config.get(\"duration_secs\", 0)/60:.1f} minutes')
+print(f'Mode: {config.get(\"mode\", \"N/A\")}')
+print()
+
+print('PERFORMANCE:')
+print(f'  Total events: {perf.get(\"total_events\", 0):,}')
+print(f'  Total data: {perf.get(\"total_bytes\", 0) / 1024 / 1024:.1f} MB')
+print(f'  Avg throughput: {perf.get(\"avg_requests_per_sec\", 0):,.0f} req/s')
+print(f'  Avg events/s: {perf.get(\"avg_events_per_sec\", 0):,.0f}')
+print(f'  Avg bandwidth: {perf.get(\"avg_mb_per_sec\", 0):.1f} MB/s ({perf.get(\"avg_gbps\", 0):.3f} Gbps)')
+print()
+
+print('RESOURCE CONSUMPTION:')
+print(f'  CPU: {res.get(\"avg_cpu_percent\", 0):.1f}% avg, {res.get(\"peak_cpu_percent\", 0):.1f}% peak')
+print(f'  Memory: {res.get(\"avg_memory_mb\", 0):.0f} MB avg, {res.get(\"peak_memory_mb\", 0):.0f} MB peak')
+print(f'  Disk write: {res.get(\"total_disk_write_mb\", 0):.1f} MB total')
+print(f'  Network TX: {res.get(\"total_net_tx_mb\", 0):.1f} MB total')
+" 2>/dev/null || echo "  (results not found)"
 fi
 
 echo ""
