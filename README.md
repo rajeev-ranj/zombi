@@ -1,64 +1,107 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Zombi Logo" width="200">
+</p>
+
 # Zombi
 
-A lightweight Kafka-replacement event streaming system with RocksDB hot storage and S3 cold storage.
+[![Build](https://github.com/rajeev-ranj/zombi/actions/workflows/ci.yml/badge.svg)](https://github.com/rajeev-ranj/zombi/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Documentation Sources
-
-Authoritative docs:
-- `README.md`
-- `SPEC.md`
-- `testing_strategy.md`
-- `docs/openapi.yaml` (API specification)
-
-Historical docs live under `docs/archive/` and may be out of date.
+The lowest-cost path from events to Iceberg, with optional streaming support.
 
 ## Features
 
-- **Simple**: Single binary, no ZooKeeper, no broker cluster
-- **Low latency**: Sub-millisecond writes to RocksDB
-- **Cost efficient**: Cold storage on S3
-- **Unified API**: Iceberg-style table interface abstracts storage tiers
-- **Dual format**: Supports both JSON and Protobuf writes
-- **Iceberg compatible**: Optional Parquet output with Iceberg metadata
-- **Compaction**: Automatic merging of small files for optimal query performance
+- **Simple** — Single binary, no ZooKeeper, no broker cluster
+- **Iceberg-native** — Events land directly in Iceberg tables, queryable by Spark/Trino/DuckDB
+- **Cost efficient** — Data stored on S3 with automatic compaction
+- **Fast writes** — Buffered in RocksDB, durable in Iceberg
+- **Dual format** — Supports both JSON and Protobuf writes
+- **Compaction** — Automatic merging of small files for query performance
+
+## Architecture
+
+```
+Producer → Zombi → Iceberg (S3)
+              ↓           ↓
+          RocksDB    Spark/Trino/DuckDB
+         (buffer)    (analytics queries)
+```
+
+- **RocksDB** — Write buffer for fast ingestion (ephemeral)
+- **Iceberg** — Source of truth, queryable by any SQL engine
+- **Background flusher** — Batches events into Parquet files with Iceberg metadata
+
+## Prerequisites
+
+Before you begin, make sure you have:
+
+- **Rust** (1.70+) — [Install via rustup](https://rustup.rs/)
+- **Protobuf compiler** — `brew install protobuf` (macOS) or `apt-get install protobuf-compiler` (Linux)
+- **Docker** — For running MinIO (local S3) — [Install Docker](https://docs.docker.com/get-docker/)
+- **MinIO Client (mc)** — `brew install minio/stable/mc` (macOS) or [see docs](https://min.io/docs/minio/linux/reference/minio-mc.html)
 
 ## Quick Start
 
-### Build from source
+### Getting Started
 
 ```bash
-# Requires protobuf compiler
-brew install protobuf  # macOS
-# or: apt-get install protobuf-compiler  # Linux
+# 1. Clone the repository
+git clone https://github.com/rajeev-ranj/zombi.git
+cd zombi
 
-# Build
+# 2. Build
 cargo build --release
 
-# Run (hot storage only)
-./target/release/zombi
-```
-
-### With S3/MinIO (hot + cold storage)
-
-```bash
-# Start MinIO
-docker run -d --name minio \
-  -p 9000:9000 -p 9001:9001 \
-  -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin \
+# 3. Start MinIO (local S3)
+docker run -d --name minio -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
   minio/minio server /data --console-address ":9001"
 
-# Create bucket
+# 4. Create bucket
 mc alias set local http://localhost:9000 minioadmin minioadmin
 mc mb local/zombi-events
 
-# Run Zombi with S3
+# 5. Start Zombi
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
 ZOMBI_S3_BUCKET=zombi-events \
 ZOMBI_S3_ENDPOINT=http://localhost:9000 \
-cargo run
+ZOMBI_ICEBERG_ENABLED=true \
+./target/release/zombi
+
+# 6. Test it works (in a new terminal)
+curl -X POST http://localhost:8080/tables/events \
+  -H "Content-Type: application/json" \
+  -d '{"payload": "hello world"}'
+
+curl "http://localhost:8080/tables/events?limit=10"
 ```
+
+### Local Only (No Persistence)
+
+For quick testing without S3 storage (data is lost on restart):
+
+```bash
+git clone https://github.com/rajeev-ranj/zombi.git
+cd zombi
+cargo build --release
+./target/release/zombi
+```
+
+### Production (AWS)
+
+For production deployments, use real S3 instead of MinIO:
+
+```bash
+AWS_ACCESS_KEY_ID=AKIA... \
+AWS_SECRET_ACCESS_KEY=... \
+AWS_REGION=us-east-1 \
+ZOMBI_S3_BUCKET=your-bucket-name \
+ZOMBI_ICEBERG_ENABLED=true \
+./target/release/zombi
+```
+
+See [AWS Deployment docs](docs/aws/IAM_S3_SETUP.md) for IAM permissions, instance profiles, and Terraform automation.
 
 ### Docker
 
@@ -67,318 +110,95 @@ docker build -t zombi .
 docker run -p 8080:8080 -v zombi-data:/var/lib/zombi zombi
 ```
 
-## API
+## Usage
 
-The API uses a **unified table interface** similar to Iceberg, providing consistent access to both hot (RocksDB) and cold (S3) storage.
+### Write events
 
-### Write Records
-
-**JSON format:**
 ```bash
 curl -X POST http://localhost:8080/tables/events \
   -H "Content-Type: application/json" \
   -d '{"payload": "hello world"}'
+# Response: {"offset": 1, "partition": 0, "table": "events"}
 ```
 
-**Protobuf format:**
-```bash
-curl -X POST http://localhost:8080/tables/events \
-  -H "Content-Type: application/x-protobuf" \
-  --data-binary <protobuf-event>
-```
-
-Response:
-```json
-{"offset": 1, "partition": 0, "table": "events"}
-```
-
-### Read Records
-
-Reads from all partitions, merged by timestamp. Partitions are abstracted away.
+### Read events
 
 ```bash
-# Read all records
-curl "http://localhost:8080/tables/events"
-
-# With limit
 curl "http://localhost:8080/tables/events?limit=100"
-
-# Filter by timestamp
-curl "http://localhost:8080/tables/events?since=1704067200000"
 ```
 
-Response:
-```json
-{
-  "records": [
-    {"payload": "hello world", "timestamp_ms": 1234567890}
-  ],
-  "count": 1,
-  "has_more": false
-}
-```
-
-### Consumer Offsets
-
-Commit offset:
-```bash
-curl -X POST http://localhost:8080/consumers/my-group/commit \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "events", "partition": 0, "offset": 100}'
-```
-
-Get offset:
-```bash
-curl "http://localhost:8080/consumers/my-group/offset?topic=events&partition=0"
-```
-
-### Health Check
+### Health check
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-### Server Metrics
-
-Get real-time performance statistics:
+### View stats
 
 ```bash
 curl http://localhost:8080/stats
 ```
 
-Response:
-```json
-{
-  "uptime_secs": 123.45,
-  "writes": {
-    "total": 1000,
-    "bytes_total": 50000,
-    "rate_per_sec": 8.1,
-    "avg_latency_us": 45.2
-  },
-  "reads": {
-    "total": 200,
-    "records_total": 5000,
-    "rate_per_sec": 1.6,
-    "avg_latency_us": 120.5
-  },
-  "errors_total": 0
-}
-```
-
-## Configuration
-
-Environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ZOMBI_DATA_DIR` | `./data` | RocksDB data directory |
-| `ZOMBI_HOST` | `0.0.0.0` | HTTP server host |
-| `ZOMBI_PORT` | `8080` | HTTP server port |
-| `ZOMBI_S3_BUCKET` | - | S3 bucket (enables cold storage) |
-| `ZOMBI_S3_ENDPOINT` | AWS | Custom S3 endpoint (for MinIO) |
-| `ZOMBI_S3_REGION` | `us-east-1` | AWS region |
-| `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | Flush interval in seconds |
-| `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | Min events before flushing |
-| `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per segment |
-| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | Target Parquet file size (Iceberg) |
-| `ZOMBI_ICEBERG_ENABLED` | `false` | Enable Iceberg format output |
-| `RUST_LOG` | `zombi=info` | Log level |
-
-## Shutdown Behavior
-
-On SIGINT/SIGTERM, Zombi attempts a final flush of pending hot storage to cold storage when S3/Iceberg is configured. The server exits after the flush attempt and flusher shutdown complete.
-
-## Architecture
-
-```
-Write → RocksDB (hot) → BackgroundFlusher → S3 (cold)
-              ↑                              ↑
-              └────── Unified Read ──────────┘
-```
-
-- **Hot storage**: RocksDB for recent data (<1ms latency)
-- **Cold storage**: S3 for archived data (optional)
-- **Background flusher**: Automatically moves data from hot to cold
-- **Unified reads**: Transparently merges data from both tiers
-
-## Iceberg Integration
-
-Zombi can write cold storage data in Apache Iceberg format, making it queryable by Spark, Trino, Athena, and other analytics engines.
-
-### Enable Iceberg Mode
+### Verify Iceberg data
 
 ```bash
-ZOMBI_ICEBERG_ENABLED=true \
-ZOMBI_TARGET_FILE_SIZE_MB=128 \
-ZOMBI_S3_BUCKET=my-bucket \
-./target/release/zombi
-```
+# List files in MinIO
+mc ls local/zombi-events/tables/ --recursive
 
-### Data Layout
-
-With Iceberg enabled, data is written as Parquet files:
-
-```
-s3://bucket/tables/{topic}/
-├── metadata/
-│   ├── v1.metadata.json      # Iceberg table metadata
-│   ├── v2.metadata.json
-│   └── snap-{id}-{uuid}.avro # Manifest lists
-└── data/
-    └── partition={n}/
-        ├── {uuid}.parquet    # Data files
-        └── {uuid}.parquet
-```
-
-### Querying with Spark
-
-```python
-# Read Zombi table with Spark
-spark.read.format("iceberg") \
-    .load("s3://bucket/tables/events") \
-    .filter("timestamp_ms > 1704067200000") \
-    .show()
-```
-
-### REST Catalog Registration
-
-Optionally register tables with an Iceberg REST catalog:
-
-```rust
-use zombi::storage::{CatalogClient, CatalogConfig};
-
-let catalog = CatalogClient::new(CatalogConfig {
-    base_url: "http://catalog:8181".into(),
-    namespace: "zombi".into(),
-    ..Default::default()
-})?;
-
-catalog.register_table("events", &metadata).await?;
-```
-
-### Compaction
-
-Zombi includes automatic compaction to merge small Parquet files:
-
-```rust
-use zombi::storage::{Compactor, CompactionConfig};
-
-let compactor = Compactor::new(
-    s3_client,
-    "my-bucket",
-    "tables",
-    CompactionConfig {
-        min_file_size_bytes: 64 * 1024 * 1024,  // 64MB
-        target_file_size_bytes: 128 * 1024 * 1024,  // 128MB
-        ..Default::default()
-    }
-);
-
-// Compact all partitions for a topic
-let result = compactor.compact_topic("events").await?;
-println!("Compacted {} files into {}", result.files_compacted, result.files_created);
-```
-
-## Development
-
-```bash
-# Run tests
-cargo test
-
-# Run with verbose logging
-RUST_LOG=zombi=debug cargo run
-
-# Format code
-cargo fmt
-
-# Lint
-cargo clippy -- -D warnings
-```
-
-## Testing with MinIO
-
-```bash
-# Check segments in S3
-mc ls local/zombi-events/segments/ --recursive
-
-# View segment contents
-mc cat local/zombi-events/segments/events/0/0000000000000001-0000000000000005.json | jq .
-
-# MinIO console
-open http://localhost:9001  # minioadmin/minioadmin
+# Query with DuckDB
+duckdb -c "SELECT * FROM iceberg_scan('s3://zombi-events/tables/events')"
 ```
 
 ## Load Testing
 
-### Recommended: zombi-load CLI
-
-Use the unified load testing CLI for comprehensive performance validation:
-
 ```bash
-cd tools
-pip install click pyyaml requests
-
-# Quick sanity check
-python zombi_load.py run --profile quick --url http://localhost:8080
+# Quick validation
+python tools/zombi_load.py run --profile quick --url http://localhost:8080
 
 # Full test suite
-python zombi_load.py run --profile full
-
-# List available scenarios
-python zombi_load.py list scenarios
+python tools/zombi_load.py run --profile full
 ```
 
-See [tools/README.md](tools/README.md) for profiles, scenarios, and configuration.
+See [tools/README.md](tools/README.md) for more options.
 
-### Legacy: Producer Tool
+## Configuration
 
-A Python producer tool is also available for simple manual testing with variable burst patterns.
+| Variable | Dev Default | Iceberg Default | Description |
+|----------|-------------|-----------------|-------------|
+| `ZOMBI_DATA_DIR` | `./data` | `./data` | RocksDB data directory |
+| `ZOMBI_HOST` | `0.0.0.0` | `0.0.0.0` | HTTP server host |
+| `ZOMBI_PORT` | `8080` | `8080` | HTTP server port |
+| `ZOMBI_S3_BUCKET` | — | (required) | S3 bucket for Iceberg storage |
+| `ZOMBI_S3_ENDPOINT` | AWS | AWS | Custom S3 endpoint (for MinIO) |
+| `ZOMBI_S3_REGION` | `us-east-1` | `us-east-1` | AWS region |
+| `ZOMBI_ICEBERG_ENABLED` | `false` | `true` | Enable Iceberg format output |
+| `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | `300` | Flush interval in seconds |
+| `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | `10000` | Min events before flushing |
+| `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | `128` | Target Parquet file size |
+| `RUST_LOG` | `zombi=info` | `zombi=info` | Log level |
 
-#### Setup
+## Documentation
+
+- [SPEC.md](SPEC.md) — Full API reference and specification
+- [CONTRIBUTING.md](CONTRIBUTING.md) — How to contribute
+- [CHANGELOG.md](CHANGELOG.md) — Version history
+- [tools/README.md](tools/README.md) — Load testing and performance tools
+
+### AWS Deployment
+
+- [docs/aws/IAM_S3_SETUP.md](docs/aws/IAM_S3_SETUP.md) — IAM permissions and S3 bucket setup
+- [docs/aws/ICEBERG_VERIFICATION.md](docs/aws/ICEBERG_VERIFICATION.md) — Verifying Iceberg tables in AWS
+- [docs/aws/SCALING_ALB_REDIS.md](docs/aws/SCALING_ALB_REDIS.md) — Scaling with ALB and Redis
+- [infra/terraform/](infra/terraform/) — Terraform modules for automated AWS deployment
+
+## Development
 
 ```bash
-cd tools/producer
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Generate protobuf code (requires protoc)
-protoc --python_out=. events.proto
+cargo test          # Run tests
+cargo fmt           # Format code
+cargo clippy        # Lint
 ```
 
-#### Usage
+## License
 
-```bash
-# Bursty traffic (default) - random bursts of 50-200 events
-python producer.py --profile bursty --duration 60
-
-# Steady traffic - constant 10 events/sec
-python producer.py --profile steady --duration 60
-
-# Spike traffic - normal traffic with 10x spikes
-python producer.py --profile spike --duration 60
-
-# Stress test - maximum throughput with 10 threads
-python producer.py --profile stress --duration 60
-```
-
-### Monitoring Performance
-
-While the producer is running, monitor Zombi metrics:
-
-```bash
-# Watch metrics in real-time
-watch -n 1 'curl -s http://localhost:8080/stats | jq .'
-
-# Or continuously with python
-while true; do curl -s http://localhost:8080/stats | jq '.writes.rate_per_sec, .reads.avg_latency_us'; sleep 1; done
-```
-
-The `/stats` endpoint provides:
-- Write rate (events/sec)
-- Read latency (microseconds)
-- Total bytes written
-- Error counts
-
-See [SPEC.md](SPEC.md) for full specification.
+[MIT](LICENSE)
