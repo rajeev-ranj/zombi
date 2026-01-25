@@ -7,7 +7,7 @@ echo "Starting user-data script at $(date)"
 
 # Install dependencies
 apt-get update
-apt-get install -y docker.io python3-pip protobuf-compiler git jq hey
+apt-get install -y docker.io python3-pip protobuf-compiler git jq hey awscli
 systemctl enable docker
 systemctl start docker
 
