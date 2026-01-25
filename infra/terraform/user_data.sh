@@ -75,6 +75,10 @@ docker logs zombi --tail 20
 STATS
 chmod +x /opt/collect_stats.sh
 
+# Create results directory with ubuntu ownership
+mkdir -p /opt/results
+chown ubuntu:ubuntu /opt/results
+
 # Peak test script (runs FROM EC2, not local)
 cat > /opt/run_peak_test.sh << 'PEAKTEST'
 #!/bin/bash
