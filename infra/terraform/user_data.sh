@@ -15,6 +15,9 @@ systemctl start docker
 git clone https://github.com/rajeev-ranj/zombi.git /opt/zombi
 pip3 install requests protobuf
 
+# Make /opt/zombi writable by ubuntu user for test outputs
+chown -R ubuntu:ubuntu /opt/zombi
+
 # Generate protobuf code
 cd /opt/zombi/tools/producer
 protoc --python_out=. events.proto
@@ -108,8 +111,8 @@ python3 peak_performance_bulk.py \
 echo "=== Read Throughput Test ==="
 python3 benchmark.py \
     --url http://localhost:8080 \
-    --test read-throughput
-cp benchmark_results.json "$${OUTPUT_DIR}/read_results.json" 2>/dev/null || true
+    --test read-throughput \
+    --output "$${OUTPUT_DIR}/read_results.json"
 
 echo "=== Waiting for Iceberg Flush (120s) ==="
 sleep 120
