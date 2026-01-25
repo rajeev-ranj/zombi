@@ -175,6 +175,8 @@ python tools/zombi_load.py run --profile full
 python tools/zombi_load.py run --scenario single-write --workers 50
 ```
 
+**AWS testing:** Run the load generator on EC2 (same VPC as Zombi server) to avoid network bottlenecks. See `tools/README.md` for deployment options.
+
 See `tools/README.md` for profiles, scenarios, and configuration options.
 
 ---
