@@ -52,7 +52,7 @@ echo ""
 echo "2️⃣  Checking cross-references..."
 
 # Check for broken internal links in markdown files
-for file in README.md SPEC.md CHANGELOG.md VERSIONING.md BENCHMARKS.md testing_strategy.md CLAUDE.md docs/*.md; do
+for file in README.md SPEC.md CHANGELOG.md VERSIONING.md BENCHMARKS.md testing_strategy.md docs/*.md; do
     if [ ! -f "$file" ]; then
         continue
     fi
@@ -73,7 +73,7 @@ for file in README.md SPEC.md CHANGELOG.md VERSIONING.md BENCHMARKS.md testing_s
         file_dir=$(dirname "$file")
         link_path="$file_dir/$link"
         
-        if [ ! -f "$link_path" ]; then
+        if [ ! -e "$link_path" ]; then
             echo -e "${RED}   ❌ Broken link in $file: $link${NC}"
             ERRORS=$((ERRORS + 1))
         fi
@@ -95,7 +95,6 @@ REQUIRED_FILES=(
     "CHANGELOG.md"
     "VERSIONING.md"
     "testing_strategy.md"
-    "CLAUDE.md"
     "Cargo.toml"
     "docs/BRANCHING_STRATEGY.md"
     "docs/openapi.yaml"
@@ -123,12 +122,14 @@ if ! grep -q "SPEC.md" README.md; then
     echo -e "${YELLOW}   ⚠️  README.md doesn't reference SPEC.md${NC}"
 fi
 
-# CLAUDE.md should reference SPEC.md, CHANGELOG.md, testing_strategy.md
-for doc in SPEC.md CHANGELOG.md testing_strategy.md; do
-    if ! grep -q "$doc" CLAUDE.md; then
-        echo -e "${YELLOW}   ⚠️  CLAUDE.md doesn't reference $doc${NC}"
-    fi
-done
+# CLAUDE.md reference check (skip if file doesn't exist - it's developer-specific)
+if [ -f "CLAUDE.md" ]; then
+    for doc in SPEC.md CHANGELOG.md testing_strategy.md; do
+        if ! grep -q "$doc" CLAUDE.md; then
+            echo -e "${YELLOW}   ⚠️  CLAUDE.md doesn't reference $doc${NC}"
+        fi
+    done
+fi
 
 echo -e "${GREEN}   ✓ Reference check complete${NC}"
 echo ""
