@@ -2,6 +2,13 @@
 name = "zombi"
 version = "0.1.0"
 edition = "2021"
+description = "Lightweight Kafka-replacement event streaming with RocksDB and S3"
+repository = "https://github.com/rajeev-ranj/zombi"
+homepage = "https://github.com/rajeev-ranj/zombi"
+keywords = ["event-streaming", "kafka", "rocksdb", "s3", "iceberg"]
+categories = ["database", "asynchronous"]
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
