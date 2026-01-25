@@ -8,17 +8,27 @@
 # 4. Optionally cleaning up infrastructure
 #
 # Usage:
-#   ./aws_peak_performance.sh [MODE] [CLEANUP] [CONCURRENCY] [DURATION]
+#   ./aws_peak_performance.sh [MODE] [CLEANUP] [INSTANCE_TYPE]
 #
 # Modes:
 #   quick        - Peak single/bulk + read throughput + iceberg verification (~10 min)
 #   comprehensive - All 9 phases: peak, read, lag, encoding, payload, mixed, consistency, iceberg (~40 min)
+#   bandwidth    - Maximum throughput test with large payloads (~15 min)
+#   bandwidth-sweep - Full bandwidth sweep across configurations (~45 min)
+#
+# Instance Types (for bandwidth testing, use larger instances):
+#   t3.micro   - 2 vCPU, 1GB RAM, up to 5 Gbps (default, free tier)
+#   t3.medium  - 2 vCPU, 4GB RAM, up to 5 Gbps
+#   t3.large   - 2 vCPU, 8GB RAM, up to 5 Gbps
+#   t3.xlarge  - 4 vCPU, 16GB RAM, up to 5 Gbps (recommended for bandwidth tests)
+#   c5.xlarge  - 4 vCPU, 8GB RAM, up to 10 Gbps (best for bandwidth)
+#   c5.2xlarge - 8 vCPU, 16GB RAM, up to 10 Gbps
 #
 # Examples:
-#   ./aws_peak_performance.sh                           # Default: quick mode, cleanup
+#   ./aws_peak_performance.sh                           # Default: quick mode, t3.micro, cleanup
 #   ./aws_peak_performance.sh quick yes                 # Quick test with cleanup
-#   ./aws_peak_performance.sh comprehensive no          # Full test, keep instance for inspection
-#   ./aws_peak_performance.sh quick yes "50,100" 30     # Quick with custom concurrency/duration
+#   ./aws_peak_performance.sh bandwidth no t3.xlarge    # Bandwidth test on larger instance
+#   ./aws_peak_performance.sh bandwidth-sweep no c5.xlarge  # Full bandwidth sweep
 
 set -euo pipefail
 
@@ -26,22 +36,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_DIR="$SCRIPT_DIR/../infra/terraform"
 MODE="${1:-quick}"
 CLEANUP="${2:-yes}"
-CONCURRENCY="${3:-50,100,200}"
-DURATION="${4:-30}"
+INSTANCE_TYPE="${3:-t3.micro}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="$SCRIPT_DIR/results/aws_${MODE}_$TIMESTAMP"
+RESULTS_DIR="$SCRIPT_DIR/results/aws_${MODE}_${INSTANCE_TYPE}_$TIMESTAMP"
+
+# Instance specs for display
+declare -A INSTANCE_SPECS=(
+    ["t3.micro"]="2 vCPU, 1GB RAM, up to 5 Gbps"
+    ["t3.medium"]="2 vCPU, 4GB RAM, up to 5 Gbps"
+    ["t3.large"]="2 vCPU, 8GB RAM, up to 5 Gbps"
+    ["t3.xlarge"]="4 vCPU, 16GB RAM, up to 5 Gbps"
+    ["c5.xlarge"]="4 vCPU, 8GB RAM, up to 10 Gbps"
+    ["c5.2xlarge"]="8 vCPU, 16GB RAM, up to 10 Gbps"
+)
+
+SPEC="${INSTANCE_SPECS[$INSTANCE_TYPE]:-unknown}"
 
 echo "=========================================="
 echo "Zombi AWS Performance Test"
 echo "=========================================="
 echo "Mode: $MODE"
-echo "Instance type: t3.micro (2 vCPU, 1GB RAM)"
-if [ "$MODE" = "quick" ]; then
-    echo "Concurrency levels: $CONCURRENCY"
-    echo "Duration: ${DURATION}s per level"
-fi
+echo "Instance type: $INSTANCE_TYPE ($SPEC)"
 echo "Cleanup: $CLEANUP"
 echo ""
+
+# Warn about cost for larger instances
+if [[ "$INSTANCE_TYPE" == c5* ]] || [[ "$INSTANCE_TYPE" == *xlarge* ]]; then
+    echo "NOTE: Using larger instance type - this will incur higher AWS costs."
+    echo ""
+fi
 
 mkdir -p "$RESULTS_DIR"
 
@@ -49,7 +72,7 @@ mkdir -p "$RESULTS_DIR"
 echo "Deploying infrastructure..."
 cd "$TF_DIR"
 terraform init -upgrade > /dev/null 2>&1
-terraform apply -auto-approve
+terraform apply -auto-approve -var="instance_type=$INSTANCE_TYPE"
 
 # Get outputs
 IP=$(terraform output -raw instance_public_ip)
@@ -102,8 +125,9 @@ echo "=========================================="
 echo "(All load generation happens on EC2, no local -> EC2 network latency)"
 echo ""
 
-if [ "$MODE" = "comprehensive" ]; then
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+case "$MODE" in
+    comprehensive)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
 set -e
 export ZOMBI_S3_BUCKET="$S3_BUCKET"
 echo "Running COMPREHENSIVE test suite on EC2..."
@@ -111,17 +135,38 @@ echo "This will take approximately 40 minutes."
 echo ""
 /opt/run_comprehensive_test.sh /opt/results
 REMOTE
-else
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+        ;;
+    bandwidth)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+set -e
+export ZOMBI_S3_BUCKET="$S3_BUCKET"
+echo "Running BANDWIDTH test on EC2..."
+echo "Testing with large payloads to maximize throughput."
+echo ""
+/opt/run_bandwidth_test.sh /opt/results quick
+REMOTE
+        ;;
+    bandwidth-sweep)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
+set -e
+export ZOMBI_S3_BUCKET="$S3_BUCKET"
+echo "Running BANDWIDTH SWEEP test on EC2..."
+echo "This will test multiple configurations to find maximum throughput."
+echo "This will take approximately 45 minutes."
+echo ""
+/opt/run_bandwidth_test.sh /opt/results sweep
+REMOTE
+        ;;
+    *)
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
 set -e
 export ZOMBI_S3_BUCKET="$S3_BUCKET"
 echo "Running QUICK tests on EC2..."
-echo "Concurrency: $CONCURRENCY"
-echo "Duration: ${DURATION}s per level"
 echo ""
-/opt/run_peak_test.sh "$CONCURRENCY" "$DURATION" /opt/results
+/opt/run_peak_test.sh "50,100,200" "30" /opt/results
 REMOTE
-fi
+        ;;
+esac
 
 # Copy results back
 echo ""
@@ -275,6 +320,57 @@ else:
 " 2>/dev/null || echo "  (verification file not found)"
     else
         echo "  (verification file not found)"
+    fi
+fi
+
+# Display bandwidth results if available
+if [[ "$MODE" == bandwidth* ]]; then
+    echo ""
+    echo "--- Bandwidth Test Results ---"
+
+    # Check for combined results first
+    if [ -f "$RESULTS_DIR/bandwidth_combined.json" ]; then
+        python3 -c "
+import json
+with open('$RESULTS_DIR/bandwidth_combined.json') as f:
+    d = json.load(f)
+
+print(f'PEAK: {d.get(\"peak_mb_per_sec\", 0):.1f} MB/s ({d.get(\"peak_gbps\", 0):.3f} Gbps)')
+print()
+
+# Print all test results
+tests = d.get('tests', [])
+if tests:
+    print(f'{\"Payload\":>10} {\"Batch\":>8} {\"Conc\":>6} {\"MB/s\":>10} {\"Gbps\":>8} {\"Events/s\":>12} {\"P99\":>10} {\"CPU\":>8}')
+    print('-' * 80)
+    for r in sorted(tests, key=lambda x: x.get('mb_per_sec', 0), reverse=True):
+        payload_kb = r.get('payload_size', 0) / 1024
+        cpu = r.get('peak_cpu_percent', 0)
+        cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+        print(f'{payload_kb:>9.0f}K {r.get(\"batch_size\", 0):>8} {r.get(\"concurrency\", 0):>6} {r.get(\"mb_per_sec\", 0):>9.1f} {r.get(\"gbps\", 0):>7.3f} {r.get(\"events_per_sec\", 0):>11,.0f} {r.get(\"p99_ms\", 0):>9.1f}ms {cpu_str:>8}')
+" 2>/dev/null || echo "  (results not found)"
+    elif [ -f "$RESULTS_DIR/bandwidth_sweep.json" ]; then
+        python3 -c "
+import json
+with open('$RESULTS_DIR/bandwidth_sweep.json') as f:
+    d = json.load(f)
+
+peak = d.get('peak', {})
+print(f'PEAK: {peak.get(\"mb_per_sec\", 0):.1f} MB/s ({peak.get(\"gbps\", 0):.3f} Gbps)')
+print()
+
+results = d.get('results', [])
+if results:
+    print(f'{\"Payload\":>10} {\"Batch\":>8} {\"Conc\":>6} {\"MB/s\":>10} {\"Gbps\":>8} {\"Events/s\":>12} {\"P99\":>10} {\"CPU\":>8}')
+    print('-' * 80)
+    for r in sorted(results, key=lambda x: x.get('mb_per_sec', 0), reverse=True)[:10]:
+        payload_kb = r.get('payload_size', 0) / 1024
+        cpu = r.get('peak_cpu_percent', 0)
+        cpu_str = f'{cpu:.0f}%' if cpu else 'N/A'
+        print(f'{payload_kb:>9.0f}K {r.get(\"batch_size\", 0):>8} {r.get(\"concurrency\", 0):>6} {r.get(\"mb_per_sec\", 0):>9.1f} {r.get(\"gbps\", 0):>7.3f} {r.get(\"events_per_sec\", 0):>11,.0f} {r.get(\"p99_ms\", 0):>9.1f}ms {cpu_str:>8}')
+" 2>/dev/null || echo "  (results not found)"
+    else
+        echo "  (no bandwidth results found)"
     fi
 fi
 

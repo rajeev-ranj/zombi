@@ -367,4 +367,80 @@ ls -la "$${OUTPUT_DIR}"
 COMPREHENSIVE
 chmod +x /opt/run_comprehensive_test.sh
 
+# Bandwidth test script - maximize MB/s throughput
+cat > /opt/run_bandwidth_test.sh << 'BANDWIDTH'
+#!/bin/bash
+set -e
+OUTPUT_DIR="$${1:-/opt/results}"
+MODE="$${2:-quick}"  # quick or sweep
+
+mkdir -p "$${OUTPUT_DIR}"
+cd /opt/zombi/tools
+
+echo "========================================"
+echo "ZOMBI BANDWIDTH TEST"
+echo "========================================"
+echo "Mode: $${MODE}"
+echo "Started: $(date)"
+echo ""
+
+if [ "$${MODE}" = "sweep" ]; then
+    echo "Running full bandwidth sweep (this will take ~30 minutes)..."
+    python3 bandwidth_test.py \
+        --url http://localhost:8080 \
+        --sweep \
+        --duration 30 \
+        --output "$${OUTPUT_DIR}/bandwidth_sweep.json"
+else
+    echo "Running quick bandwidth test..."
+    # Test with increasing payload sizes
+    for PAYLOAD in 4096 16384 32768 65536; do
+        PAYLOAD_KB=$((PAYLOAD / 1024))
+        echo ""
+        echo "=== Testing $${PAYLOAD_KB}KB payload ==="
+        python3 bandwidth_test.py \
+            --url http://localhost:8080 \
+            --payload-size $${PAYLOAD} \
+            --batch-size 100 \
+            --concurrency 100 \
+            --duration 20 \
+            --output "$${OUTPUT_DIR}/bandwidth_$${PAYLOAD_KB}k.json"
+    done
+
+    # Generate combined results
+    python3 << COMBINE
+import json
+import os
+from glob import glob
+
+output_dir = "$${OUTPUT_DIR}"
+combined = {"tests": [], "peak_mb_per_sec": 0, "peak_gbps": 0}
+
+for f in sorted(glob(os.path.join(output_dir, "bandwidth_*.json"))):
+    if "sweep" in f or "combined" in f:
+        continue
+    with open(f) as fp:
+        data = json.load(fp)
+        combined["tests"].extend(data.get("results", []))
+        peak = data.get("peak", {})
+        if peak.get("mb_per_sec", 0) > combined["peak_mb_per_sec"]:
+            combined["peak_mb_per_sec"] = peak["mb_per_sec"]
+            combined["peak_gbps"] = peak["gbps"]
+
+with open(os.path.join(output_dir, "bandwidth_combined.json"), "w") as fp:
+    json.dump(combined, fp, indent=2)
+
+print(f"Peak: {combined['peak_mb_per_sec']:.1f} MB/s ({combined['peak_gbps']:.3f} Gbps)")
+COMBINE
+fi
+
+echo ""
+echo "========================================"
+echo "BANDWIDTH TEST COMPLETE"
+echo "========================================"
+echo "Finished: $(date)"
+echo "Results: $${OUTPUT_DIR}"
+BANDWIDTH
+chmod +x /opt/run_bandwidth_test.sh
+
 echo "User-data script completed at $(date)"
