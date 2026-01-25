@@ -75,4 +75,82 @@ docker logs zombi --tail 20
 STATS
 chmod +x /opt/collect_stats.sh
 
+# Peak test script (runs FROM EC2, not local)
+cat > /opt/run_peak_test.sh << 'PEAKTEST'
+#!/bin/bash
+set -e
+CONCURRENCY="$${1:-50,100,200}"
+DURATION="$${2:-30}"
+OUTPUT_DIR="$${3:-/opt/results}"
+
+mkdir -p "$$OUTPUT_DIR"
+cd /opt/zombi/tools
+
+echo "=== Peak Performance Test (Single Write API) ==="
+python3 peak_performance.py \
+    --url http://localhost:8080 \
+    --concurrency "$$CONCURRENCY" \
+    --duration "$$DURATION" \
+    --output "$$OUTPUT_DIR/peak_single.json"
+
+echo "=== Peak Performance Test (Bulk Write API) ==="
+python3 peak_performance_bulk.py \
+    --url http://localhost:8080 \
+    --concurrency "$$CONCURRENCY" \
+    --duration "$$DURATION" \
+    --batch-size 100 \
+    --output "$$OUTPUT_DIR/peak_bulk.json"
+
+echo "=== Read Throughput Test ==="
+python3 benchmark.py \
+    --url http://localhost:8080 \
+    --test read-throughput
+cp benchmark_results.json "$$OUTPUT_DIR/read_results.json" 2>/dev/null || true
+
+echo "=== Waiting for Iceberg Flush (120s) ==="
+sleep 120
+
+echo "=== Iceberg Verification ==="
+/opt/verify_iceberg.sh "$$OUTPUT_DIR"
+
+echo "=== Final Server Stats ==="
+curl -s http://localhost:8080/stats > "$$OUTPUT_DIR/server_stats.json"
+
+echo "Results saved to: $$OUTPUT_DIR"
+PEAKTEST
+chmod +x /opt/run_peak_test.sh
+
+# Iceberg verification script
+cat > /opt/verify_iceberg.sh << 'VERIFY'
+#!/bin/bash
+OUTPUT_DIR="$${1:-.}"
+BUCKET="$${ZOMBI_S3_BUCKET:-zombi-events-test1}"
+
+echo "=== Iceberg Verification: s3://$$BUCKET ==="
+
+METADATA=$$(aws s3 ls "s3://$$BUCKET/tables/" --recursive | grep -c "metadata.json" || echo 0)
+PARQUET=$$(aws s3 ls "s3://$$BUCKET/tables/" --recursive | grep -c ".parquet" || echo 0)
+TOTAL_SIZE=$$(aws s3 ls "s3://$$BUCKET/tables/" --recursive --summarize 2>/dev/null | grep "Total Size" | awk '{print $$3}' || echo 0)
+
+echo "  Metadata files: $$METADATA"
+echo "  Parquet files: $$PARQUET"
+echo "  Total size: $$TOTAL_SIZE bytes"
+
+# List actual files
+echo ""
+echo "S3 Contents:"
+aws s3 ls "s3://$$BUCKET/tables/" --recursive | head -20
+
+cat > "$$OUTPUT_DIR/iceberg_verification.json" << EOF
+{
+  "bucket": "$$BUCKET",
+  "metadata_files": $$METADATA,
+  "parquet_files": $$PARQUET,
+  "total_bytes": $$TOTAL_SIZE,
+  "verified_at": "$$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+VERIFY
+chmod +x /opt/verify_iceberg.sh
+
 echo "User-data script completed at $(date)"
