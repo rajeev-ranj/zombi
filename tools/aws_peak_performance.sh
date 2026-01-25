@@ -40,17 +40,20 @@ INSTANCE_TYPE="${3:-t3.micro}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULTS_DIR="$SCRIPT_DIR/results/aws_${MODE}_${INSTANCE_TYPE}_$TIMESTAMP"
 
-# Instance specs for display
-declare -A INSTANCE_SPECS=(
-    ["t3.micro"]="2 vCPU, 1GB RAM, up to 5 Gbps"
-    ["t3.medium"]="2 vCPU, 4GB RAM, up to 5 Gbps"
-    ["t3.large"]="2 vCPU, 8GB RAM, up to 5 Gbps"
-    ["t3.xlarge"]="4 vCPU, 16GB RAM, up to 5 Gbps"
-    ["c5.xlarge"]="4 vCPU, 8GB RAM, up to 10 Gbps"
-    ["c5.2xlarge"]="8 vCPU, 16GB RAM, up to 10 Gbps"
-)
+# Get instance specs for display
+get_instance_spec() {
+    case "$1" in
+        t3.micro)   echo "2 vCPU, 1GB RAM, up to 5 Gbps" ;;
+        t3.medium)  echo "2 vCPU, 4GB RAM, up to 5 Gbps" ;;
+        t3.large)   echo "2 vCPU, 8GB RAM, up to 5 Gbps" ;;
+        t3.xlarge)  echo "4 vCPU, 16GB RAM, up to 5 Gbps" ;;
+        c5.xlarge)  echo "4 vCPU, 8GB RAM, up to 10 Gbps" ;;
+        c5.2xlarge) echo "8 vCPU, 16GB RAM, up to 10 Gbps" ;;
+        *)          echo "unknown" ;;
+    esac
+}
 
-SPEC="${INSTANCE_SPECS[$INSTANCE_TYPE]:-unknown}"
+SPEC=$(get_instance_spec "$INSTANCE_TYPE")
 
 echo "=========================================="
 echo "Zombi AWS Performance Test"
@@ -61,10 +64,12 @@ echo "Cleanup: $CLEANUP"
 echo ""
 
 # Warn about cost for larger instances
-if [[ "$INSTANCE_TYPE" == c5* ]] || [[ "$INSTANCE_TYPE" == *xlarge* ]]; then
-    echo "NOTE: Using larger instance type - this will incur higher AWS costs."
-    echo ""
-fi
+case "$INSTANCE_TYPE" in
+    c5*|*xlarge*)
+        echo "NOTE: Using larger instance type - this will incur higher AWS costs."
+        echo ""
+        ;;
+esac
 
 mkdir -p "$RESULTS_DIR"
 
