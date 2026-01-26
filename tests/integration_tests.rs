@@ -6,6 +6,7 @@ use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
+use zombi::metrics::MetricsRegistry;
 use zombi::proto;
 use zombi::storage::RocksDbStorage;
 
@@ -18,6 +19,7 @@ fn create_test_app_with_backpressure(
         Arc::new(storage),
         None::<Arc<NoopColdStorage>>,
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         config,
     ));
     let router = create_router(state);
@@ -31,6 +33,7 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(storage),
         None::<Arc<NoopColdStorage>>,
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
     let router = create_router(state);
@@ -44,6 +47,7 @@ fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
         Arc::new(storage),
         Some(Arc::new(NoopColdStorage)),
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
     let router = create_router(state);

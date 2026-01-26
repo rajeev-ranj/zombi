@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
 use zombi::contracts::Flusher;
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
+use zombi::metrics::MetricsRegistry;
 use zombi::storage::{ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage, S3Storage};
 
 #[tokio::main]
@@ -160,10 +161,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_inflight_bytes_mb = backpressure_config.max_inflight_bytes / (1024 * 1024),
         "Backpressure configured"
     );
+    let metrics_registry = Arc::new(MetricsRegistry::new());
     let state = Arc::new(AppState::new(
         storage,
         cold_storage,
         Arc::new(Metrics::new()),
+        metrics_registry,
         backpressure_config,
     ));
 

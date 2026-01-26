@@ -1,0 +1,15 @@
+# Prometheus configuration for Zombi observability stack
+# Scrapes metrics from Zombi's /metrics endpoint
+
+global:
+  scrape_interval: 5s      # How often to scrape targets
+  evaluation_interval: 5s  # How often to evaluate rules
+
+scrape_configs:
+  - job_name: 'zombi'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['zombi:8080']
+        labels:
+          service: 'zombi'
+          environment: 'docker'

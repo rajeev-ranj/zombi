@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::contracts::{ColdStorage, HotStorage, StorageError};
+use crate::metrics::MetricsRegistry;
 use crate::proto;
 
 /// Server metrics for monitoring.
@@ -109,6 +110,7 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub storage: Arc<H>,
     pub cold_storage: Option<Arc<C>>,
     pub metrics: Arc<Metrics>,
+    pub metrics_registry: Arc<MetricsRegistry>,
     /// Semaphore for limiting concurrent writes
     pub write_semaphore: Arc<Semaphore>,
     /// Current inflight bytes (for byte-based backpressure)
@@ -123,12 +125,14 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
         storage: Arc<H>,
         cold_storage: Option<Arc<C>>,
         metrics: Arc<Metrics>,
+        metrics_registry: Arc<MetricsRegistry>,
         backpressure: BackpressureConfig,
     ) -> Self {
         Self {
             storage,
             cold_storage,
             metrics,
+            metrics_registry,
             write_semaphore: Arc::new(Semaphore::new(backpressure.max_inflight_writes)),
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
@@ -385,6 +389,7 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
         state.metrics.record_error();
+        state.metrics_registry.enhanced_api.record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -455,6 +460,13 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_write(body_len, latency_us);
 
+    // Record enhanced metrics
+    state.metrics_registry.enhanced_api.record_write(&table, latency_us);
+    state.metrics_registry.consumer.update_high_watermark(&table, partition, offset);
+    if let Ok(lwm) = state.storage.low_watermark(&table, partition) {
+        state.metrics_registry.hot.update(&table, partition, lwm, offset);
+    }
+
     Ok((
         StatusCode::ACCEPTED,
         Json(WriteRecordResponse {
@@ -504,6 +516,7 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(total_bytes).map_err(|e| {
         state.metrics.record_error();
+        state.metrics_registry.enhanced_api.record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -634,6 +647,9 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_read(count as u64, latency_us);
 
+    // Record enhanced metrics
+    state.metrics_registry.enhanced_api.record_read(&table, latency_us);
+
     Ok(Json(ReadRecordsResponse {
         records,
         count,
@@ -760,6 +776,14 @@ pub async fn commit_offset<H: HotStorage, C: ColdStorage>(
     state
         .storage
         .commit_offset(&group, &request.topic, request.partition, request.offset)?;
+
+    // Record consumer metrics
+    state.metrics_registry.consumer.update_committed_offset(
+        &group,
+        &request.topic,
+        request.partition,
+        request.offset,
+    );
 
     Ok(Json(CommitOffsetResponse {
         group,
@@ -1042,7 +1066,7 @@ pub async fn metrics<H: HotStorage, C: ColdStorage>(
     let reads_avg_latency = safe_avg(read_latency_sum, reads_total);
 
     // Build Prometheus text format output
-    let output = format!(
+    let mut output = format!(
         "# HELP zombi_uptime_secs Server uptime in seconds\n\
          # TYPE zombi_uptime_secs gauge\n\
          zombi_uptime_secs {:.3}\n\
@@ -1103,6 +1127,9 @@ pub async fn metrics<H: HotStorage, C: ColdStorage>(
         inflight_bytes,
         inflight_writes_available,
     );
+
+    // Append enhanced metrics from MetricsRegistry
+    output.push_str(&state.metrics_registry.format_prometheus());
 
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
