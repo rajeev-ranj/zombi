@@ -489,12 +489,9 @@ pub struct ManifestListEntry {
 /// Generates a unique snapshot ID.
 pub fn generate_snapshot_id() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // SAFETY: This unwrap is safe because SystemTime::now() will always be after UNIX_EPOCH
-    // on any reasonable system. The only way this could fail is if the system clock is
-    // set to before 1970-01-01, which would cause many other problems first.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_nanos();
     (now & 0x7FFFFFFFFFFFFFFF) as i64
 }
@@ -502,12 +499,9 @@ pub fn generate_snapshot_id() -> i64 {
 /// Returns current timestamp in milliseconds.
 pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // SAFETY: This unwrap is safe because SystemTime::now() will always be after UNIX_EPOCH
-    // on any reasonable system. The only way this could fail is if the system clock is
-    // set to before 1970-01-01, which would cause many other problems first.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_millis() as i64
 }
 
