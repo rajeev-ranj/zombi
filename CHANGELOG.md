@@ -4,6 +4,11 @@ All notable changes to Zombi are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Column Statistics** - Iceberg `lower_bounds`/`upper_bounds` populated in DataFile manifests
+  - Enables query engines (Spark, Trino, DuckDB) to skip files during planning
+  - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
+
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 

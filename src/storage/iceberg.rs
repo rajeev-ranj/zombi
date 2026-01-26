@@ -6,6 +6,66 @@ use uuid::Uuid;
 use crate::contracts::StorageError;
 use crate::storage::ParquetFileMetadata;
 
+/// Iceberg schema field IDs.
+/// These must match the field IDs in the schema definition and remain stable
+/// across schema evolution. Used for column statistics (lower/upper bounds).
+#[allow(dead_code)]
+pub mod field_ids {
+    /// sequence (long) - monotonically increasing event ID
+    pub const SEQUENCE: i32 = 1;
+    /// topic (string) - event topic/table name
+    pub const TOPIC: i32 = 2;
+    /// partition (int) - partition number
+    pub const PARTITION: i32 = 3;
+    /// payload (binary) - event payload
+    pub const PAYLOAD: i32 = 4;
+    /// timestamp_ms (long) - event timestamp in milliseconds
+    pub const TIMESTAMP_MS: i32 = 5;
+    /// idempotency_key (string, optional) - deduplication key
+    pub const IDEMPOTENCY_KEY: i32 = 6;
+    /// event_date (date) - partition column, days since epoch
+    pub const EVENT_DATE: i32 = 7;
+    /// event_hour (int) - partition column, hour of day (0-23)
+    pub const EVENT_HOUR: i32 = 8;
+}
+
+/// Iceberg binary encoding utilities for column statistics.
+/// Iceberg uses big-endian encoding for all numeric types in lower_bounds/upper_bounds.
+pub mod iceberg_encoding {
+    /// Encodes an i64 (long) to big-endian bytes for Iceberg.
+    pub fn encode_long(value: i64) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    /// Encodes a u64 as i64 (long) to big-endian bytes for Iceberg.
+    ///
+    /// # Note
+    /// Iceberg uses signed long for all integer types. Values greater than
+    /// `i64::MAX` (9,223,372,036,854,775,807) will wrap to negative values
+    /// due to two's complement representation. For Zombi sequence numbers,
+    /// this limit is unlikely to be reached in practice (would require ~292
+    /// years at 1 billion events/second).
+    pub fn encode_u64_as_long(value: u64) -> Vec<u8> {
+        (value as i64).to_be_bytes().to_vec()
+    }
+
+    /// Encodes an i32 (int) to big-endian bytes for Iceberg.
+    pub fn encode_int(value: i32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    /// Encodes a u32 as i32 (int) to big-endian bytes for Iceberg.
+    pub fn encode_u32_as_int(value: u32) -> Vec<u8> {
+        (value as i32).to_be_bytes().to_vec()
+    }
+
+    /// Encodes a date (days since epoch) to big-endian bytes for Iceberg.
+    /// Iceberg date type is stored as i32 days since 1970-01-01.
+    pub fn encode_date(days_since_epoch: i32) -> Vec<u8> {
+        encode_int(days_since_epoch)
+    }
+}
+
 /// Iceberg table location on S3.
 #[derive(Debug, Clone)]
 pub struct IcebergTableConfig {
@@ -361,7 +421,65 @@ pub struct DataFile {
 
 impl DataFile {
     /// Creates a DataFile from ParquetFileMetadata.
+    /// Populates column statistics (lower/upper bounds) from Parquet metadata.
+    /// Field IDs are defined in the `field_ids` module.
     pub fn from_parquet_metadata(metadata: &ParquetFileMetadata, s3_path: &str) -> Self {
+        use crate::storage::iceberg::field_ids;
+        use iceberg_encoding::*;
+
+        let mut lower_bounds = HashMap::new();
+        let mut upper_bounds = HashMap::new();
+
+        // sequence (long)
+        lower_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_min),
+        );
+        upper_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_max),
+        );
+
+        // partition (int)
+        lower_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_min),
+        );
+        upper_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_max),
+        );
+
+        // timestamp_ms (long)
+        lower_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_min),
+        );
+        upper_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_max),
+        );
+
+        // event_date (date - days since epoch)
+        lower_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_max),
+        );
+
+        // event_hour (int)
+        lower_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_max),
+        );
+
         Self {
             content: 0, // Data file
             file_path: s3_path.to_string(),
@@ -371,8 +489,8 @@ impl DataFile {
             column_sizes: None,
             value_counts: None,
             null_value_counts: None,
-            lower_bounds: None,
-            upper_bounds: None,
+            lower_bounds: Some(lower_bounds),
+            upper_bounds: Some(upper_bounds),
             split_offsets: None,
         }
     }
@@ -427,7 +545,7 @@ pub fn generate_snapshot_id() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_nanos();
     (now & 0x7FFFFFFFFFFFFFFF) as i64
 }
@@ -437,7 +555,7 @@ pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_millis() as i64
 }
 
@@ -543,7 +661,20 @@ mod tests {
 
     #[test]
     fn test_data_file_from_parquet_metadata() {
-        use crate::storage::parquet::PartitionValues;
+        use crate::storage::parquet::{ColumnStatistics, PartitionValues};
+
+        let column_stats = ColumnStatistics {
+            sequence_min: 1,
+            sequence_max: 1000,
+            partition_min: 0,
+            partition_max: 5,
+            timestamp_min: 100,
+            timestamp_max: 200,
+            event_date_min: 19737,
+            event_date_max: 19737,
+            event_hour_min: 10,
+            event_hour_max: 14,
+        };
 
         let parquet_meta = ParquetFileMetadata {
             path: "/tmp/test.parquet".into(),
@@ -554,6 +685,7 @@ mod tests {
             max_timestamp_ms: 200,
             file_size_bytes: 50000,
             partition_values: PartitionValues::default(),
+            column_stats,
         };
 
         let data_file =
@@ -564,6 +696,138 @@ mod tests {
         assert_eq!(data_file.file_format, "PARQUET");
         assert_eq!(data_file.record_count, 1000);
         assert_eq!(data_file.file_size_in_bytes, 50000);
+
+        // Verify column statistics are now populated
+        let lower = data_file
+            .lower_bounds
+            .expect("lower_bounds should be populated");
+        let upper = data_file
+            .upper_bounds
+            .expect("upper_bounds should be populated");
+
+        // Verify all fields are present
+        assert!(lower.contains_key(&1), "sequence lower bound should exist");
+        assert!(lower.contains_key(&3), "partition lower bound should exist");
+        assert!(lower.contains_key(&5), "timestamp lower bound should exist");
+        assert!(
+            lower.contains_key(&7),
+            "event_date lower bound should exist"
+        );
+        assert!(
+            lower.contains_key(&8),
+            "event_hour lower bound should exist"
+        );
+
+        assert!(upper.contains_key(&1), "sequence upper bound should exist");
+        assert!(upper.contains_key(&3), "partition upper bound should exist");
+        assert!(upper.contains_key(&5), "timestamp upper bound should exist");
+        assert!(
+            upper.contains_key(&7),
+            "event_date upper bound should exist"
+        );
+        assert!(
+            upper.contains_key(&8),
+            "event_hour upper bound should exist"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_encoding_long() {
+        // Test encoding i64 as big-endian bytes
+        let encoded = iceberg_encoding::encode_long(1705276800000_i64);
+        assert_eq!(encoded.len(), 8);
+        // Verify big-endian by checking first byte is most significant
+        let decoded = i64::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 1705276800000_i64);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_u64_as_long() {
+        let encoded = iceberg_encoding::encode_u64_as_long(12345_u64);
+        assert_eq!(encoded.len(), 8);
+        let decoded = i64::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 12345_i64);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_int() {
+        let encoded = iceberg_encoding::encode_int(19737_i32);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 19737_i32);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_u32_as_int() {
+        let encoded = iceberg_encoding::encode_u32_as_int(100_u32);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 100_i32);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_date() {
+        // 2024-01-15 is day 19737 since epoch
+        let encoded = iceberg_encoding::encode_date(19737);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 19737);
+    }
+
+    #[test]
+    fn test_data_file_bounds_encoding() {
+        use crate::storage::parquet::{ColumnStatistics, PartitionValues};
+
+        let column_stats = ColumnStatistics {
+            sequence_min: 100,
+            sequence_max: 200,
+            partition_min: 0,
+            partition_max: 5,
+            timestamp_min: 1705276800000,
+            timestamp_max: 1705363200000,
+            event_date_min: 19737,
+            event_date_max: 19738,
+            event_hour_min: 0,
+            event_hour_max: 23,
+        };
+
+        let parquet_meta = ParquetFileMetadata {
+            path: "/tmp/test.parquet".into(),
+            row_count: 100,
+            min_sequence: 100,
+            max_sequence: 200,
+            min_timestamp_ms: 1705276800000,
+            max_timestamp_ms: 1705363200000,
+            file_size_bytes: 10000,
+            partition_values: PartitionValues::default(),
+            column_stats,
+        };
+
+        let data_file = DataFile::from_parquet_metadata(&parquet_meta, "s3://test/file.parquet");
+
+        let lower = data_file.lower_bounds.unwrap();
+        let upper = data_file.upper_bounds.unwrap();
+
+        // Verify sequence encoding (field 1)
+        let seq_min_bytes: [u8; 8] = lower.get(&1).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(seq_min_bytes), 100);
+
+        let seq_max_bytes: [u8; 8] = upper.get(&1).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(seq_max_bytes), 200);
+
+        // Verify timestamp encoding (field 5)
+        let ts_min_bytes: [u8; 8] = lower.get(&5).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(ts_min_bytes), 1705276800000);
+
+        let ts_max_bytes: [u8; 8] = upper.get(&5).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(ts_max_bytes), 1705363200000);
+
+        // Verify event_date encoding (field 7)
+        let date_min_bytes: [u8; 4] = lower.get(&7).unwrap().clone().try_into().unwrap();
+        assert_eq!(i32::from_be_bytes(date_min_bytes), 19737);
+
+        let date_max_bytes: [u8; 4] = upper.get(&7).unwrap().clone().try_into().unwrap();
+        assert_eq!(i32::from_be_bytes(date_max_bytes), 19738);
     }
 
     #[test]
