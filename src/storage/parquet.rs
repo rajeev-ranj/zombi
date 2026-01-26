@@ -66,6 +66,27 @@ pub struct PartitionValues {
     pub max_event_hour: i32,
 }
 
+/// Column-level statistics for Iceberg DataFile bounds.
+/// Contains min/max values for each indexed column, keyed by Iceberg field ID.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnStatistics {
+    /// Field ID 1: sequence (u64, stored as i64 for Iceberg)
+    pub sequence_min: u64,
+    pub sequence_max: u64,
+    /// Field ID 3: partition (u32, stored as i32 for Iceberg)
+    pub partition_min: u32,
+    pub partition_max: u32,
+    /// Field ID 5: timestamp_ms (i64)
+    pub timestamp_min: i64,
+    pub timestamp_max: i64,
+    /// Field ID 7: event_date (Date32 - days since epoch as i32)
+    pub event_date_min: i32,
+    pub event_date_max: i32,
+    /// Field ID 8: event_hour (i32)
+    pub event_hour_min: i32,
+    pub event_hour_max: i32,
+}
+
 /// Metadata about a written Parquet file.
 #[derive(Debug, Clone)]
 pub struct ParquetFileMetadata {
@@ -85,6 +106,8 @@ pub struct ParquetFileMetadata {
     pub file_size_bytes: u64,
     /// Partition column bounds.
     pub partition_values: PartitionValues,
+    /// Column statistics for Iceberg DataFile bounds.
+    pub column_stats: ColumnStatistics,
 }
 
 /// Returns the Arrow schema for StoredEvent.
@@ -193,26 +216,7 @@ pub fn write_parquet<P: AsRef<Path>>(
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     // Calculate statistics - events is guaranteed non-empty (checked at function start)
-    let min_sequence = events
-        .iter()
-        .map(|e| e.sequence)
-        .min()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let max_sequence = events
-        .iter()
-        .map(|e| e.sequence)
-        .max()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let min_timestamp = events
-        .iter()
-        .map(|e| e.timestamp_ms)
-        .min()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let max_timestamp = events
-        .iter()
-        .map(|e| e.timestamp_ms)
-        .max()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let column_stats = compute_column_statistics(events)?;
 
     // Calculate partition bounds
     let partition_values = compute_partition_bounds(events)?;
@@ -224,12 +228,13 @@ pub fn write_parquet<P: AsRef<Path>>(
     Ok(ParquetFileMetadata {
         path: path.to_string_lossy().to_string(),
         row_count: events.len(),
-        min_sequence,
-        max_sequence,
-        min_timestamp_ms: min_timestamp,
-        max_timestamp_ms: max_timestamp,
+        min_sequence: column_stats.sequence_min,
+        max_sequence: column_stats.sequence_max,
+        min_timestamp_ms: column_stats.timestamp_min,
+        max_timestamp_ms: column_stats.timestamp_max,
         file_size_bytes: file_size,
         partition_values,
+        column_stats,
     })
 }
 
@@ -275,6 +280,92 @@ fn compute_partition_bounds(events: &[StoredEvent]) -> Result<PartitionValues, S
     })
 }
 
+/// Computes column statistics for all indexed columns.
+/// These statistics are used for Iceberg DataFile lower_bounds/upper_bounds.
+fn compute_column_statistics(events: &[StoredEvent]) -> Result<ColumnStatistics, StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot compute column statistics for empty events".into(),
+        ));
+    }
+
+    // Sequence bounds (field 1)
+    let sequence_min = events
+        .iter()
+        .map(|e| e.sequence)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let sequence_max = events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+
+    // Partition bounds (field 3)
+    let partition_min = events
+        .iter()
+        .map(|e| e.partition)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let partition_max = events
+        .iter()
+        .map(|e| e.partition)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+
+    // Timestamp bounds (field 5)
+    let timestamp_min = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let timestamp_max = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+
+    // Derive partition column bounds from timestamps
+    let partition_cols: Vec<(i32, i32)> = events
+        .iter()
+        .map(|e| derive_partition_columns(e.timestamp_ms))
+        .collect();
+
+    let event_date_min = partition_cols
+        .iter()
+        .map(|(d, _)| *d)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let event_date_max = partition_cols
+        .iter()
+        .map(|(d, _)| *d)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let event_hour_min = partition_cols
+        .iter()
+        .map(|(_, h)| *h)
+        .min()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+    let event_hour_max = partition_cols
+        .iter()
+        .map(|(_, h)| *h)
+        .max()
+        .ok_or_else(|| StorageError::InvalidInput("Empty partition columns".into()))?;
+
+    Ok(ColumnStatistics {
+        sequence_min,
+        sequence_max,
+        partition_min,
+        partition_max,
+        timestamp_min,
+        timestamp_max,
+        event_date_min,
+        event_date_max,
+        event_hour_min,
+        event_hour_max,
+    })
+}
+
 /// Writes events to a Parquet file in memory and returns bytes.
 /// Useful for S3 uploads.
 pub fn write_parquet_to_bytes(
@@ -306,26 +397,7 @@ pub fn write_parquet_to_bytes(
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     // Calculate statistics - events is guaranteed non-empty (checked at function start)
-    let min_sequence = events
-        .iter()
-        .map(|e| e.sequence)
-        .min()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let max_sequence = events
-        .iter()
-        .map(|e| e.sequence)
-        .max()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let min_timestamp = events
-        .iter()
-        .map(|e| e.timestamp_ms)
-        .min()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
-    let max_timestamp = events
-        .iter()
-        .map(|e| e.timestamp_ms)
-        .max()
-        .ok_or_else(|| StorageError::InvalidInput("Empty events slice".into()))?;
+    let column_stats = compute_column_statistics(events)?;
 
     // Calculate partition bounds
     let partition_values = compute_partition_bounds(events)?;
@@ -333,12 +405,13 @@ pub fn write_parquet_to_bytes(
     let metadata = ParquetFileMetadata {
         path: String::new(), // No path for in-memory
         row_count: events.len(),
-        min_sequence,
-        max_sequence,
-        min_timestamp_ms: min_timestamp,
-        max_timestamp_ms: max_timestamp,
+        min_sequence: column_stats.sequence_min,
+        max_sequence: column_stats.sequence_max,
+        min_timestamp_ms: column_stats.timestamp_min,
+        max_timestamp_ms: column_stats.timestamp_max,
         file_size_bytes: buffer.len() as u64,
         partition_values,
+        column_stats,
     };
 
     Ok((buffer, metadata))
