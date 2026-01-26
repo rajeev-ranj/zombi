@@ -320,7 +320,8 @@ impl ColdStorage for IcebergStorage {
         // Convert events to Parquet with sorting for optimized queries
         // Clone events since we need to sort them
         let mut events_to_write = events.to_vec();
-        let (parquet_bytes, parquet_metadata) = write_parquet_to_bytes_sorted(&mut events_to_write)?;
+        let (parquet_bytes, parquet_metadata) =
+            write_parquet_to_bytes_sorted(&mut events_to_write)?;
 
         // Generate data file name and key
         let filename = data_file_name();
