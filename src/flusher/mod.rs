@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Notify;
@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use crate::contracts::{
     ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError,
 };
+use crate::metrics::{FlushMetrics, IcebergMetrics};
 
 /// Configuration for the background flusher.
 #[derive(Debug, Clone)]
@@ -101,6 +102,10 @@ where
     task_handle: RwLock<Option<JoinHandle<()>>>,
     /// Topics/partitions to monitor
     topics: Arc<RwLock<Vec<(String, u32)>>>,
+    /// Flush metrics
+    flush_metrics: Arc<FlushMetrics>,
+    /// Iceberg metrics
+    iceberg_metrics: Arc<IcebergMetrics>,
 }
 
 impl<H, C> BackgroundFlusher<H, C>
@@ -109,7 +114,13 @@ where
     C: ColdStorage + 'static,
 {
     /// Creates a new background flusher.
-    pub fn new(hot_storage: Arc<H>, cold_storage: Arc<C>, config: FlusherConfig) -> Self {
+    pub fn new(
+        hot_storage: Arc<H>,
+        cold_storage: Arc<C>,
+        config: FlusherConfig,
+        flush_metrics: Arc<FlushMetrics>,
+        iceberg_metrics: Arc<IcebergMetrics>,
+    ) -> Self {
         Self {
             hot_storage,
             cold_storage,
@@ -119,6 +130,8 @@ where
             flush_notify: Arc::new(Notify::new()),
             task_handle: RwLock::new(None),
             topics: Arc::new(RwLock::new(Vec::new())),
+            flush_metrics,
+            iceberg_metrics,
         }
     }
 
@@ -156,6 +169,8 @@ where
     ///
     /// When `iceberg_enabled` is true, uses `target_file_size_bytes` to limit
     /// the segment size instead of event count alone.
+    ///
+    /// Returns (events_flushed, new_watermark, bytes_flushed) on success.
     #[allow(clippy::too_many_arguments)]
     async fn flush_partition(
         hot_storage: &H,
@@ -166,18 +181,18 @@ where
         max_segment_size: usize,
         iceberg_enabled: bool,
         target_file_size_bytes: usize,
-    ) -> Result<(usize, u64), StorageError> {
+    ) -> Result<(usize, u64, usize), StorageError> {
         let high_watermark = hot_storage.high_watermark(topic, partition)?;
 
         if high_watermark <= watermark {
-            return Ok((0, watermark)); // Nothing to flush
+            return Ok((0, watermark, 0)); // Nothing to flush
         }
 
         // Read events from hot storage
         let all_events = hot_storage.read(topic, partition, watermark + 1, max_segment_size)?;
 
         if all_events.is_empty() {
-            return Ok((0, watermark));
+            return Ok((0, watermark, 0));
         }
 
         // When Iceberg is enabled, use size-based batching
@@ -212,11 +227,14 @@ where
         };
 
         if events.is_empty() {
-            return Ok((0, watermark));
+            return Ok((0, watermark, 0));
         }
 
         let events_count = events.len();
         let new_watermark = events.last().map(|e| e.sequence).unwrap_or(watermark);
+
+        // Calculate bytes flushed (payload + metadata overhead)
+        let bytes_flushed: usize = events.iter().map(|e| e.payload.len() + 64).sum();
 
         // Write to cold storage
         cold_storage
@@ -227,12 +245,13 @@ where
             topic = topic,
             partition = partition,
             events = events_count,
+            bytes = bytes_flushed,
             new_watermark = new_watermark,
             iceberg_enabled = iceberg_enabled,
             "Flushed events to cold storage"
         );
 
-        Ok((events_count, new_watermark))
+        Ok((events_count, new_watermark, bytes_flushed))
     }
 }
 
@@ -257,6 +276,8 @@ where
         let snapshot_threshold_files = self.config.snapshot_threshold_files;
         let snapshot_threshold_bytes = self.config.snapshot_threshold_bytes;
         let max_concurrent_uploads = self.config.max_concurrent_s3_uploads;
+        let flush_metrics = Arc::clone(&self.flush_metrics);
+        let iceberg_metrics = Arc::clone(&self.iceberg_metrics);
 
         let handle = tokio::spawn(async move {
             tracing::info!(
@@ -307,8 +328,9 @@ where
                     let cold = Arc::clone(&cold_storage);
                     let topic_clone = topic.clone();
 
-                    // Create the flush future
+                    // Create the flush future with timing
                     flush_futures.push(async move {
+                        let start = Instant::now();
                         let result = Self::flush_partition(
                             &hot,
                             &cold,
@@ -320,15 +342,24 @@ where
                             target_file_size_bytes,
                         )
                         .await;
-                        (topic_clone, partition, result)
+                        let duration_us = start.elapsed().as_micros() as u64;
+                        (topic_clone, partition, result, duration_us)
                     });
 
                     // If we've reached max concurrency, wait for one to complete
                     if flush_futures.len() >= max_concurrent_uploads {
-                        if let Some((topic, partition, result)) = flush_futures.next().await {
+                        if let Some((topic, partition, result, duration_us)) = flush_futures.next().await {
                             match result {
-                                Ok((count, new_watermark)) => {
+                                Ok((count, new_watermark, bytes)) => {
                                     if count > 0 {
+                                        // Record flush metrics
+                                        flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+
+                                        // Record Iceberg metrics if enabled
+                                        if iceberg_enabled {
+                                            iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                                        }
+
                                         if let Ok(mut w) = watermarks.write() {
                                             w.insert((topic.clone(), partition), new_watermark);
                                         }
@@ -336,6 +367,8 @@ where
                                     }
                                 }
                                 Err(e) => {
+                                    // Record S3 error
+                                    iceberg_metrics.record_s3_error();
                                     tracing::error!(
                                         topic = %topic,
                                         partition = partition,
@@ -349,10 +382,18 @@ where
                 }
 
                 // Drain remaining futures
-                while let Some((topic, partition, result)) = flush_futures.next().await {
+                while let Some((topic, partition, result, duration_us)) = flush_futures.next().await {
                     match result {
-                        Ok((count, new_watermark)) => {
+                        Ok((count, new_watermark, bytes)) => {
                             if count > 0 {
+                                // Record flush metrics
+                                flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+
+                                // Record Iceberg metrics if enabled
+                                if iceberg_enabled {
+                                    iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                                }
+
                                 if let Ok(mut w) = watermarks.write() {
                                     w.insert((topic.clone(), partition), new_watermark);
                                 }
@@ -360,6 +401,8 @@ where
                             }
                         }
                         Err(e) => {
+                            // Record S3 error
+                            iceberg_metrics.record_s3_error();
                             tracing::error!(
                                 topic = %topic,
                                 partition = partition,
@@ -391,6 +434,8 @@ where
 
                             match cold_storage.commit_snapshot(&topic).await {
                                 Ok(Some(snapshot_id)) => {
+                                    // Record snapshot commit metric
+                                    iceberg_metrics.record_snapshot_commit(&topic);
                                     tracing::info!(
                                         topic = %topic,
                                         snapshot_id = snapshot_id,
@@ -406,6 +451,7 @@ where
                                     );
                                 }
                                 Err(e) => {
+                                    iceberg_metrics.record_s3_error();
                                     tracing::error!(
                                         topic = %topic,
                                         error = %e,
@@ -471,7 +517,8 @@ where
                 .copied()
                 .unwrap_or(0);
 
-            let (count, new_watermark) = Self::flush_partition(
+            let start = Instant::now();
+            let (count, new_watermark, bytes) = Self::flush_partition(
                 &self.hot_storage,
                 &self.cold_storage,
                 &topic,
@@ -482,8 +529,17 @@ where
                 self.config.target_file_size_bytes,
             )
             .await?;
+            let duration_us = start.elapsed().as_micros() as u64;
 
             if count > 0 {
+                // Record flush metrics
+                self.flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+
+                // Record Iceberg metrics if enabled
+                if self.config.iceberg_enabled {
+                    self.iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                }
+
                 total_events += count;
                 total_segments += 1;
                 flushed_topics.insert(topic.clone());
@@ -506,6 +562,8 @@ where
                 if stats.file_count > 0 {
                     match self.cold_storage.commit_snapshot(&topic).await {
                         Ok(Some(snapshot_id)) => {
+                            // Record snapshot commit metric
+                            self.iceberg_metrics.record_snapshot_commit(&topic);
                             tracing::info!(
                                 topic = %topic,
                                 snapshot_id = snapshot_id,
@@ -516,6 +574,7 @@ where
                         }
                         Ok(None) => {}
                         Err(e) => {
+                            self.iceberg_metrics.record_s3_error();
                             tracing::error!(
                                 topic = %topic,
                                 error = %e,
@@ -796,8 +855,15 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let flusher =
-            BackgroundFlusher::new(Arc::new(hot), Arc::clone(&cold), FlusherConfig::default());
+        let flush_metrics = Arc::new(FlushMetrics::default());
+        let iceberg_metrics = Arc::new(IcebergMetrics::default());
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            FlusherConfig::default(),
+            flush_metrics,
+            iceberg_metrics,
+        );
 
         let result = flusher.flush_now().await.unwrap();
         assert_eq!(result.events_flushed, 2);
