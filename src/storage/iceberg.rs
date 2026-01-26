@@ -644,21 +644,37 @@ mod tests {
         assert_eq!(data_file.file_size_in_bytes, 50000);
 
         // Verify column statistics are now populated
-        let lower = data_file.lower_bounds.expect("lower_bounds should be populated");
-        let upper = data_file.upper_bounds.expect("upper_bounds should be populated");
+        let lower = data_file
+            .lower_bounds
+            .expect("lower_bounds should be populated");
+        let upper = data_file
+            .upper_bounds
+            .expect("upper_bounds should be populated");
 
         // Verify all fields are present
         assert!(lower.contains_key(&1), "sequence lower bound should exist");
         assert!(lower.contains_key(&3), "partition lower bound should exist");
         assert!(lower.contains_key(&5), "timestamp lower bound should exist");
-        assert!(lower.contains_key(&7), "event_date lower bound should exist");
-        assert!(lower.contains_key(&8), "event_hour lower bound should exist");
+        assert!(
+            lower.contains_key(&7),
+            "event_date lower bound should exist"
+        );
+        assert!(
+            lower.contains_key(&8),
+            "event_hour lower bound should exist"
+        );
 
         assert!(upper.contains_key(&1), "sequence upper bound should exist");
         assert!(upper.contains_key(&3), "partition upper bound should exist");
         assert!(upper.contains_key(&5), "timestamp upper bound should exist");
-        assert!(upper.contains_key(&7), "event_date upper bound should exist");
-        assert!(upper.contains_key(&8), "event_hour upper bound should exist");
+        assert!(
+            upper.contains_key(&7),
+            "event_date upper bound should exist"
+        );
+        assert!(
+            upper.contains_key(&8),
+            "event_hour upper bound should exist"
+        );
     }
 
     #[test]
