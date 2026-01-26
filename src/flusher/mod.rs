@@ -348,16 +348,23 @@ where
 
                     // If we've reached max concurrency, wait for one to complete
                     if flush_futures.len() >= max_concurrent_uploads {
-                        if let Some((topic, partition, result, duration_us)) = flush_futures.next().await {
+                        if let Some((topic, partition, result, duration_us)) =
+                            flush_futures.next().await
+                        {
                             match result {
                                 Ok((count, new_watermark, bytes)) => {
                                     if count > 0 {
                                         // Record flush metrics
-                                        flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+                                        flush_metrics.record_flush(
+                                            count as u64,
+                                            bytes as u64,
+                                            duration_us,
+                                        );
 
                                         // Record Iceberg metrics if enabled
                                         if iceberg_enabled {
-                                            iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                                            iceberg_metrics
+                                                .record_parquet_write(&topic, bytes as u64);
                                         }
 
                                         if let Ok(mut w) = watermarks.write() {
@@ -382,7 +389,8 @@ where
                 }
 
                 // Drain remaining futures
-                while let Some((topic, partition, result, duration_us)) = flush_futures.next().await {
+                while let Some((topic, partition, result, duration_us)) = flush_futures.next().await
+                {
                     match result {
                         Ok((count, new_watermark, bytes)) => {
                             if count > 0 {
@@ -533,11 +541,13 @@ where
 
             if count > 0 {
                 // Record flush metrics
-                self.flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+                self.flush_metrics
+                    .record_flush(count as u64, bytes as u64, duration_us);
 
                 // Record Iceberg metrics if enabled
                 if self.config.iceberg_enabled {
-                    self.iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                    self.iceberg_metrics
+                        .record_parquet_write(&topic, bytes as u64);
                 }
 
                 total_events += count;

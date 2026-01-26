@@ -130,7 +130,11 @@ impl Histogram {
 
         // Output bucket counts (cumulative)
         for (i, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
-            let _ = writeln!(output, "{}_bucket{{le=\"{}\"}} {}", name, boundary, buckets[i]);
+            let _ = writeln!(
+                output,
+                "{}_bucket{{le=\"{}\"}} {}",
+                name, boundary, buckets[i]
+            );
         }
 
         // +Inf bucket (total count - all observations fall into this)

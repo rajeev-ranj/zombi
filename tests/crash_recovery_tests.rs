@@ -819,14 +819,13 @@ async fn flushed_events_readable_after_restart() {
 
         // Flush to cold storage using the flusher
         let config = FlusherConfig::default();
-        let flusher =
-            BackgroundFlusher::new(
-                Arc::clone(&hot_storage),
-                Arc::clone(&cold_storage),
-                config,
-                Arc::new(FlushMetrics::default()),
-                Arc::new(IcebergMetrics::default()),
-            );
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot_storage),
+            Arc::clone(&cold_storage),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
 
         let result = flusher.flush_now().await.expect("flush should succeed");
         assert_eq!(
@@ -905,14 +904,13 @@ async fn mixed_hot_cold_recovery() {
 
         // Flush first batch to cold storage
         let config = FlusherConfig::default();
-        let flusher =
-            BackgroundFlusher::new(
-                Arc::clone(&hot_storage),
-                Arc::clone(&cold_storage),
-                config,
-                Arc::new(FlushMetrics::default()),
-                Arc::new(IcebergMetrics::default()),
-            );
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot_storage),
+            Arc::clone(&cold_storage),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
 
         let result = flusher.flush_now().await.expect("flush should succeed");
         assert_eq!(result.events_flushed, flushed_count);
@@ -1002,14 +1000,13 @@ async fn flush_watermark_starts_at_zero_after_restart() {
         }
 
         let config = FlusherConfig::default();
-        let flusher =
-            BackgroundFlusher::new(
-                Arc::clone(&hot_storage),
-                Arc::clone(&cold_storage),
-                config,
-                Arc::new(FlushMetrics::default()),
-                Arc::new(IcebergMetrics::default()),
-            );
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot_storage),
+            Arc::clone(&cold_storage),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
 
         let result = flusher.flush_now().await.expect("flush should succeed");
         assert_eq!(result.events_flushed, events_count);
@@ -1033,14 +1030,13 @@ async fn flush_watermark_starts_at_zero_after_restart() {
         let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
 
         let config = FlusherConfig::default();
-        let flusher =
-            BackgroundFlusher::new(
-                Arc::clone(&hot_storage),
-                Arc::clone(&cold_storage),
-                config,
-                Arc::new(FlushMetrics::default()),
-                Arc::new(IcebergMetrics::default()),
-            );
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot_storage),
+            Arc::clone(&cold_storage),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
 
         let watermark_after = flusher
             .flush_watermark("test-topic", 0)

@@ -86,6 +86,12 @@ local/
 tmp/
 *.local
 
+# Load test results
+results/
+
+# Research/draft docs
+docs/spectre/
+
 # Logs and debug
 debug/
 *.debug

@@ -389,7 +389,10 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
         state.metrics.record_error();
-        state.metrics_registry.enhanced_api.record_backpressure_rejection();
+        state
+            .metrics_registry
+            .enhanced_api
+            .record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -461,10 +464,19 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     state.metrics.record_write(body_len, latency_us);
 
     // Record enhanced metrics
-    state.metrics_registry.enhanced_api.record_write(&table, latency_us);
-    state.metrics_registry.consumer.update_high_watermark(&table, partition, offset);
+    state
+        .metrics_registry
+        .enhanced_api
+        .record_write(&table, latency_us);
+    state
+        .metrics_registry
+        .consumer
+        .update_high_watermark(&table, partition, offset);
     if let Ok(lwm) = state.storage.low_watermark(&table, partition) {
-        state.metrics_registry.hot.update(&table, partition, lwm, offset);
+        state
+            .metrics_registry
+            .hot
+            .update(&table, partition, lwm, offset);
     }
 
     Ok((
@@ -516,7 +528,10 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(total_bytes).map_err(|e| {
         state.metrics.record_error();
-        state.metrics_registry.enhanced_api.record_backpressure_rejection();
+        state
+            .metrics_registry
+            .enhanced_api
+            .record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -648,7 +663,10 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     state.metrics.record_read(count as u64, latency_us);
 
     // Record enhanced metrics
-    state.metrics_registry.enhanced_api.record_read(&table, latency_us);
+    state
+        .metrics_registry
+        .enhanced_api
+        .record_read(&table, latency_us);
 
     Ok(Json(ReadRecordsResponse {
         records,
