@@ -269,18 +269,19 @@ impl SortOrder {
     /// - Provides deterministic ordering within same timestamp
     /// - Enables better column statistics per file
     pub fn timestamp_sequence() -> Self {
+        use crate::storage::iceberg::field_ids;
         Self {
             order_id: 1,
             fields: vec![
                 SortField {
                     transform: "identity".into(),
-                    source_id: 5, // timestamp_ms
+                    source_id: field_ids::TIMESTAMP_MS,
                     direction: "asc".into(),
                     null_order: "nulls-last".into(),
                 },
                 SortField {
                     transform: "identity".into(),
-                    source_id: 1, // sequence
+                    source_id: field_ids::SEQUENCE,
                     direction: "asc".into(),
                     null_order: "nulls-last".into(),
                 },
