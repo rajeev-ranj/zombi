@@ -115,19 +115,34 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 
 ### Schema
 ```
-┌─────────────────┬──────────┬──────────┐
-│ Field           │ Type     │ Required │
-├─────────────────┼──────────┼──────────┤
-│ sequence        │ long     │ yes      │
-│ topic           │ string   │ yes      │
-│ partition       │ int      │ yes      │
-│ payload         │ binary   │ yes      │
-│ timestamp_ms    │ long     │ yes      │
-│ idempotency_key │ string   │ no       │
-│ event_date      │ date     │ yes      │  ← partition column
-│ event_hour      │ int      │ yes      │  ← partition column
-└─────────────────┴──────────┴──────────┘
+┌─────────────────┬──────────┬──────────┬──────────┐
+│ Field           │ Type     │ Field ID │ Required │
+├─────────────────┼──────────┼──────────┼──────────┤
+│ sequence        │ long     │ 1        │ yes      │
+│ topic           │ string   │ 2        │ yes      │
+│ partition       │ int      │ 3        │ yes      │
+│ payload         │ binary   │ 4        │ yes      │
+│ timestamp_ms    │ long     │ 5        │ yes      │
+│ idempotency_key │ string   │ 6        │ no       │
+│ event_date      │ date     │ 7        │ yes      │  ← partition column
+│ event_hour      │ int      │ 8        │ yes      │  ← partition column
+└─────────────────┴──────────┴──────────┴──────────┘
 ```
+
+### Sort Order
+Data is sorted within each Parquet file by `timestamp_ms ASC, sequence ASC`. This:
+- Improves data locality for time-range queries
+- Produces tighter min/max column statistics per file
+- Enables better compression ratios for time-series data
+
+### Column Statistics
+Each DataFile in Iceberg manifests includes `lower_bounds` and `upper_bounds` for indexed columns:
+- `sequence` - enables offset-based file pruning
+- `partition` - enables partition-aware queries
+- `timestamp_ms` - enables time-range file pruning
+- `event_date`, `event_hour` - enables partition pruning
+
+Query engines (Spark, Trino, DuckDB) use these statistics to skip files that cannot contain matching rows, significantly improving query performance for selective time-range queries.
 
 ### Directory Layout
 ```

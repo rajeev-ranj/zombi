@@ -23,6 +23,16 @@ All notable changes to Zombi are documented here.
   - Prometheus scrape configuration
   - Grafana provisioning with data source and dashboard
 
+- **Sorted Writes** - Events sorted by `timestamp_ms ASC, sequence ASC` before writing to Parquet
+  - Improves data locality for time-range queries
+  - Produces tighter column statistics per file
+  - Enables better compression ratios
+  - Sort order metadata included in Iceberg table metadata
+
+- **Column Statistics** - Iceberg `lower_bounds`/`upper_bounds` populated in DataFile manifests
+  - Enables query engines (Spark, Trino, DuckDB) to skip files during planning
+  - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
+
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 

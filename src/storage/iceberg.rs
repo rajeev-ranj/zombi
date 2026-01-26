@@ -6,6 +6,66 @@ use uuid::Uuid;
 use crate::contracts::StorageError;
 use crate::storage::ParquetFileMetadata;
 
+/// Iceberg schema field IDs.
+/// These must match the field IDs in the schema definition and remain stable
+/// across schema evolution. Used for column statistics (lower/upper bounds).
+#[allow(dead_code)]
+pub mod field_ids {
+    /// sequence (long) - monotonically increasing event ID
+    pub const SEQUENCE: i32 = 1;
+    /// topic (string) - event topic/table name
+    pub const TOPIC: i32 = 2;
+    /// partition (int) - partition number
+    pub const PARTITION: i32 = 3;
+    /// payload (binary) - event payload
+    pub const PAYLOAD: i32 = 4;
+    /// timestamp_ms (long) - event timestamp in milliseconds
+    pub const TIMESTAMP_MS: i32 = 5;
+    /// idempotency_key (string, optional) - deduplication key
+    pub const IDEMPOTENCY_KEY: i32 = 6;
+    /// event_date (date) - partition column, days since epoch
+    pub const EVENT_DATE: i32 = 7;
+    /// event_hour (int) - partition column, hour of day (0-23)
+    pub const EVENT_HOUR: i32 = 8;
+}
+
+/// Iceberg binary encoding utilities for column statistics.
+/// Iceberg uses big-endian encoding for all numeric types in lower_bounds/upper_bounds.
+pub mod iceberg_encoding {
+    /// Encodes an i64 (long) to big-endian bytes for Iceberg.
+    pub fn encode_long(value: i64) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    /// Encodes a u64 as i64 (long) to big-endian bytes for Iceberg.
+    ///
+    /// # Note
+    /// Iceberg uses signed long for all integer types. Values greater than
+    /// `i64::MAX` (9,223,372,036,854,775,807) will wrap to negative values
+    /// due to two's complement representation. For Zombi sequence numbers,
+    /// this limit is unlikely to be reached in practice (would require ~292
+    /// years at 1 billion events/second).
+    pub fn encode_u64_as_long(value: u64) -> Vec<u8> {
+        (value as i64).to_be_bytes().to_vec()
+    }
+
+    /// Encodes an i32 (int) to big-endian bytes for Iceberg.
+    pub fn encode_int(value: i32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    /// Encodes a u32 as i32 (int) to big-endian bytes for Iceberg.
+    pub fn encode_u32_as_int(value: u32) -> Vec<u8> {
+        (value as i32).to_be_bytes().to_vec()
+    }
+
+    /// Encodes a date (days since epoch) to big-endian bytes for Iceberg.
+    /// Iceberg date type is stored as i32 days since 1970-01-01.
+    pub fn encode_date(days_since_epoch: i32) -> Vec<u8> {
+        encode_int(days_since_epoch)
+    }
+}
+
 /// Iceberg table location on S3.
 #[derive(Debug, Clone)]
 pub struct IcebergTableConfig {
@@ -170,13 +230,64 @@ impl PartitionSpec {
     }
 }
 
-/// Sort order (unsorted for append-only).
+/// Iceberg sort field definition per the Iceberg spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortField {
+    /// Transform applied before sorting (identity, bucket, truncate, etc.)
+    pub transform: String,
+    /// Source field ID from schema
+    #[serde(rename = "source-id")]
+    pub source_id: i32,
+    /// Sort direction (asc or desc)
+    pub direction: String,
+    /// Null ordering (nulls-first or nulls-last)
+    #[serde(rename = "null-order")]
+    pub null_order: String,
+}
+
+/// Sort order defining how data is sorted within files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SortOrder {
     #[serde(rename = "order-id")]
     pub order_id: i32,
     #[serde(default)]
-    pub fields: Vec<serde_json::Value>,
+    pub fields: Vec<SortField>,
+}
+
+impl SortOrder {
+    /// Creates an unsorted (empty) sort order.
+    pub fn unsorted() -> Self {
+        Self {
+            order_id: 0,
+            fields: vec![],
+        }
+    }
+
+    /// Creates a sort order by timestamp_ms ASC, sequence ASC.
+    /// This is the recommended sort order for Zombi events as it:
+    /// - Optimizes time-range queries (most common pattern)
+    /// - Provides deterministic ordering within same timestamp
+    /// - Enables better column statistics per file
+    pub fn timestamp_sequence() -> Self {
+        use crate::storage::iceberg::field_ids;
+        Self {
+            order_id: 1,
+            fields: vec![
+                SortField {
+                    transform: "identity".into(),
+                    source_id: field_ids::TIMESTAMP_MS,
+                    direction: "asc".into(),
+                    null_order: "nulls-last".into(),
+                },
+                SortField {
+                    transform: "identity".into(),
+                    source_id: field_ids::SEQUENCE,
+                    direction: "asc".into(),
+                    null_order: "nulls-last".into(),
+                },
+            ],
+        }
+    }
 }
 
 /// Iceberg snapshot.
@@ -260,6 +371,7 @@ pub struct SnapshotLogEntry {
 
 impl TableMetadata {
     /// Creates new table metadata for a Zombi topic.
+    /// Uses timestamp_sequence sort order by default for optimized time-range queries.
     pub fn new(location: &str) -> Self {
         Self {
             format_version: 2,
@@ -277,8 +389,10 @@ impl TableMetadata {
             current_snapshot_id: None,
             snapshots: vec![],
             snapshot_log: vec![],
-            sort_orders: vec![SortOrder::default()],
-            default_sort_order_id: 0,
+            // Provide both unsorted (0) and timestamp_sequence (1) sort orders
+            // Default to timestamp_sequence for optimized queries
+            sort_orders: vec![SortOrder::unsorted(), SortOrder::timestamp_sequence()],
+            default_sort_order_id: 1, // Use timestamp_sequence by default
         }
     }
 
@@ -361,7 +475,65 @@ pub struct DataFile {
 
 impl DataFile {
     /// Creates a DataFile from ParquetFileMetadata.
+    /// Populates column statistics (lower/upper bounds) from Parquet metadata.
+    /// Field IDs are defined in the `field_ids` module.
     pub fn from_parquet_metadata(metadata: &ParquetFileMetadata, s3_path: &str) -> Self {
+        use crate::storage::iceberg::field_ids;
+        use iceberg_encoding::*;
+
+        let mut lower_bounds = HashMap::new();
+        let mut upper_bounds = HashMap::new();
+
+        // sequence (long)
+        lower_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_min),
+        );
+        upper_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_max),
+        );
+
+        // partition (int)
+        lower_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_min),
+        );
+        upper_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_max),
+        );
+
+        // timestamp_ms (long)
+        lower_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_min),
+        );
+        upper_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_max),
+        );
+
+        // event_date (date - days since epoch)
+        lower_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_max),
+        );
+
+        // event_hour (int)
+        lower_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_max),
+        );
+
         Self {
             content: 0, // Data file
             file_path: s3_path.to_string(),
@@ -371,8 +543,8 @@ impl DataFile {
             column_sizes: None,
             value_counts: None,
             null_value_counts: None,
-            lower_bounds: None,
-            upper_bounds: None,
+            lower_bounds: Some(lower_bounds),
+            upper_bounds: Some(upper_bounds),
             split_offsets: None,
         }
     }
@@ -427,7 +599,7 @@ pub fn generate_snapshot_id() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_nanos();
     (now & 0x7FFFFFFFFFFFFFFF) as i64
 }
@@ -437,7 +609,7 @@ pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap() // SAFETY: SystemTime::now() is always after UNIX_EPOCH
         .as_millis() as i64
 }
 
@@ -543,7 +715,20 @@ mod tests {
 
     #[test]
     fn test_data_file_from_parquet_metadata() {
-        use crate::storage::parquet::PartitionValues;
+        use crate::storage::parquet::{ColumnStatistics, PartitionValues};
+
+        let column_stats = ColumnStatistics {
+            sequence_min: 1,
+            sequence_max: 1000,
+            partition_min: 0,
+            partition_max: 5,
+            timestamp_min: 100,
+            timestamp_max: 200,
+            event_date_min: 19737,
+            event_date_max: 19737,
+            event_hour_min: 10,
+            event_hour_max: 14,
+        };
 
         let parquet_meta = ParquetFileMetadata {
             path: "/tmp/test.parquet".into(),
@@ -554,6 +739,7 @@ mod tests {
             max_timestamp_ms: 200,
             file_size_bytes: 50000,
             partition_values: PartitionValues::default(),
+            column_stats,
         };
 
         let data_file =
@@ -564,6 +750,138 @@ mod tests {
         assert_eq!(data_file.file_format, "PARQUET");
         assert_eq!(data_file.record_count, 1000);
         assert_eq!(data_file.file_size_in_bytes, 50000);
+
+        // Verify column statistics are now populated
+        let lower = data_file
+            .lower_bounds
+            .expect("lower_bounds should be populated");
+        let upper = data_file
+            .upper_bounds
+            .expect("upper_bounds should be populated");
+
+        // Verify all fields are present
+        assert!(lower.contains_key(&1), "sequence lower bound should exist");
+        assert!(lower.contains_key(&3), "partition lower bound should exist");
+        assert!(lower.contains_key(&5), "timestamp lower bound should exist");
+        assert!(
+            lower.contains_key(&7),
+            "event_date lower bound should exist"
+        );
+        assert!(
+            lower.contains_key(&8),
+            "event_hour lower bound should exist"
+        );
+
+        assert!(upper.contains_key(&1), "sequence upper bound should exist");
+        assert!(upper.contains_key(&3), "partition upper bound should exist");
+        assert!(upper.contains_key(&5), "timestamp upper bound should exist");
+        assert!(
+            upper.contains_key(&7),
+            "event_date upper bound should exist"
+        );
+        assert!(
+            upper.contains_key(&8),
+            "event_hour upper bound should exist"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_encoding_long() {
+        // Test encoding i64 as big-endian bytes
+        let encoded = iceberg_encoding::encode_long(1705276800000_i64);
+        assert_eq!(encoded.len(), 8);
+        // Verify big-endian by checking first byte is most significant
+        let decoded = i64::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 1705276800000_i64);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_u64_as_long() {
+        let encoded = iceberg_encoding::encode_u64_as_long(12345_u64);
+        assert_eq!(encoded.len(), 8);
+        let decoded = i64::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 12345_i64);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_int() {
+        let encoded = iceberg_encoding::encode_int(19737_i32);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 19737_i32);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_u32_as_int() {
+        let encoded = iceberg_encoding::encode_u32_as_int(100_u32);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 100_i32);
+    }
+
+    #[test]
+    fn test_iceberg_encoding_date() {
+        // 2024-01-15 is day 19737 since epoch
+        let encoded = iceberg_encoding::encode_date(19737);
+        assert_eq!(encoded.len(), 4);
+        let decoded = i32::from_be_bytes(encoded.try_into().unwrap());
+        assert_eq!(decoded, 19737);
+    }
+
+    #[test]
+    fn test_data_file_bounds_encoding() {
+        use crate::storage::parquet::{ColumnStatistics, PartitionValues};
+
+        let column_stats = ColumnStatistics {
+            sequence_min: 100,
+            sequence_max: 200,
+            partition_min: 0,
+            partition_max: 5,
+            timestamp_min: 1705276800000,
+            timestamp_max: 1705363200000,
+            event_date_min: 19737,
+            event_date_max: 19738,
+            event_hour_min: 0,
+            event_hour_max: 23,
+        };
+
+        let parquet_meta = ParquetFileMetadata {
+            path: "/tmp/test.parquet".into(),
+            row_count: 100,
+            min_sequence: 100,
+            max_sequence: 200,
+            min_timestamp_ms: 1705276800000,
+            max_timestamp_ms: 1705363200000,
+            file_size_bytes: 10000,
+            partition_values: PartitionValues::default(),
+            column_stats,
+        };
+
+        let data_file = DataFile::from_parquet_metadata(&parquet_meta, "s3://test/file.parquet");
+
+        let lower = data_file.lower_bounds.unwrap();
+        let upper = data_file.upper_bounds.unwrap();
+
+        // Verify sequence encoding (field 1)
+        let seq_min_bytes: [u8; 8] = lower.get(&1).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(seq_min_bytes), 100);
+
+        let seq_max_bytes: [u8; 8] = upper.get(&1).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(seq_max_bytes), 200);
+
+        // Verify timestamp encoding (field 5)
+        let ts_min_bytes: [u8; 8] = lower.get(&5).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(ts_min_bytes), 1705276800000);
+
+        let ts_max_bytes: [u8; 8] = upper.get(&5).unwrap().clone().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(ts_max_bytes), 1705363200000);
+
+        // Verify event_date encoding (field 7)
+        let date_min_bytes: [u8; 4] = lower.get(&7).unwrap().clone().try_into().unwrap();
+        assert_eq!(i32::from_be_bytes(date_min_bytes), 19737);
+
+        let date_max_bytes: [u8; 4] = upper.get(&7).unwrap().clone().try_into().unwrap();
+        assert_eq!(i32::from_be_bytes(date_max_bytes), 19738);
     }
 
     #[test]
@@ -577,5 +895,70 @@ mod tests {
         assert_eq!(config.table_prefix(), "tables/events");
         assert_eq!(config.metadata_path(), "tables/events/metadata");
         assert_eq!(config.data_path(), "tables/events/data");
+    }
+
+    #[test]
+    fn test_sort_order_unsorted() {
+        let sort_order = SortOrder::unsorted();
+
+        assert_eq!(sort_order.order_id, 0);
+        assert!(sort_order.fields.is_empty());
+    }
+
+    #[test]
+    fn test_sort_order_timestamp_sequence() {
+        let sort_order = SortOrder::timestamp_sequence();
+
+        assert_eq!(sort_order.order_id, 1);
+        assert_eq!(sort_order.fields.len(), 2);
+
+        // First field: timestamp_ms (source-id 5)
+        let first = &sort_order.fields[0];
+        assert_eq!(first.source_id, 5);
+        assert_eq!(first.transform, "identity");
+        assert_eq!(first.direction, "asc");
+        assert_eq!(first.null_order, "nulls-last");
+
+        // Second field: sequence (source-id 1)
+        let second = &sort_order.fields[1];
+        assert_eq!(second.source_id, 1);
+        assert_eq!(second.transform, "identity");
+        assert_eq!(second.direction, "asc");
+        assert_eq!(second.null_order, "nulls-last");
+    }
+
+    #[test]
+    fn test_table_metadata_uses_timestamp_sequence_sort() {
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        // Should have two sort orders: unsorted (0) and timestamp_sequence (1)
+        assert_eq!(metadata.sort_orders.len(), 2);
+        assert_eq!(metadata.sort_orders[0].order_id, 0);
+        assert!(metadata.sort_orders[0].fields.is_empty());
+        assert_eq!(metadata.sort_orders[1].order_id, 1);
+        assert_eq!(metadata.sort_orders[1].fields.len(), 2);
+
+        // Default should be timestamp_sequence (order-id 1)
+        assert_eq!(metadata.default_sort_order_id, 1);
+    }
+
+    #[test]
+    fn test_sort_order_serialization() {
+        let sort_order = SortOrder::timestamp_sequence();
+
+        let json = serde_json::to_string(&sort_order).unwrap();
+
+        // Verify JSON contains expected field names per Iceberg spec
+        assert!(json.contains("\"order-id\":1"));
+        assert!(json.contains("\"source-id\":5"));
+        assert!(json.contains("\"source-id\":1"));
+        assert!(json.contains("\"direction\":\"asc\""));
+        assert!(json.contains("\"null-order\":\"nulls-last\""));
+        assert!(json.contains("\"transform\":\"identity\""));
+
+        // Verify round-trip
+        let parsed: SortOrder = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.order_id, 1);
+        assert_eq!(parsed.fields.len(), 2);
     }
 }

@@ -15,8 +15,8 @@ use crate::s3_retry;
 use crate::storage::retry::RetryConfig;
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
-    metadata_file_name, write_parquet_to_bytes, DataFile, ManifestListEntry, ParquetFileMetadata,
-    SnapshotOperation, TableMetadata,
+    metadata_file_name, write_parquet_to_bytes_sorted, DataFile, ManifestListEntry,
+    ParquetFileMetadata, SnapshotOperation, TableMetadata,
 };
 
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
@@ -317,8 +317,11 @@ impl ColdStorage for IcebergStorage {
             }
         }
 
-        // Convert events to Parquet
-        let (parquet_bytes, parquet_metadata) = write_parquet_to_bytes(events)?;
+        // Convert events to Parquet with sorting for optimized queries
+        // Clone events since we need to sort them
+        let mut events_to_write = events.to_vec();
+        let (parquet_bytes, parquet_metadata) =
+            write_parquet_to_bytes_sorted(&mut events_to_write)?;
 
         // Generate data file name and key
         let filename = data_file_name();
@@ -631,6 +634,7 @@ fn make_metadata_key(base_path: &str, topic: &str, filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::write_parquet_to_bytes;
 
     #[test]
     fn test_data_file_key() {
