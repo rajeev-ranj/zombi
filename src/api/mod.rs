@@ -18,7 +18,10 @@ pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(
 ) -> Router {
     Router::new()
         .route("/health", get(handlers::health_check))
+        .route("/health/live", get(handlers::health_live))
+        .route("/health/ready", get(handlers::health_ready::<H, C>))
         .route("/stats", get(handlers::get_stats::<H, C>))
+        .route("/metrics", get(handlers::metrics::<H, C>))
         .route("/tables/:table/bulk", post(handlers::bulk_write::<H, C>))
         .route("/tables/:table", post(handlers::write_record::<H, C>))
         .route("/tables/:table", get(handlers::read_records::<H, C>))
