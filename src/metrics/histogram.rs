@@ -3,6 +3,7 @@
 //! Uses fixed buckets optimized for microsecond latencies, enabling
 //! `histogram_quantile()` calculations in Prometheus.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Fixed histogram buckets in microseconds.
@@ -121,21 +122,21 @@ impl Histogram {
         let (sum, count, buckets) = self.snapshot();
 
         let mut output = String::with_capacity(1024);
-        output.push_str(&format!("# HELP {} {}\n", name, help));
-        output.push_str(&format!("# TYPE {} histogram\n", name));
+
+        // Using write! macro is more efficient than push_str + format!
+        // as it avoids intermediate String allocations
+        let _ = writeln!(output, "# HELP {} {}", name, help);
+        let _ = writeln!(output, "# TYPE {} histogram", name);
 
         // Output bucket counts (cumulative)
         for (i, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
-            output.push_str(&format!(
-                "{}_bucket{{le=\"{}\"}} {}\n",
-                name, boundary, buckets[i]
-            ));
+            let _ = writeln!(output, "{}_bucket{{le=\"{}\"}} {}", name, boundary, buckets[i]);
         }
 
         // +Inf bucket (total count - all observations fall into this)
-        output.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", name, count));
-        output.push_str(&format!("{}_sum {}\n", name, sum));
-        output.push_str(&format!("{}_count {}\n", name, count));
+        let _ = writeln!(output, "{}_bucket{{le=\"+Inf\"}} {}", name, count);
+        let _ = writeln!(output, "{}_sum {}", name, sum);
+        let _ = writeln!(output, "{}_count {}", name, count);
 
         output
     }

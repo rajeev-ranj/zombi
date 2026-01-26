@@ -3,6 +3,7 @@
 //! This module provides structured metrics collection using lock-free atomics
 //! and concurrent hashmaps for per-topic/partition metrics.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -94,28 +95,19 @@ impl FlushMetrics {
     pub fn format_prometheus(&self) -> String {
         let mut output = String::with_capacity(1024);
 
-        output.push_str("# HELP zombi_flush_total Total number of flush operations\n");
-        output.push_str("# TYPE zombi_flush_total counter\n");
-        output.push_str(&format!(
-            "zombi_flush_total {}\n",
-            self.flush_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_flush_total Total number of flush operations");
+        let _ = writeln!(output, "# TYPE zombi_flush_total counter");
+        let _ = writeln!(output, "zombi_flush_total {}", self.flush_total.load(Ordering::Relaxed));
         output.push('\n');
 
-        output.push_str("# HELP zombi_flush_events_total Total events flushed to cold storage\n");
-        output.push_str("# TYPE zombi_flush_events_total counter\n");
-        output.push_str(&format!(
-            "zombi_flush_events_total {}\n",
-            self.flush_events_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_flush_events_total Total events flushed to cold storage");
+        let _ = writeln!(output, "# TYPE zombi_flush_events_total counter");
+        let _ = writeln!(output, "zombi_flush_events_total {}", self.flush_events_total.load(Ordering::Relaxed));
         output.push('\n');
 
-        output.push_str("# HELP zombi_flush_bytes_total Total bytes flushed to cold storage\n");
-        output.push_str("# TYPE zombi_flush_bytes_total counter\n");
-        output.push_str(&format!(
-            "zombi_flush_bytes_total {}\n",
-            self.flush_bytes_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_flush_bytes_total Total bytes flushed to cold storage");
+        let _ = writeln!(output, "# TYPE zombi_flush_bytes_total counter");
+        let _ = writeln!(output, "zombi_flush_bytes_total {}", self.flush_bytes_total.load(Ordering::Relaxed));
         output.push('\n');
 
         output.push_str(&self.flush_duration_us.format_prometheus(
@@ -188,58 +180,34 @@ impl IcebergMetrics {
     pub fn format_prometheus(&self) -> String {
         let mut output = String::with_capacity(2048);
 
-        output.push_str("# HELP zombi_parquet_files_written_total Total Parquet files written\n");
-        output.push_str("# TYPE zombi_parquet_files_written_total counter\n");
-        output.push_str(&format!(
-            "zombi_parquet_files_written_total {}\n",
-            self.parquet_files_written_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_parquet_files_written_total Total Parquet files written");
+        let _ = writeln!(output, "# TYPE zombi_parquet_files_written_total counter");
+        let _ = writeln!(output, "zombi_parquet_files_written_total {}", self.parquet_files_written_total.load(Ordering::Relaxed));
         output.push('\n');
 
-        output.push_str(
-            "# HELP zombi_iceberg_snapshots_committed_total Total Iceberg snapshots committed\n",
-        );
-        output.push_str("# TYPE zombi_iceberg_snapshots_committed_total counter\n");
-        output.push_str(&format!(
-            "zombi_iceberg_snapshots_committed_total {}\n",
-            self.iceberg_snapshots_committed_total
-                .load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_iceberg_snapshots_committed_total Total Iceberg snapshots committed");
+        let _ = writeln!(output, "# TYPE zombi_iceberg_snapshots_committed_total counter");
+        let _ = writeln!(output, "zombi_iceberg_snapshots_committed_total {}", self.iceberg_snapshots_committed_total.load(Ordering::Relaxed));
         output.push('\n');
 
-        output.push_str("# HELP zombi_s3_errors_total Total S3 errors encountered\n");
-        output.push_str("# TYPE zombi_s3_errors_total counter\n");
-        output.push_str(&format!(
-            "zombi_s3_errors_total {}\n",
-            self.s3_errors_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_s3_errors_total Total S3 errors encountered");
+        let _ = writeln!(output, "# TYPE zombi_s3_errors_total counter");
+        let _ = writeln!(output, "zombi_s3_errors_total {}", self.s3_errors_total.load(Ordering::Relaxed));
         output.push('\n');
 
         // Per-topic pending snapshot files
-        output.push_str(
-            "# HELP zombi_pending_snapshot_files Pending files awaiting Iceberg snapshot commit\n",
-        );
-        output.push_str("# TYPE zombi_pending_snapshot_files gauge\n");
+        let _ = writeln!(output, "# HELP zombi_pending_snapshot_files Pending files awaiting Iceberg snapshot commit");
+        let _ = writeln!(output, "# TYPE zombi_pending_snapshot_files gauge");
         for entry in self.pending_snapshot_files.iter() {
-            output.push_str(&format!(
-                "zombi_pending_snapshot_files{{topic=\"{}\"}} {}\n",
-                entry.key(),
-                entry.value()
-            ));
+            let _ = writeln!(output, "zombi_pending_snapshot_files{{topic=\"{}\"}} {}", entry.key(), entry.value());
         }
         output.push('\n');
 
         // Per-topic pending snapshot bytes
-        output.push_str(
-            "# HELP zombi_pending_snapshot_bytes Pending bytes awaiting Iceberg snapshot commit\n",
-        );
-        output.push_str("# TYPE zombi_pending_snapshot_bytes gauge\n");
+        let _ = writeln!(output, "# HELP zombi_pending_snapshot_bytes Pending bytes awaiting Iceberg snapshot commit");
+        let _ = writeln!(output, "# TYPE zombi_pending_snapshot_bytes gauge");
         for entry in self.pending_snapshot_bytes.iter() {
-            output.push_str(&format!(
-                "zombi_pending_snapshot_bytes{{topic=\"{}\"}} {}\n",
-                entry.key(),
-                entry.value()
-            ));
+            let _ = writeln!(output, "zombi_pending_snapshot_bytes{{topic=\"{}\"}} {}", entry.key(), entry.value());
         }
         output.push('\n');
 
@@ -291,48 +259,30 @@ impl ConsumerMetrics {
         let mut output = String::with_capacity(4096);
 
         // High watermarks
-        output.push_str(
-            "# HELP zombi_high_watermark Latest available offset (high watermark) per partition\n",
-        );
-        output.push_str("# TYPE zombi_high_watermark gauge\n");
+        let _ = writeln!(output, "# HELP zombi_high_watermark Latest available offset (high watermark) per partition");
+        let _ = writeln!(output, "# TYPE zombi_high_watermark gauge");
         for entry in self.high_watermarks.iter() {
             let (topic, partition) = entry.key();
-            output.push_str(&format!(
-                "zombi_high_watermark{{topic=\"{}\",partition=\"{}\"}} {}\n",
-                topic,
-                partition,
-                entry.value()
-            ));
+            let _ = writeln!(output, "zombi_high_watermark{{topic=\"{}\",partition=\"{}\"}} {}", topic, partition, entry.value());
         }
         output.push('\n');
 
         // Committed offsets
-        output.push_str("# HELP zombi_committed_offset Committed offset per consumer group\n");
-        output.push_str("# TYPE zombi_committed_offset gauge\n");
+        let _ = writeln!(output, "# HELP zombi_committed_offset Committed offset per consumer group");
+        let _ = writeln!(output, "# TYPE zombi_committed_offset gauge");
         for entry in self.committed_offsets.iter() {
             let (group, topic, partition) = entry.key();
-            output.push_str(&format!(
-                "zombi_committed_offset{{group=\"{}\",topic=\"{}\",partition=\"{}\"}} {}\n",
-                group,
-                topic,
-                partition,
-                entry.value()
-            ));
+            let _ = writeln!(output, "zombi_committed_offset{{group=\"{}\",topic=\"{}\",partition=\"{}\"}} {}", group, topic, partition, entry.value());
         }
         output.push('\n');
 
         // Consumer lag (derived metric)
-        output.push_str(
-            "# HELP zombi_consumer_lag Consumer lag (high watermark - committed offset)\n",
-        );
-        output.push_str("# TYPE zombi_consumer_lag gauge\n");
+        let _ = writeln!(output, "# HELP zombi_consumer_lag Consumer lag (high watermark - committed offset)");
+        let _ = writeln!(output, "# TYPE zombi_consumer_lag gauge");
         for entry in self.committed_offsets.iter() {
             let (group, topic, partition) = entry.key();
             if let Some(lag) = self.calculate_lag(group, topic, *partition) {
-                output.push_str(&format!(
-                    "zombi_consumer_lag{{group=\"{}\",topic=\"{}\",partition=\"{}\"}} {}\n",
-                    group, topic, partition, lag
-                ));
+                let _ = writeln!(output, "zombi_consumer_lag{{group=\"{}\",topic=\"{}\",partition=\"{}\"}} {}", group, topic, partition, lag);
             }
         }
         output.push('\n');
@@ -368,18 +318,11 @@ impl HotStorageMetrics {
     pub fn format_prometheus(&self) -> String {
         let mut output = String::with_capacity(2048);
 
-        output.push_str(
-            "# HELP zombi_hot_storage_events Events currently in hot storage per partition\n",
-        );
-        output.push_str("# TYPE zombi_hot_storage_events gauge\n");
+        let _ = writeln!(output, "# HELP zombi_hot_storage_events Events currently in hot storage per partition");
+        let _ = writeln!(output, "# TYPE zombi_hot_storage_events gauge");
         for entry in self.hot_events.iter() {
             let (topic, partition) = entry.key();
-            output.push_str(&format!(
-                "zombi_hot_storage_events{{topic=\"{}\",partition=\"{}\"}} {}\n",
-                topic,
-                partition,
-                entry.value()
-            ));
+            let _ = writeln!(output, "zombi_hot_storage_events{{topic=\"{}\",partition=\"{}\"}} {}", topic, partition, entry.value());
         }
         output.push('\n');
 
@@ -449,38 +392,25 @@ impl EnhancedApiMetrics {
         output.push('\n');
 
         // Writes by topic
-        output.push_str("# HELP zombi_writes_by_topic_total Write operations per topic\n");
-        output.push_str("# TYPE zombi_writes_by_topic_total counter\n");
+        let _ = writeln!(output, "# HELP zombi_writes_by_topic_total Write operations per topic");
+        let _ = writeln!(output, "# TYPE zombi_writes_by_topic_total counter");
         for entry in self.writes_by_topic.iter() {
-            output.push_str(&format!(
-                "zombi_writes_by_topic_total{{topic=\"{}\"}} {}\n",
-                entry.key(),
-                entry.value().load(Ordering::Relaxed)
-            ));
+            let _ = writeln!(output, "zombi_writes_by_topic_total{{topic=\"{}\"}} {}", entry.key(), entry.value().load(Ordering::Relaxed));
         }
         output.push('\n');
 
         // Reads by topic
-        output.push_str("# HELP zombi_reads_by_topic_total Read operations per topic\n");
-        output.push_str("# TYPE zombi_reads_by_topic_total counter\n");
+        let _ = writeln!(output, "# HELP zombi_reads_by_topic_total Read operations per topic");
+        let _ = writeln!(output, "# TYPE zombi_reads_by_topic_total counter");
         for entry in self.reads_by_topic.iter() {
-            output.push_str(&format!(
-                "zombi_reads_by_topic_total{{topic=\"{}\"}} {}\n",
-                entry.key(),
-                entry.value().load(Ordering::Relaxed)
-            ));
+            let _ = writeln!(output, "zombi_reads_by_topic_total{{topic=\"{}\"}} {}", entry.key(), entry.value().load(Ordering::Relaxed));
         }
         output.push('\n');
 
         // Backpressure rejections
-        output.push_str(
-            "# HELP zombi_backpressure_rejections_total Total requests rejected due to backpressure\n",
-        );
-        output.push_str("# TYPE zombi_backpressure_rejections_total counter\n");
-        output.push_str(&format!(
-            "zombi_backpressure_rejections_total {}\n",
-            self.backpressure_rejections_total.load(Ordering::Relaxed)
-        ));
+        let _ = writeln!(output, "# HELP zombi_backpressure_rejections_total Total requests rejected due to backpressure");
+        let _ = writeln!(output, "# TYPE zombi_backpressure_rejections_total counter");
+        let _ = writeln!(output, "zombi_backpressure_rejections_total {}", self.backpressure_rejections_total.load(Ordering::Relaxed));
         output.push('\n');
 
         output

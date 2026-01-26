@@ -34,5 +34,8 @@ Dockerfile text eol=lf
 *.jpg binary
 *.ico binary
 
+# Generated files (linguist exclusion + simplified diffs)
+infra/monitoring/grafana/provisioning/dashboards/*.json linguist-generated=true -diff
+
 # Lock files (don't merge, regenerate)
 Cargo.lock merge=binary
