@@ -6,6 +6,29 @@ use uuid::Uuid;
 use crate::contracts::StorageError;
 use crate::storage::ParquetFileMetadata;
 
+/// Iceberg schema field IDs.
+/// These must match the field IDs in the schema definition and remain stable
+/// across schema evolution. Used for column statistics (lower/upper bounds).
+#[allow(dead_code)]
+pub mod field_ids {
+    /// sequence (long) - monotonically increasing event ID
+    pub const SEQUENCE: i32 = 1;
+    /// topic (string) - event topic/table name
+    pub const TOPIC: i32 = 2;
+    /// partition (int) - partition number
+    pub const PARTITION: i32 = 3;
+    /// payload (binary) - event payload
+    pub const PAYLOAD: i32 = 4;
+    /// timestamp_ms (long) - event timestamp in milliseconds
+    pub const TIMESTAMP_MS: i32 = 5;
+    /// idempotency_key (string, optional) - deduplication key
+    pub const IDEMPOTENCY_KEY: i32 = 6;
+    /// event_date (date) - partition column, days since epoch
+    pub const EVENT_DATE: i32 = 7;
+    /// event_hour (int) - partition column, hour of day (0-23)
+    pub const EVENT_HOUR: i32 = 8;
+}
+
 /// Iceberg binary encoding utilities for column statistics.
 /// Iceberg uses big-endian encoding for all numeric types in lower_bounds/upper_bounds.
 pub mod iceberg_encoding {
@@ -15,7 +38,13 @@ pub mod iceberg_encoding {
     }
 
     /// Encodes a u64 as i64 (long) to big-endian bytes for Iceberg.
-    /// Note: Iceberg uses signed long for all integer types.
+    ///
+    /// # Note
+    /// Iceberg uses signed long for all integer types. Values greater than
+    /// `i64::MAX` (9,223,372,036,854,775,807) will wrap to negative values
+    /// due to two's complement representation. For Zombi sequence numbers,
+    /// this limit is unlikely to be reached in practice (would require ~292
+    /// years at 1 billion events/second).
     pub fn encode_u64_as_long(value: u64) -> Vec<u8> {
         (value as i64).to_be_bytes().to_vec()
     }
@@ -392,39 +421,64 @@ pub struct DataFile {
 
 impl DataFile {
     /// Creates a DataFile from ParquetFileMetadata.
-    /// Populates column statistics (lower_bounds, upper_bounds) from the metadata.
-    ///
-    /// Field IDs per Iceberg schema:
-    /// - 1: sequence (long)
-    /// - 3: partition (int)
-    /// - 5: timestamp_ms (long)
-    /// - 7: event_date (date)
-    /// - 8: event_hour (int)
+    /// Populates column statistics (lower/upper bounds) from Parquet metadata.
+    /// Field IDs are defined in the `field_ids` module.
     pub fn from_parquet_metadata(metadata: &ParquetFileMetadata, s3_path: &str) -> Self {
+        use crate::storage::iceberg::field_ids;
         use iceberg_encoding::*;
 
         let mut lower_bounds = HashMap::new();
         let mut upper_bounds = HashMap::new();
 
-        // Field 1: sequence (long)
-        lower_bounds.insert(1, encode_u64_as_long(metadata.column_stats.sequence_min));
-        upper_bounds.insert(1, encode_u64_as_long(metadata.column_stats.sequence_max));
+        // sequence (long)
+        lower_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_min),
+        );
+        upper_bounds.insert(
+            field_ids::SEQUENCE,
+            encode_u64_as_long(metadata.column_stats.sequence_max),
+        );
 
-        // Field 3: partition (int)
-        lower_bounds.insert(3, encode_u32_as_int(metadata.column_stats.partition_min));
-        upper_bounds.insert(3, encode_u32_as_int(metadata.column_stats.partition_max));
+        // partition (int)
+        lower_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_min),
+        );
+        upper_bounds.insert(
+            field_ids::PARTITION,
+            encode_u32_as_int(metadata.column_stats.partition_max),
+        );
 
-        // Field 5: timestamp_ms (long)
-        lower_bounds.insert(5, encode_long(metadata.column_stats.timestamp_min));
-        upper_bounds.insert(5, encode_long(metadata.column_stats.timestamp_max));
+        // timestamp_ms (long)
+        lower_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_min),
+        );
+        upper_bounds.insert(
+            field_ids::TIMESTAMP_MS,
+            encode_long(metadata.column_stats.timestamp_max),
+        );
 
-        // Field 7: event_date (date - days since epoch)
-        lower_bounds.insert(7, encode_date(metadata.column_stats.event_date_min));
-        upper_bounds.insert(7, encode_date(metadata.column_stats.event_date_max));
+        // event_date (date - days since epoch)
+        lower_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_DATE,
+            encode_date(metadata.column_stats.event_date_max),
+        );
 
-        // Field 8: event_hour (int)
-        lower_bounds.insert(8, encode_int(metadata.column_stats.event_hour_min));
-        upper_bounds.insert(8, encode_int(metadata.column_stats.event_hour_max));
+        // event_hour (int)
+        lower_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_min),
+        );
+        upper_bounds.insert(
+            field_ids::EVENT_HOUR,
+            encode_int(metadata.column_stats.event_hour_max),
+        );
 
         Self {
             content: 0, // Data file
