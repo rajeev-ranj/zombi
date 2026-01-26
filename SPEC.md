@@ -129,6 +129,12 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 └─────────────────┴──────────┴──────────┴──────────┘
 ```
 
+### Sort Order
+Data is sorted within each Parquet file by `timestamp_ms ASC, sequence ASC`. This:
+- Improves data locality for time-range queries
+- Produces tighter min/max column statistics per file
+- Enables better compression ratios for time-series data
+
 ### Column Statistics
 Each DataFile in Iceberg manifests includes `lower_bounds` and `upper_bounds` for indexed columns:
 - `sequence` - enables offset-based file pruning

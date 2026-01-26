@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use aws_sdk_s3::Client;
 
 use crate::contracts::{StorageError, StoredEvent};
-use crate::storage::{data_file_name, write_parquet_to_bytes};
+use crate::storage::{data_file_name, write_parquet_to_bytes_sorted};
 
 /// Configuration for compaction.
 #[derive(Debug, Clone)]
@@ -210,7 +210,7 @@ impl Compactor {
 
             // Write batch when it reaches target size
             if current_size_estimate >= self.config.target_file_size_bytes as usize {
-                let (bytes, metadata) = write_parquet_to_bytes(&current_batch)?;
+                let (bytes, metadata) = write_parquet_to_bytes_sorted(&mut current_batch)?;
                 let filename = data_file_name();
                 let key = format!(
                     "{}/{}/data/partition={}/{}",
@@ -227,7 +227,7 @@ impl Compactor {
 
         // Write remaining events
         if !current_batch.is_empty() {
-            let (bytes, metadata) = write_parquet_to_bytes(&current_batch)?;
+            let (bytes, metadata) = write_parquet_to_bytes_sorted(&mut current_batch)?;
             let filename = data_file_name();
             let key = format!(
                 "{}/{}/data/partition={}/{}",
