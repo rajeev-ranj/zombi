@@ -16,13 +16,14 @@ pub use iceberg::{
     current_timestamp_ms, data_file_name, generate_snapshot_id, iceberg_encoding,
     manifest_file_name, manifest_list_file_name, metadata_file_name, DataFile, IcebergField,
     IcebergSchema, IcebergTableConfig, ManifestEntry, ManifestFile, ManifestListEntry,
-    PartitionField, PartitionSpec, Snapshot, SnapshotLogEntry, SnapshotOperation, SortOrder,
-    TableMetadata,
+    PartitionField, PartitionSpec, Snapshot, SnapshotLogEntry, SnapshotOperation, SortField,
+    SortOrder, TableMetadata,
 };
 pub use iceberg_storage::IcebergStorage;
 pub use parquet::{
     derive_partition_columns, event_schema, events_to_record_batch, format_partition_date,
-    write_parquet, write_parquet_to_bytes, ColumnStatistics, ParquetFileMetadata, PartitionValues,
+    write_parquet, write_parquet_sorted, write_parquet_to_bytes, write_parquet_to_bytes_sorted,
+    ColumnStatistics, ParquetFileMetadata, PartitionValues,
 };
 pub use retry::{is_retryable_s3_error, RetryConfig};
 pub use rocksdb::RocksDbStorage;

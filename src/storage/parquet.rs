@@ -417,6 +417,57 @@ pub fn write_parquet_to_bytes(
     Ok((buffer, metadata))
 }
 
+/// Writes events to a Parquet file in memory with sorting.
+/// Events are sorted by timestamp_ms ASC, then sequence ASC before writing.
+/// This matches the Iceberg SortOrder::timestamp_sequence() definition.
+///
+/// Sorting improves:
+/// - Query performance for time-range queries (better data locality)
+/// - Column statistics quality (tighter bounds per file)
+/// - Compression ratios (similar values grouped together)
+pub fn write_parquet_to_bytes_sorted(
+    events: &mut [StoredEvent],
+) -> Result<(Vec<u8>, ParquetFileMetadata), StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot write empty events to Parquet".into(),
+        ));
+    }
+
+    // Sort by timestamp_ms ASC, then sequence ASC for determinism
+    events.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then(a.sequence.cmp(&b.sequence))
+    });
+
+    // Delegate to the non-sorted version (now that events are sorted)
+    write_parquet_to_bytes(events)
+}
+
+/// Writes events to a Parquet file on disk with sorting.
+/// Events are sorted by timestamp_ms ASC, then sequence ASC before writing.
+pub fn write_parquet_sorted<P: AsRef<Path>>(
+    events: &mut [StoredEvent],
+    output_path: P,
+) -> Result<ParquetFileMetadata, StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot write empty events to Parquet".into(),
+        ));
+    }
+
+    // Sort by timestamp_ms ASC, then sequence ASC for determinism
+    events.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then(a.sequence.cmp(&b.sequence))
+    });
+
+    // Delegate to the non-sorted version (now that events are sorted)
+    write_parquet(events, output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +739,120 @@ mod tests {
 
         assert!(bytes.len() < raw);
         assert_eq!(meta.row_count, 1000);
+    }
+
+    #[test]
+    fn test_write_parquet_to_bytes_sorted_orders_by_timestamp() {
+        // Create events out of order by timestamp
+        let mut events = vec![
+            StoredEvent {
+                sequence: 3,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"third".to_vec(),
+                timestamp_ms: 3000, // Latest
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 1,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"first".to_vec(),
+                timestamp_ms: 1000, // Earliest
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 2,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"second".to_vec(),
+                timestamp_ms: 2000, // Middle
+                idempotency_key: None,
+            },
+        ];
+
+        let (_, metadata) = write_parquet_to_bytes_sorted(&mut events).unwrap();
+
+        // After sorting, events should be in timestamp order
+        assert_eq!(events[0].timestamp_ms, 1000);
+        assert_eq!(events[1].timestamp_ms, 2000);
+        assert_eq!(events[2].timestamp_ms, 3000);
+
+        // Metadata should still capture correct min/max
+        assert_eq!(metadata.min_timestamp_ms, 1000);
+        assert_eq!(metadata.max_timestamp_ms, 3000);
+    }
+
+    #[test]
+    fn test_write_parquet_to_bytes_sorted_secondary_sort_by_sequence() {
+        // Create events with same timestamp but different sequences
+        let mut events = vec![
+            StoredEvent {
+                sequence: 100,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"high seq".to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 50,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"low seq".to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 75,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"mid seq".to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+        ];
+
+        let _ = write_parquet_to_bytes_sorted(&mut events).unwrap();
+
+        // Same timestamp, so should be sorted by sequence as secondary key
+        assert_eq!(events[0].sequence, 50);
+        assert_eq!(events[1].sequence, 75);
+        assert_eq!(events[2].sequence, 100);
+    }
+
+    #[test]
+    fn test_write_parquet_sorted_file() {
+        let mut events = vec![
+            StoredEvent {
+                sequence: 2,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"second".to_vec(),
+                timestamp_ms: 2000,
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 1,
+                topic: "test".into(),
+                partition: 0,
+                payload: b"first".to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+        ];
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sorted.parquet");
+
+        let metadata = write_parquet_sorted(&mut events, &path).unwrap();
+
+        // Verify file was created
+        assert!(path.exists());
+        assert_eq!(metadata.row_count, 2);
+
+        // Events should be sorted
+        assert_eq!(events[0].timestamp_ms, 1000);
+        assert_eq!(events[1].timestamp_ms, 2000);
     }
 }
