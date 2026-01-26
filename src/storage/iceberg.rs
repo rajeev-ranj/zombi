@@ -201,13 +201,63 @@ impl PartitionSpec {
     }
 }
 
-/// Sort order (unsorted for append-only).
+/// Iceberg sort field definition per the Iceberg spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortField {
+    /// Transform applied before sorting (identity, bucket, truncate, etc.)
+    pub transform: String,
+    /// Source field ID from schema
+    #[serde(rename = "source-id")]
+    pub source_id: i32,
+    /// Sort direction (asc or desc)
+    pub direction: String,
+    /// Null ordering (nulls-first or nulls-last)
+    #[serde(rename = "null-order")]
+    pub null_order: String,
+}
+
+/// Sort order defining how data is sorted within files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SortOrder {
     #[serde(rename = "order-id")]
     pub order_id: i32,
     #[serde(default)]
-    pub fields: Vec<serde_json::Value>,
+    pub fields: Vec<SortField>,
+}
+
+impl SortOrder {
+    /// Creates an unsorted (empty) sort order.
+    pub fn unsorted() -> Self {
+        Self {
+            order_id: 0,
+            fields: vec![],
+        }
+    }
+
+    /// Creates a sort order by timestamp_ms ASC, sequence ASC.
+    /// This is the recommended sort order for Zombi events as it:
+    /// - Optimizes time-range queries (most common pattern)
+    /// - Provides deterministic ordering within same timestamp
+    /// - Enables better column statistics per file
+    pub fn timestamp_sequence() -> Self {
+        Self {
+            order_id: 1,
+            fields: vec![
+                SortField {
+                    transform: "identity".into(),
+                    source_id: 5, // timestamp_ms
+                    direction: "asc".into(),
+                    null_order: "nulls-last".into(),
+                },
+                SortField {
+                    transform: "identity".into(),
+                    source_id: 1, // sequence
+                    direction: "asc".into(),
+                    null_order: "nulls-last".into(),
+                },
+            ],
+        }
+    }
 }
 
 /// Iceberg snapshot.
@@ -291,6 +341,7 @@ pub struct SnapshotLogEntry {
 
 impl TableMetadata {
     /// Creates new table metadata for a Zombi topic.
+    /// Uses timestamp_sequence sort order by default for optimized time-range queries.
     pub fn new(location: &str) -> Self {
         Self {
             format_version: 2,
@@ -308,8 +359,10 @@ impl TableMetadata {
             current_snapshot_id: None,
             snapshots: vec![],
             snapshot_log: vec![],
-            sort_orders: vec![SortOrder::default()],
-            default_sort_order_id: 0,
+            // Provide both unsorted (0) and timestamp_sequence (1) sort orders
+            // Default to timestamp_sequence for optimized queries
+            sort_orders: vec![SortOrder::unsorted(), SortOrder::timestamp_sequence()],
+            default_sort_order_id: 1, // Use timestamp_sequence by default
         }
     }
 
@@ -787,5 +840,70 @@ mod tests {
         assert_eq!(config.table_prefix(), "tables/events");
         assert_eq!(config.metadata_path(), "tables/events/metadata");
         assert_eq!(config.data_path(), "tables/events/data");
+    }
+
+    #[test]
+    fn test_sort_order_unsorted() {
+        let sort_order = SortOrder::unsorted();
+
+        assert_eq!(sort_order.order_id, 0);
+        assert!(sort_order.fields.is_empty());
+    }
+
+    #[test]
+    fn test_sort_order_timestamp_sequence() {
+        let sort_order = SortOrder::timestamp_sequence();
+
+        assert_eq!(sort_order.order_id, 1);
+        assert_eq!(sort_order.fields.len(), 2);
+
+        // First field: timestamp_ms (source-id 5)
+        let first = &sort_order.fields[0];
+        assert_eq!(first.source_id, 5);
+        assert_eq!(first.transform, "identity");
+        assert_eq!(first.direction, "asc");
+        assert_eq!(first.null_order, "nulls-last");
+
+        // Second field: sequence (source-id 1)
+        let second = &sort_order.fields[1];
+        assert_eq!(second.source_id, 1);
+        assert_eq!(second.transform, "identity");
+        assert_eq!(second.direction, "asc");
+        assert_eq!(second.null_order, "nulls-last");
+    }
+
+    #[test]
+    fn test_table_metadata_uses_timestamp_sequence_sort() {
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        // Should have two sort orders: unsorted (0) and timestamp_sequence (1)
+        assert_eq!(metadata.sort_orders.len(), 2);
+        assert_eq!(metadata.sort_orders[0].order_id, 0);
+        assert!(metadata.sort_orders[0].fields.is_empty());
+        assert_eq!(metadata.sort_orders[1].order_id, 1);
+        assert_eq!(metadata.sort_orders[1].fields.len(), 2);
+
+        // Default should be timestamp_sequence (order-id 1)
+        assert_eq!(metadata.default_sort_order_id, 1);
+    }
+
+    #[test]
+    fn test_sort_order_serialization() {
+        let sort_order = SortOrder::timestamp_sequence();
+
+        let json = serde_json::to_string(&sort_order).unwrap();
+
+        // Verify JSON contains expected field names per Iceberg spec
+        assert!(json.contains("\"order-id\":1"));
+        assert!(json.contains("\"source-id\":5"));
+        assert!(json.contains("\"source-id\":1"));
+        assert!(json.contains("\"direction\":\"asc\""));
+        assert!(json.contains("\"null-order\":\"nulls-last\""));
+        assert!(json.contains("\"transform\":\"identity\""));
+
+        // Verify round-trip
+        let parsed: SortOrder = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.order_id, 1);
+        assert_eq!(parsed.fields.len(), 2);
     }
 }
