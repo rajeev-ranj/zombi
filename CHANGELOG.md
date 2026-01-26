@@ -4,12 +4,30 @@ All notable changes to Zombi are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Comprehensive Observability** (Issue #9, #10)
+  - `GET /metrics` - Prometheus metrics endpoint
+  - `GET /health/live` - Kubernetes liveness probe
+  - `GET /health/ready` - Kubernetes readiness probe
+  - Flush pipeline metrics (`zombi_flush_total`, `zombi_flush_events_total`, `zombi_flush_bytes_total`, `zombi_flush_duration_us`)
+  - Iceberg/cold storage metrics (`zombi_parquet_files_written_total`, `zombi_iceberg_snapshots_committed_total`, `zombi_s3_errors_total`)
+  - Consumer lag metrics (`zombi_consumer_lag`, `zombi_high_watermark`, `zombi_committed_offset`)
+  - Hot storage metrics (`zombi_hot_storage_events`)
+  - Latency histograms (`zombi_write_latency_us`, `zombi_read_latency_us`)
+  - Per-topic breakdowns (`zombi_writes_by_topic_total`, `zombi_reads_by_topic_total`)
+  - Backpressure tracking (`zombi_backpressure_rejections_total`)
+  - Grafana dashboard with pre-configured panels
+
+- **Monitoring Infrastructure**
+  - `docker-compose.monitoring.yml` - Full observability stack (Zombi + MinIO + Prometheus + Grafana)
+  - Prometheus scrape configuration
+  - Grafana provisioning with data source and dashboard
+
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 
 ### Planned
 - Streaming endpoint (`GET /tables/{table}/stream`)
-- Prometheus metrics endpoint (`/metrics`)
 - Redis coordination for multi-node deployment
 - Avro manifest files (full Iceberg compliance)
 
