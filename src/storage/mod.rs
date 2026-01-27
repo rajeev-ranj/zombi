@@ -3,7 +3,8 @@ mod cold_storage_backend;
 mod compaction;
 mod iceberg;
 mod iceberg_storage;
-mod parquet;
+pub(crate) mod parquet;
+pub(crate) mod payload_extractor;
 mod retry;
 mod rocksdb;
 mod s3;
@@ -21,9 +22,11 @@ pub use iceberg::{
 };
 pub use iceberg_storage::IcebergStorage;
 pub use parquet::{
-    derive_partition_columns, event_schema, events_to_record_batch, format_partition_date,
-    write_parquet, write_parquet_sorted, write_parquet_to_bytes, write_parquet_to_bytes_sorted,
-    ColumnStatistics, ParquetFileMetadata, PartitionValues,
+    derive_partition_columns, event_schema, event_schema_with_extraction, events_to_record_batch,
+    events_to_record_batch_structured, format_partition_date, write_parquet, write_parquet_sorted,
+    write_parquet_to_bytes, write_parquet_to_bytes_sorted, write_parquet_to_bytes_structured,
+    write_parquet_to_bytes_structured_sorted, ColumnStatistics, ParquetFileMetadata,
+    PartitionValues,
 };
 pub use retry::{is_retryable_s3_error, RetryConfig};
 pub use rocksdb::RocksDbStorage;

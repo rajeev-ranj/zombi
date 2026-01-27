@@ -6,7 +6,7 @@ use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
 use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
-use zombi::contracts::Flusher;
+use zombi::contracts::{Flusher, TableSchemaConfig};
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::metrics::MetricsRegistry;
 use zombi::storage::{ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage, S3Storage};
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let backend = if iceberg_enabled {
             // Use Iceberg storage (Parquet + metadata)
-            let iceberg = if let Some(ref endpoint) = endpoint {
+            let mut iceberg = if let Some(ref endpoint) = endpoint {
                 tracing::info!(
                     "Connecting to Iceberg storage at {} (bucket: {}, path: {})",
                     endpoint,
@@ -63,6 +63,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 IcebergStorage::new(&bucket, &storage_path).await?
             };
+
+            // Load schema configs for structured column extraction
+            let schema_configs = load_schema_configs();
+            if !schema_configs.is_empty() {
+                let tables: Vec<&str> = schema_configs.iter().map(|c| c.table.as_str()).collect();
+                tracing::info!(
+                    tables = ?tables,
+                    "Loaded structured column schemas for {} table(s)",
+                    schema_configs.len()
+                );
+                iceberg.set_schema_configs(schema_configs);
+            }
+
             ColdStorageBackend::iceberg(iceberg)
         } else {
             // Use plain S3 storage (JSON segments)
@@ -238,6 +251,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+/// Loads table schema configurations from environment variable or file.
+///
+/// Checks in order:
+/// 1. `ZOMBI_TABLE_SCHEMA` env var (JSON array of TableSchemaConfig)
+/// 2. `ZOMBI_TABLE_SCHEMA_FILE` env var (path to JSON file)
+/// 3. `table_schema.json` in current directory
+///
+/// Returns empty vec if none found (all tables use binary blob behavior).
+fn load_schema_configs() -> Vec<TableSchemaConfig> {
+    // Try env var first
+    if let Ok(json) = std::env::var("ZOMBI_TABLE_SCHEMA") {
+        match serde_json::from_str::<Vec<TableSchemaConfig>>(&json) {
+            Ok(configs) => return configs,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to parse ZOMBI_TABLE_SCHEMA env var");
+                return vec![];
+            }
+        }
+    }
+
+    // Try file path from env
+    let file_path =
+        std::env::var("ZOMBI_TABLE_SCHEMA_FILE").unwrap_or_else(|_| "table_schema.json".into());
+
+    if let Ok(contents) = std::fs::read_to_string(&file_path) {
+        match serde_json::from_str::<Vec<TableSchemaConfig>>(&contents) {
+            Ok(configs) => return configs,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %file_path,
+                    "Failed to parse table schema config file"
+                );
+            }
+        }
+    }
+
+    vec![]
 }
 
 async fn shutdown_signal() {
