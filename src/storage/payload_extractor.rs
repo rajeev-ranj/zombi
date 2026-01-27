@@ -70,20 +70,17 @@ fn extract_json_fields(
         extracted_paths.push(&field.json_path);
     }
 
-    // Build overflow: remove extracted top-level keys from the JSON object
+    // Build overflow: remove extracted keys (including nested) from the JSON object
     let overflow = if config.preserve_overflow {
-        if let serde_json::Value::Object(ref mut map) = json_value {
-            // Remove only simple (non-nested) extracted paths
+        if let serde_json::Value::Object(_) = json_value {
             for path in &extracted_paths {
-                if !path.contains('.') {
-                    map.remove(*path);
-                }
+                remove_json_path(&mut json_value, path);
             }
-            if map.is_empty() {
+            if json_value.as_object().is_none_or(|m| m.is_empty()) {
                 None
             } else {
                 Some(
-                    serde_json::to_vec(&map)
+                    serde_json::to_vec(&json_value)
                         .map_err(|e| StorageError::Serialization(e.to_string()))?,
                 )
             }
@@ -142,6 +139,43 @@ pub fn extract_batch(
     config: &TableSchemaConfig,
 ) -> Result<Vec<ExtractionResult>, StorageError> {
     payloads.iter().map(|p| extract_fields(p, config)).collect()
+}
+
+/// Removes a dot-separated path from a JSON value, pruning empty parent objects.
+fn remove_json_path(value: &mut serde_json::Value, path: &str) {
+    let parts: Vec<&str> = path.split('.').collect();
+    remove_nested(value, &parts);
+}
+
+/// Recursively removes the leaf key and prunes empty parent objects.
+/// Returns `true` if the current value is now an empty object and should be pruned.
+fn remove_nested(value: &mut serde_json::Value, parts: &[&str]) -> bool {
+    match parts {
+        [] => false,
+        [key] => {
+            if let serde_json::Value::Object(map) = value {
+                map.remove(*key);
+                map.is_empty()
+            } else {
+                false
+            }
+        }
+        [key, rest @ ..] => {
+            if let serde_json::Value::Object(map) = value {
+                let should_prune = if let Some(child) = map.get_mut(*key) {
+                    remove_nested(child, rest)
+                } else {
+                    false
+                };
+                if should_prune {
+                    map.remove(*key);
+                }
+                map.is_empty()
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +362,48 @@ mod tests {
         let result = extract_fields(payload, &config).unwrap();
 
         assert_eq!(result.values[0], Some(ExtractedValue::Utf8("12345".into())));
+    }
+
+    #[test]
+    fn test_nested_extraction_removes_from_overflow() {
+        let config = test_config(vec![field(
+            "nested_val",
+            "meta.nested.value",
+            FieldType::Int64,
+        )]);
+
+        let payload = br#"{"meta": {"nested": {"value": 42, "other": "keep"}}, "top": 1}"#;
+        let result = extract_fields(payload, &config).unwrap();
+
+        assert_eq!(result.values[0], Some(ExtractedValue::Int64(42)));
+
+        let overflow = result.overflow.unwrap();
+        let overflow_json: serde_json::Value = serde_json::from_slice(&overflow).unwrap();
+        // "value" removed but sibling "other" and top-level "top" remain
+        assert_eq!(
+            overflow_json,
+            serde_json::json!({"meta": {"nested": {"other": "keep"}}, "top": 1})
+        );
+    }
+
+    #[test]
+    fn test_nested_extraction_prunes_empty_parent() {
+        let config = test_config(vec![field(
+            "nested_val",
+            "meta.nested.value",
+            FieldType::Int64,
+        )]);
+
+        // "meta.nested" only has "value", so after removal the entire "meta" tree is empty
+        let payload = br#"{"meta": {"nested": {"value": 42}}, "other": 1}"#;
+        let result = extract_fields(payload, &config).unwrap();
+
+        assert_eq!(result.values[0], Some(ExtractedValue::Int64(42)));
+
+        let overflow = result.overflow.unwrap();
+        let overflow_json: serde_json::Value = serde_json::from_slice(&overflow).unwrap();
+        // Empty parents pruned, only "other" remains
+        assert_eq!(overflow_json, serde_json::json!({"other": 1}));
     }
 
     #[test]
