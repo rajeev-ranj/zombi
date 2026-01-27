@@ -6,6 +6,7 @@ use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
+use zombi::metrics::MetricsRegistry;
 use zombi::proto;
 use zombi::storage::RocksDbStorage;
 
@@ -18,6 +19,7 @@ fn create_test_app_with_backpressure(
         Arc::new(storage),
         None::<Arc<NoopColdStorage>>,
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         config,
     ));
     let router = create_router(state);
@@ -31,6 +33,7 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(storage),
         None::<Arc<NoopColdStorage>>,
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
     let router = create_router(state);
@@ -44,6 +47,7 @@ fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
         Arc::new(storage),
         Some(Arc::new(NoopColdStorage)),
         Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
     let router = create_router(state);
@@ -588,4 +592,179 @@ async fn test_backpressure_bytes_limit() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["code"], "SERVER_OVERLOADED");
+}
+
+// ============================================================================
+// Health Check Tests (#10)
+// ============================================================================
+
+#[tokio::test]
+async fn test_health_live_returns_ok() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_health_ready_checks_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Verify response structure
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["hot_storage"]["status"], "ok");
+    assert_eq!(json["cold_storage"]["status"], "not_configured");
+    assert_eq!(json["backpressure"]["status"], "ok");
+
+    // Verify backpressure fields exist and are valid
+    assert!(json["backpressure"]["max_inflight_bytes"].is_number());
+    assert!(json["backpressure"]["inflight_bytes"].is_number());
+    assert!(json["backpressure"]["inflight_writes"].is_number());
+}
+
+#[tokio::test]
+async fn test_health_ready_with_cold_storage() {
+    let (app, _dir) = create_test_app_with_cold_storage();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["hot_storage"]["status"], "ok");
+    // NoopColdStorage returns "none" as storage_type, so it shows as not_configured
+    assert_eq!(json["cold_storage"]["status"], "not_configured");
+}
+
+// ============================================================================
+// Prometheus Metrics Tests (#9)
+// ============================================================================
+
+#[tokio::test]
+async fn test_metrics_returns_prometheus_format() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Verify content type is text/plain
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .expect("content-type header missing");
+    assert!(content_type.to_str().unwrap().starts_with("text/plain"));
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+    // Verify Prometheus format with HELP and TYPE lines
+    assert!(body_str.contains("# HELP zombi_writes_total"));
+    assert!(body_str.contains("# TYPE zombi_writes_total counter"));
+    assert!(body_str.contains("# HELP zombi_uptime_secs"));
+    assert!(body_str.contains("# TYPE zombi_uptime_secs gauge"));
+    assert!(body_str.contains("# HELP zombi_errors_total"));
+    assert!(body_str.contains("zombi_inflight_bytes"));
+    assert!(body_str.contains("zombi_inflight_writes_available"));
+}
+
+#[tokio::test]
+async fn test_metrics_values_update_after_writes() {
+    let (app, _dir) = create_test_app();
+
+    // Write some records to generate metrics
+    for _ in 0..3 {
+        let app_clone = app.clone();
+        let response = app_clone
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tables/metrics_test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"payload": "test data", "partition": 0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // Get metrics
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+    // Verify writes_total is 3
+    assert!(body_str.contains("zombi_writes_total 3"));
+    // Verify bytes were written
+    assert!(body_str.contains("zombi_writes_bytes_total"));
 }

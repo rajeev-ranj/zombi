@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
 use zombi::contracts::Flusher;
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
+use zombi::metrics::MetricsRegistry;
 use zombi::storage::{ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage, S3Storage};
 
 #[tokio::main]
@@ -81,6 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Initialize metrics registry (needed by both flusher and API)
+    let metrics_registry = Arc::new(MetricsRegistry::new());
+
     // Start background flusher if cold storage is configured
     let flusher = if let Some(ref cold) = cold_storage {
         // Use Iceberg defaults when enabled, otherwise use standard defaults
@@ -143,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&storage),
             Arc::clone(cold),
             config,
+            Arc::clone(&metrics_registry.flush),
+            Arc::clone(&metrics_registry.iceberg),
         ));
 
         flusher.start().await?;
@@ -164,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         storage,
         cold_storage,
         Arc::new(Metrics::new()),
+        Arc::clone(&metrics_registry),
         backpressure_config,
     ));
 

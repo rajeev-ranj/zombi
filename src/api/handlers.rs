@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::contracts::{ColdStorage, HotStorage, StorageError};
+use crate::metrics::MetricsRegistry;
 use crate::proto;
 
 /// Server metrics for monitoring.
@@ -109,6 +110,7 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub storage: Arc<H>,
     pub cold_storage: Option<Arc<C>>,
     pub metrics: Arc<Metrics>,
+    pub metrics_registry: Arc<MetricsRegistry>,
     /// Semaphore for limiting concurrent writes
     pub write_semaphore: Arc<Semaphore>,
     /// Current inflight bytes (for byte-based backpressure)
@@ -123,12 +125,14 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
         storage: Arc<H>,
         cold_storage: Option<Arc<C>>,
         metrics: Arc<Metrics>,
+        metrics_registry: Arc<MetricsRegistry>,
         backpressure: BackpressureConfig,
     ) -> Self {
         Self {
             storage,
             cold_storage,
             metrics,
+            metrics_registry,
             write_semaphore: Arc::new(Semaphore::new(backpressure.max_inflight_writes)),
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
@@ -385,6 +389,10 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
         state.metrics.record_error();
+        state
+            .metrics_registry
+            .enhanced_api
+            .record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -455,6 +463,22 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_write(body_len, latency_us);
 
+    // Record enhanced metrics
+    state
+        .metrics_registry
+        .enhanced_api
+        .record_write(&table, latency_us);
+    state
+        .metrics_registry
+        .consumer
+        .update_high_watermark(&table, partition, offset);
+    if let Ok(lwm) = state.storage.low_watermark(&table, partition) {
+        state
+            .metrics_registry
+            .hot
+            .update(&table, partition, lwm, offset);
+    }
+
     Ok((
         StatusCode::ACCEPTED,
         Json(WriteRecordResponse {
@@ -504,6 +528,10 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     // Acquire backpressure permit before processing
     let _permit = state.try_acquire_write_permit(total_bytes).map_err(|e| {
         state.metrics.record_error();
+        state
+            .metrics_registry
+            .enhanced_api
+            .record_backpressure_rejection();
         ApiError::from(e)
     })?;
 
@@ -634,6 +662,12 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_read(count as u64, latency_us);
 
+    // Record enhanced metrics
+    state
+        .metrics_registry
+        .enhanced_api
+        .record_read(&table, latency_us);
+
     Ok(Json(ReadRecordsResponse {
         records,
         count,
@@ -761,6 +795,14 @@ pub async fn commit_offset<H: HotStorage, C: ColdStorage>(
         .storage
         .commit_offset(&group, &request.topic, request.partition, request.offset)?;
 
+    // Record consumer metrics
+    state.metrics_registry.consumer.update_committed_offset(
+        &group,
+        &request.topic,
+        request.partition,
+        request.offset,
+    );
+
     Ok(Json(CommitOffsetResponse {
         group,
         topic: request.topic,
@@ -886,4 +928,229 @@ pub async fn compact_table<H: HotStorage, C: ColdStorage>(
             table
         ),
     }))
+}
+
+// ============================================================================
+// Health Check Endpoints (#10)
+// ============================================================================
+
+/// GET /health/live
+/// Kubernetes liveness probe - checks if the process is running.
+/// This is a lightweight check that always returns OK if the server is responsive.
+pub async fn health_live() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Response for readiness endpoint.
+#[derive(Debug, Serialize)]
+pub struct ReadinessResponse {
+    pub status: String,
+    pub hot_storage: ComponentHealth,
+    pub cold_storage: ComponentHealth,
+    pub backpressure: BackpressureHealth,
+}
+
+/// Health status for a single component.
+#[derive(Debug, Serialize)]
+pub struct ComponentHealth {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Backpressure health information.
+#[derive(Debug, Serialize)]
+pub struct BackpressureHealth {
+    pub status: String,
+    pub inflight_writes: usize,
+    pub inflight_bytes: u64,
+    pub max_inflight_bytes: u64,
+}
+
+/// GET /health/ready
+/// Kubernetes readiness probe - checks if the server can handle traffic.
+/// Verifies storage backends are accessible and backpressure limits aren't exceeded.
+pub async fn health_ready<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
+) -> Result<Json<ReadinessResponse>, (StatusCode, Json<ReadinessResponse>)> {
+    let mut overall_ready = true;
+
+    // Check hot storage by calling list_topics() - fast RocksDB metadata read
+    let hot_storage = match state.storage.list_topics() {
+        Ok(_) => ComponentHealth {
+            status: "ok".into(),
+            error: None,
+        },
+        Err(e) => {
+            overall_ready = false;
+            ComponentHealth {
+                status: "error".into(),
+                error: Some(e.to_string()),
+            }
+        }
+    };
+
+    // Check cold storage if configured
+    let cold_storage = if let Some(ref cold) = state.cold_storage {
+        let info = cold.storage_info();
+        if info.storage_type == "none" {
+            ComponentHealth {
+                status: "not_configured".into(),
+                error: None,
+            }
+        } else {
+            ComponentHealth {
+                status: "ok".into(),
+                error: None,
+            }
+        }
+    } else {
+        ComponentHealth {
+            status: "not_configured".into(),
+            error: None,
+        }
+    };
+
+    // Check backpressure status
+    let inflight_bytes = state.inflight_bytes.load(Ordering::Relaxed);
+    let max_inflight_bytes = state.max_inflight_bytes;
+    let inflight_writes = state.write_semaphore.available_permits();
+
+    // Consider backpressure unhealthy if at 90% capacity
+    let backpressure_threshold = (max_inflight_bytes as f64 * 0.9) as u64;
+    let backpressure_ok = inflight_bytes < backpressure_threshold;
+
+    let backpressure = BackpressureHealth {
+        status: if backpressure_ok { "ok" } else { "warning" }.into(),
+        inflight_writes,
+        inflight_bytes,
+        max_inflight_bytes,
+    };
+
+    if !backpressure_ok {
+        overall_ready = false;
+    }
+
+    let response = ReadinessResponse {
+        status: if overall_ready { "ready" } else { "not_ready" }.into(),
+        hot_storage,
+        cold_storage,
+        backpressure,
+    };
+
+    if overall_ready {
+        Ok(Json(response))
+    } else {
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(response)))
+    }
+}
+
+// ============================================================================
+// Prometheus Metrics Endpoint (#9)
+// ============================================================================
+
+/// GET /metrics
+/// Returns metrics in Prometheus text exposition format.
+/// Compatible with Prometheus scraping and the existing Grafana dashboard.
+pub async fn metrics<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
+) -> impl IntoResponse {
+    let metrics = &state.metrics;
+
+    let uptime_secs = metrics
+        .start_time
+        .get()
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+
+    let writes_total = metrics.writes_total.load(Ordering::Relaxed);
+    let writes_bytes = metrics.writes_bytes.load(Ordering::Relaxed);
+    let write_latency_sum = metrics.write_latency_sum_us.load(Ordering::Relaxed);
+
+    let reads_total = metrics.reads_total.load(Ordering::Relaxed);
+    let read_records_total = metrics.read_records_total.load(Ordering::Relaxed);
+    let read_latency_sum = metrics.read_latency_sum_us.load(Ordering::Relaxed);
+
+    let errors_total = metrics.errors_total.load(Ordering::Relaxed);
+
+    // Backpressure metrics
+    let inflight_bytes = state.inflight_bytes.load(Ordering::Relaxed);
+    let inflight_writes_available = state.write_semaphore.available_permits();
+
+    // Calculate rates and averages
+    let writes_rate = safe_rate(writes_total, uptime_secs);
+    let writes_avg_latency = safe_avg(write_latency_sum, writes_total);
+    let reads_rate = safe_rate(reads_total, uptime_secs);
+    let reads_avg_latency = safe_avg(read_latency_sum, reads_total);
+
+    // Build Prometheus text format output
+    let mut output = format!(
+        "# HELP zombi_uptime_secs Server uptime in seconds\n\
+         # TYPE zombi_uptime_secs gauge\n\
+         zombi_uptime_secs {:.3}\n\
+         \n\
+         # HELP zombi_writes_total Total write requests\n\
+         # TYPE zombi_writes_total counter\n\
+         zombi_writes_total {}\n\
+         \n\
+         # HELP zombi_writes_bytes_total Total bytes written\n\
+         # TYPE zombi_writes_bytes_total counter\n\
+         zombi_writes_bytes_total {}\n\
+         \n\
+         # HELP zombi_writes_rate_per_sec Current write rate (events per second)\n\
+         # TYPE zombi_writes_rate_per_sec gauge\n\
+         zombi_writes_rate_per_sec {:.2}\n\
+         \n\
+         # HELP zombi_writes_avg_latency_us Average write latency in microseconds\n\
+         # TYPE zombi_writes_avg_latency_us gauge\n\
+         zombi_writes_avg_latency_us {:.2}\n\
+         \n\
+         # HELP zombi_reads_total Total read requests\n\
+         # TYPE zombi_reads_total counter\n\
+         zombi_reads_total {}\n\
+         \n\
+         # HELP zombi_reads_records_total Total records read\n\
+         # TYPE zombi_reads_records_total counter\n\
+         zombi_reads_records_total {}\n\
+         \n\
+         # HELP zombi_reads_rate_per_sec Current read rate (requests per second)\n\
+         # TYPE zombi_reads_rate_per_sec gauge\n\
+         zombi_reads_rate_per_sec {:.2}\n\
+         \n\
+         # HELP zombi_reads_avg_latency_us Average read latency in microseconds\n\
+         # TYPE zombi_reads_avg_latency_us gauge\n\
+         zombi_reads_avg_latency_us {:.2}\n\
+         \n\
+         # HELP zombi_errors_total Total errors\n\
+         # TYPE zombi_errors_total counter\n\
+         zombi_errors_total {}\n\
+         \n\
+         # HELP zombi_inflight_bytes Current inflight write bytes\n\
+         # TYPE zombi_inflight_bytes gauge\n\
+         zombi_inflight_bytes {}\n\
+         \n\
+         # HELP zombi_inflight_writes_available Available write permits\n\
+         # TYPE zombi_inflight_writes_available gauge\n\
+         zombi_inflight_writes_available {}\n",
+        uptime_secs,
+        writes_total,
+        writes_bytes,
+        writes_rate,
+        writes_avg_latency,
+        reads_total,
+        read_records_total,
+        reads_rate,
+        reads_avg_latency,
+        errors_total,
+        inflight_bytes,
+        inflight_writes_available,
+    );
+
+    // Append enhanced metrics from MetricsRegistry
+    output.push_str(&state.metrics_registry.format_prometheus());
+
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        output,
+    )
 }

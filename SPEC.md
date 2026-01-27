@@ -275,12 +275,109 @@ GET /consumers/{group}/offset?topic=events&partition=0
 ### Admin APIs
 
 ```http
-GET /health
-GET /stats
+GET /health                    # Basic health check (JSON)
+GET /health/live               # Kubernetes liveness probe
+GET /health/ready              # Kubernetes readiness probe
+GET /stats                     # Server statistics (JSON)
+GET /metrics                   # Prometheus metrics format
 GET /tables                    # List all tables
 GET /tables/{table}/metadata   # Iceberg metadata location
 POST /tables/{table}/compact   # Trigger compaction
 POST /tables/{table}/flush     # Force flush to Iceberg
+```
+
+#### Health Endpoints
+
+**Liveness Probe** (`GET /health/live`):
+```http
+GET /health/live
+
+Response 200:
+{
+  "status": "ok"
+}
+```
+
+**Readiness Probe** (`GET /health/ready`):
+```http
+GET /health/ready
+
+Response 200 (ready):
+{
+  "status": "ready",
+  "hot_storage": {"status": "ok"},
+  "cold_storage": {"status": "ok"},
+  "backpressure": {
+    "status": "ok",
+    "inflight_writes": 10000,
+    "inflight_bytes": 1048576,
+    "max_inflight_bytes": 67108864
+  }
+}
+
+Response 503 (not ready):
+{
+  "status": "not_ready",
+  "hot_storage": {"status": "error", "error": "RocksDB unavailable"},
+  "cold_storage": {"status": "ok"},
+  "backpressure": {"status": "warning", ...}
+}
+```
+
+#### Prometheus Metrics
+
+**Metrics Endpoint** (`GET /metrics`):
+```http
+GET /metrics
+
+Response 200 (text/plain):
+# HELP zombi_uptime_secs Server uptime in seconds
+# TYPE zombi_uptime_secs gauge
+zombi_uptime_secs 3600.5
+
+# HELP zombi_writes_total Total write requests
+# TYPE zombi_writes_total counter
+zombi_writes_total 150000
+
+# HELP zombi_writes_bytes_total Total bytes written
+# TYPE zombi_writes_bytes_total counter
+zombi_writes_bytes_total 75000000
+
+# HELP zombi_writes_rate_per_sec Current write rate
+# TYPE zombi_writes_rate_per_sec gauge
+zombi_writes_rate_per_sec 41.67
+
+# HELP zombi_writes_avg_latency_us Average write latency
+# TYPE zombi_writes_avg_latency_us gauge
+zombi_writes_avg_latency_us 85.30
+
+# HELP zombi_reads_total Total read requests
+# TYPE zombi_reads_total counter
+zombi_reads_total 50000
+
+# HELP zombi_reads_records_total Total records read
+# TYPE zombi_reads_records_total counter
+zombi_reads_records_total 500000
+
+# HELP zombi_reads_rate_per_sec Current read rate
+# TYPE zombi_reads_rate_per_sec gauge
+zombi_reads_rate_per_sec 13.89
+
+# HELP zombi_reads_avg_latency_us Average read latency
+# TYPE zombi_reads_avg_latency_us gauge
+zombi_reads_avg_latency_us 120.50
+
+# HELP zombi_errors_total Total errors
+# TYPE zombi_errors_total counter
+zombi_errors_total 5
+
+# HELP zombi_inflight_bytes Current inflight write bytes
+# TYPE zombi_inflight_bytes gauge
+zombi_inflight_bytes 1048576
+
+# HELP zombi_inflight_writes_available Available write permits
+# TYPE zombi_inflight_writes_available gauge
+zombi_inflight_writes_available 9500
 ```
 
 ---

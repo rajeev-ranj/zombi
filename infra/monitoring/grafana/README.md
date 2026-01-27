@@ -6,7 +6,7 @@ This directory contains a Grafana dashboard for monitoring Zombi event streaming
 
 The dashboard (`zombi-dashboard.json`) displays:
 
-### Application Metrics (from `/stats` endpoint)
+### Application Metrics (from `/metrics` endpoint)
 - **Uptime** - Server uptime in seconds
 - **Total Errors** - Cumulative error count
 - **Total Writes** - Number of write operations
@@ -18,6 +18,8 @@ The dashboard (`zombi-dashboard.json`) displays:
 - **Read Rate** - Read requests per second
 - **Read Latency** - Average read latency in microseconds
 - **Error Rate** - Errors per second (5m rolling)
+- **Inflight Bytes** - Current inflight write bytes
+- **Available Write Permits** - Remaining write capacity
 
 ### Infrastructure Metrics (from CloudWatch)
 - **CPU Usage** - User and system CPU utilization
@@ -28,7 +30,7 @@ The dashboard (`zombi-dashboard.json`) displays:
 ## Prerequisites
 
 1. **Grafana** (v9.0.0 or later)
-2. **Prometheus** - For scraping Zombi `/stats` endpoint
+2. **Prometheus** - For scraping Zombi `/metrics` endpoint
 3. **CloudWatch datasource** - For AWS infrastructure metrics (optional)
 
 ## Setup Instructions
@@ -41,18 +43,12 @@ Add the following to your Prometheus configuration (`prometheus.yml`):
 scrape_configs:
   - job_name: 'zombi'
     scrape_interval: 15s
-    metrics_path: /stats
+    metrics_path: /metrics
     static_configs:
       - targets: ['localhost:8080']  # Replace with your Zombi host:port
-    metric_relabel_configs:
-      # Convert JSON response to Prometheus metrics
-      - source_labels: [__name__]
-        regex: '(.*)'
-        target_label: __name__
-        replacement: 'zombi_$1'
 ```
 
-Alternatively, use a JSON exporter or custom scraper to convert the `/stats` JSON to Prometheus metrics format.
+That's it! Zombi natively exposes metrics in Prometheus text format, so no JSON exporter or metric relabeling is needed.
 
 ### Step 2: Add Datasources in Grafana
 
@@ -70,7 +66,7 @@ Alternatively, use a JSON exporter or custom scraper to convert the `/stats` JSO
 
 ## Alternative: Direct JSON Polling
 
-If you prefer not to use Prometheus, you can use the **JSON API datasource** plugin:
+If you prefer not to use Prometheus, you can use the **JSON API datasource** plugin with the `/stats` endpoint:
 
 1. Install the [JSON API datasource](https://grafana.com/grafana/plugins/marcusolsson-json-datasource/) plugin
 2. Configure it to poll `http://<zombi-host>:8080/stats`
@@ -85,6 +81,25 @@ If you prefer not to use Prometheus, you can use the **JSON API datasource** plu
    - `$.errors_total` for errors
 
 ## Metrics Reference
+
+### Prometheus Format (`/metrics` endpoint - Recommended)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `zombi_uptime_secs` | gauge | Server uptime in seconds |
+| `zombi_writes_total` | counter | Total write requests |
+| `zombi_writes_bytes_total` | counter | Total bytes written |
+| `zombi_writes_rate_per_sec` | gauge | Current write rate (events/sec) |
+| `zombi_writes_avg_latency_us` | gauge | Average write latency (μs) |
+| `zombi_reads_total` | counter | Total read requests |
+| `zombi_reads_records_total` | counter | Total records read |
+| `zombi_reads_rate_per_sec` | gauge | Current read rate (requests/sec) |
+| `zombi_reads_avg_latency_us` | gauge | Average read latency (μs) |
+| `zombi_errors_total` | counter | Total errors |
+| `zombi_inflight_bytes` | gauge | Current inflight write bytes |
+| `zombi_inflight_writes_available` | gauge | Available write permits |
+
+### JSON Format (`/stats` endpoint - Legacy)
 
 The `/stats` endpoint returns:
 
@@ -117,6 +132,7 @@ Feel free to modify the dashboard to suit your needs:
 
 ## Troubleshooting
 
-- **No data in Prometheus panels**: Verify Prometheus is scraping the `/stats` endpoint correctly
+- **No data in Prometheus panels**: Verify Prometheus is scraping the `/metrics` endpoint correctly. You can test with: `curl http://localhost:8080/metrics`
 - **No data in CloudWatch panels**: Ensure the CloudWatch agent is installed and configured (see `../cloudwatch-agent.json`)
 - **Import errors**: Verify Grafana version is 9.0.0 or later
+- **Migration from /stats**: If upgrading from an older setup using `/stats` with a JSON exporter, simply update `metrics_path: /stats` to `metrics_path: /metrics` in your Prometheus config and remove any `metric_relabel_configs`
