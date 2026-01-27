@@ -131,6 +131,44 @@ pub trait HotStorage: Send + Sync {
     }
 }
 
+/// Specifies which columns to read from cold storage.
+/// When `fields` is `None`, all columns are returned (default behavior).
+/// When `fields` is `Some(...)`, only the specified columns are projected,
+/// enabling Parquet column pruning for I/O and CPU savings.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnProjection {
+    pub fields: Option<Vec<String>>,
+}
+
+impl ColumnProjection {
+    /// Returns a projection that reads all columns.
+    pub fn all() -> Self {
+        Self { fields: None }
+    }
+
+    /// Returns a projection that reads only the specified columns.
+    pub fn select(fields: Vec<String>) -> Self {
+        Self {
+            fields: Some(fields),
+        }
+    }
+
+    /// Returns `true` if all columns should be read.
+    pub fn is_all(&self) -> bool {
+        self.fields.is_none()
+    }
+}
+
+/// The set of known base column names for validation.
+pub const KNOWN_COLUMNS: &[&str] = &[
+    "sequence",
+    "topic",
+    "partition",
+    "payload",
+    "timestamp_ms",
+    "idempotency_key",
+];
+
 /// An event with its storage metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEvent {
@@ -140,6 +178,45 @@ pub struct StoredEvent {
     pub payload: Vec<u8>,
     pub timestamp_ms: i64,
     pub idempotency_key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_projection_all_returns_none_fields() {
+        let proj = ColumnProjection::all();
+        assert!(proj.is_all());
+        assert!(proj.fields.is_none());
+    }
+
+    #[test]
+    fn column_projection_select_returns_specified_fields() {
+        let proj = ColumnProjection::select(vec!["payload".into(), "timestamp_ms".into()]);
+        assert!(!proj.is_all());
+        assert_eq!(
+            proj.fields.unwrap(),
+            vec!["payload".to_string(), "timestamp_ms".to_string()]
+        );
+    }
+
+    #[test]
+    fn column_projection_default_is_all() {
+        let proj = ColumnProjection::default();
+        assert!(proj.is_all());
+    }
+
+    #[test]
+    fn known_columns_contains_base_fields() {
+        assert!(KNOWN_COLUMNS.contains(&"sequence"));
+        assert!(KNOWN_COLUMNS.contains(&"payload"));
+        assert!(KNOWN_COLUMNS.contains(&"timestamp_ms"));
+        assert!(KNOWN_COLUMNS.contains(&"topic"));
+        assert!(KNOWN_COLUMNS.contains(&"partition"));
+        assert!(KNOWN_COLUMNS.contains(&"idempotency_key"));
+        assert!(!KNOWN_COLUMNS.contains(&"nonexistent"));
+    }
 }
 
 /// An event for bulk write operations.

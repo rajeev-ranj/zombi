@@ -3,6 +3,7 @@ use std::future::Future;
 use serde::Serialize;
 
 use crate::contracts::error::StorageError;
+use crate::contracts::storage::ColumnProjection;
 use crate::contracts::StoredEvent;
 
 /// Information about the cold storage backend.
@@ -42,6 +43,7 @@ pub trait ColdStorage: Send + Sync {
 
     /// Reads events from cold storage starting at the given offset.
     /// Optional time range parameters enable partition pruning for better performance.
+    #[allow(clippy::too_many_arguments)]
     fn read_events(
         &self,
         topic: &str,
@@ -50,6 +52,7 @@ pub trait ColdStorage: Send + Sync {
         limit: usize,
         since_ms: Option<i64>,
         until_ms: Option<i64>,
+        projection: &ColumnProjection,
     ) -> impl Future<Output = Result<Vec<StoredEvent>, StorageError>> + Send;
 
     /// Lists all segments for a topic/partition.

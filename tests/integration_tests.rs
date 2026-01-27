@@ -768,3 +768,234 @@ async fn test_metrics_values_update_after_writes() {
     // Verify bytes were written
     assert!(body_str.contains("zombi_writes_bytes_total"));
 }
+
+// ============================================================================
+// Column Projection Tests (#38)
+// ============================================================================
+
+#[tokio::test]
+async fn test_read_without_fields_returns_default_response() {
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/proj_test")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "hello projection", "partition": 0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Read without fields param
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/proj_test?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Default response has payload + timestamp_ms (backward compatible)
+    let record = &json["records"][0];
+    assert_eq!(record["payload"], "hello projection");
+    assert!(record["timestamp_ms"].is_number());
+    // Should NOT have sequence, topic, partition, idempotency_key by default
+    assert!(record.get("sequence").is_none());
+    assert!(record.get("topic").is_none());
+}
+
+#[tokio::test]
+async fn test_read_with_fields_returns_projected_response() {
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/proj_test2")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "field test", "partition": 0, "idempotency_key": "key-1"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Read with fields=payload,timestamp_ms,sequence
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/proj_test2?limit=10&fields=payload,timestamp_ms,sequence")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let record = &json["records"][0];
+    // Requested fields present
+    assert_eq!(record["payload"], "field test");
+    assert!(record["timestamp_ms"].is_number());
+    assert!(record["sequence"].is_number());
+    // Non-requested fields absent
+    assert!(record.get("topic").is_none());
+    assert!(record.get("partition").is_none());
+    assert!(record.get("idempotency_key").is_none());
+}
+
+#[tokio::test]
+async fn test_read_with_invalid_field_returns_400() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/proj_test3?fields=bogus_field")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown field 'bogus_field'"));
+}
+
+#[tokio::test]
+async fn test_read_with_single_field() {
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/proj_test4")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "single field", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Read with fields=payload only
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/proj_test4?limit=10&fields=payload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let record = &json["records"][0];
+    assert_eq!(record["payload"], "single field");
+    // Only payload should be present
+    let obj = record.as_object().unwrap();
+    assert_eq!(obj.len(), 1);
+    assert!(obj.contains_key("payload"));
+}
+
+#[tokio::test]
+async fn test_read_with_fields_and_since_filter() {
+    let (app, _dir) = create_test_app();
+
+    // Write two records with different timestamps
+    let app_clone = app.clone();
+    app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/proj_test5")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "old event", "partition": 0, "timestamp_ms": 1000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let app_clone2 = app.clone();
+    app_clone2
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/proj_test5")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "new event", "partition": 0, "timestamp_ms": 2000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Read with fields + since filter
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/proj_test5?limit=10&fields=sequence,payload&since=1500")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["count"], 1);
+    let record = &json["records"][0];
+    assert_eq!(record["payload"], "new event");
+    assert!(record["sequence"].is_number());
+    assert!(record.get("timestamp_ms").is_none());
+}

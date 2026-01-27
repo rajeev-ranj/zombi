@@ -191,6 +191,7 @@ impl ColdStorage for S3Storage {
         limit: usize,
         _since_ms: Option<i64>,
         _until_ms: Option<i64>,
+        _projection: &crate::contracts::ColumnProjection,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         // List segments that might contain our offset
         let segments = self.list_segments(topic, partition).await?;
