@@ -25,19 +25,14 @@ fn default_true() -> bool {
 }
 
 /// Payload content format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadFormat {
     /// Parse payload as JSON, extract fields by key path.
     Json,
     /// No extraction possible, store as binary blob (current behavior).
+    #[default]
     Binary,
-}
-
-impl Default for PayloadFormat {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 /// A field to extract from the payload into a typed Parquet column.

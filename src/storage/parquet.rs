@@ -1181,7 +1181,7 @@ mod tests {
 
         let (bytes, metadata) = write_parquet_to_bytes_structured(&events, &config).unwrap();
         assert_eq!(metadata.row_count, 2);
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
 
         // Read back and verify columns exist
         use bytes::Bytes;
