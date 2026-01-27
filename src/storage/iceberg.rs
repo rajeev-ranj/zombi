@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::contracts::StorageError;
+use crate::contracts::{StorageError, TableSchemaConfig};
 use crate::storage::ParquetFileMetadata;
 
 /// Iceberg schema field IDs.
@@ -27,6 +27,12 @@ pub mod field_ids {
     pub const EVENT_DATE: i32 = 7;
     /// event_hour (int) - partition column, hour of day (0-23)
     pub const EVENT_HOUR: i32 = 8;
+    /// First field ID for extracted payload columns.
+    /// Extracted fields are assigned IDs 100, 101, 102, ... to avoid conflicts
+    /// with system field IDs (1-8) and partition field IDs (1000+).
+    pub const EXTRACTED_START: i32 = 100;
+    /// Field ID for the _payload_overflow column (replaces payload when extraction is active).
+    pub const PAYLOAD_OVERFLOW: i32 = 99;
 }
 
 /// Iceberg binary encoding utilities for column statistics.
@@ -171,6 +177,94 @@ impl Default for IcebergSchema {
                 },
             ],
         }
+    }
+}
+
+impl IcebergSchema {
+    /// Creates an Iceberg schema with extracted payload columns.
+    ///
+    /// The schema replaces the opaque `payload` (binary) column with:
+    /// - One typed column per `ExtractedField` (field IDs starting at 100)
+    /// - A `_payload_overflow` (binary, nullable) column (field ID 99) for unextracted data
+    pub fn with_extracted_fields(config: &TableSchemaConfig) -> Self {
+        let mut fields = vec![
+            IcebergField {
+                id: field_ids::SEQUENCE,
+                name: "sequence".into(),
+                field_type: "long".into(),
+                required: true,
+            },
+            IcebergField {
+                id: field_ids::TOPIC,
+                name: "topic".into(),
+                field_type: "string".into(),
+                required: true,
+            },
+            IcebergField {
+                id: field_ids::PARTITION,
+                name: "partition".into(),
+                field_type: "int".into(),
+                required: true,
+            },
+            // payload (field ID 4) is omitted — replaced by extracted + overflow
+            IcebergField {
+                id: field_ids::TIMESTAMP_MS,
+                name: "timestamp_ms".into(),
+                field_type: "long".into(),
+                required: true,
+            },
+            IcebergField {
+                id: field_ids::IDEMPOTENCY_KEY,
+                name: "idempotency_key".into(),
+                field_type: "string".into(),
+                required: false,
+            },
+        ];
+
+        // Add extracted columns
+        for (i, f) in config.fields.iter().enumerate() {
+            fields.push(IcebergField {
+                id: field_ids::EXTRACTED_START + i as i32,
+                name: f.name.clone(),
+                field_type: f.data_type.iceberg_type().into(),
+                required: !f.nullable,
+            });
+        }
+
+        // Overflow column
+        if config.preserve_overflow {
+            fields.push(IcebergField {
+                id: field_ids::PAYLOAD_OVERFLOW,
+                name: "_payload_overflow".into(),
+                field_type: "binary".into(),
+                required: false,
+            });
+        }
+
+        // Partition columns
+        fields.push(IcebergField {
+            id: field_ids::EVENT_DATE,
+            name: "event_date".into(),
+            field_type: "date".into(),
+            required: true,
+        });
+        fields.push(IcebergField {
+            id: field_ids::EVENT_HOUR,
+            name: "event_hour".into(),
+            field_type: "int".into(),
+            required: true,
+        });
+
+        Self {
+            schema_type: "struct".into(),
+            schema_id: 1, // New schema version for structured columns
+            fields,
+        }
+    }
+
+    /// Returns the highest field ID in this schema.
+    pub fn last_column_id(&self) -> i32 {
+        self.fields.iter().map(|f| f.id).max().unwrap_or(0)
     }
 }
 
@@ -393,6 +487,36 @@ impl TableMetadata {
             // Default to timestamp_sequence for optimized queries
             sort_orders: vec![SortOrder::unsorted(), SortOrder::timestamp_sequence()],
             default_sort_order_id: 1, // Use timestamp_sequence by default
+        }
+    }
+
+    /// Creates table metadata with structured column extraction.
+    ///
+    /// Uses a schema derived from `TableSchemaConfig` where payload bytes are
+    /// split into typed columns + overflow, instead of an opaque binary blob.
+    pub fn with_schema_config(location: &str, config: &TableSchemaConfig) -> Self {
+        let schema = IcebergSchema::with_extracted_fields(config);
+        let last_col = schema.last_column_id();
+        let schema_id = schema.schema_id;
+
+        Self {
+            format_version: 2,
+            table_uuid: Uuid::new_v4().to_string(),
+            location: location.to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: current_timestamp_ms(),
+            last_column_id: last_col,
+            schemas: vec![schema],
+            current_schema_id: schema_id,
+            partition_specs: vec![PartitionSpec::default()],
+            default_spec_id: 0,
+            last_partition_id: 999,
+            properties: HashMap::new(),
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            sort_orders: vec![SortOrder::unsorted(), SortOrder::timestamp_sequence()],
+            default_sort_order_id: 1,
         }
     }
 
@@ -960,5 +1084,126 @@ mod tests {
         let parsed: SortOrder = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.order_id, 1);
         assert_eq!(parsed.fields.len(), 2);
+    }
+
+    #[test]
+    fn test_iceberg_schema_with_extracted_fields() {
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "clicks".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![
+                ExtractedField {
+                    name: "user_id".into(),
+                    json_path: "user_id".into(),
+                    data_type: FieldType::Utf8,
+                    nullable: true,
+                },
+                ExtractedField {
+                    name: "value".into(),
+                    json_path: "value".into(),
+                    data_type: FieldType::Int64,
+                    nullable: true,
+                },
+            ],
+            preserve_overflow: true,
+        };
+
+        let schema = IcebergSchema::with_extracted_fields(&config);
+
+        assert_eq!(schema.schema_id, 1);
+
+        // Check field names
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"sequence"));
+        assert!(names.contains(&"topic"));
+        assert!(names.contains(&"partition"));
+        assert!(names.contains(&"timestamp_ms"));
+        assert!(names.contains(&"idempotency_key"));
+        assert!(names.contains(&"user_id"));
+        assert!(names.contains(&"value"));
+        assert!(names.contains(&"_payload_overflow"));
+        assert!(names.contains(&"event_date"));
+        assert!(names.contains(&"event_hour"));
+
+        // payload should NOT be present
+        assert!(!names.contains(&"payload"));
+
+        // Extracted fields should have IDs starting at 100
+        let user_id_field = schema.fields.iter().find(|f| f.name == "user_id").unwrap();
+        assert_eq!(user_id_field.id, field_ids::EXTRACTED_START);
+        assert_eq!(user_id_field.field_type, "string");
+        assert!(!user_id_field.required); // nullable
+
+        let value_field = schema.fields.iter().find(|f| f.name == "value").unwrap();
+        assert_eq!(value_field.id, field_ids::EXTRACTED_START + 1);
+        assert_eq!(value_field.field_type, "long");
+
+        // Overflow field
+        let overflow = schema
+            .fields
+            .iter()
+            .find(|f| f.name == "_payload_overflow")
+            .unwrap();
+        assert_eq!(overflow.id, field_ids::PAYLOAD_OVERFLOW);
+        assert!(!overflow.required);
+    }
+
+    #[test]
+    fn test_table_metadata_with_schema_config() {
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "clicks".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![ExtractedField {
+                name: "user_id".into(),
+                json_path: "user_id".into(),
+                data_type: FieldType::Utf8,
+                nullable: true,
+            }],
+            preserve_overflow: true,
+        };
+
+        let metadata = TableMetadata::with_schema_config("s3://bucket/tables/clicks", &config);
+
+        assert_eq!(metadata.current_schema_id, 1);
+        assert!(metadata.last_column_id >= field_ids::EXTRACTED_START);
+        assert_eq!(metadata.schemas.len(), 1);
+        assert_eq!(metadata.schemas[0].schema_id, 1);
+    }
+
+    #[test]
+    fn test_iceberg_schema_last_column_id() {
+        let schema = IcebergSchema::default();
+        assert_eq!(schema.last_column_id(), 8);
+
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "test".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![
+                ExtractedField {
+                    name: "a".into(),
+                    json_path: "a".into(),
+                    data_type: FieldType::Utf8,
+                    nullable: true,
+                },
+                ExtractedField {
+                    name: "b".into(),
+                    json_path: "b".into(),
+                    data_type: FieldType::Int64,
+                    nullable: true,
+                },
+            ],
+            preserve_overflow: true,
+        };
+
+        let schema = IcebergSchema::with_extracted_fields(&config);
+        // Max should be extracted field: 101 (100 + 1)
+        // But we also have system fields up to 8, and partition fields 7,8
+        assert_eq!(schema.last_column_id(), 101); // EXTRACTED_START + 1
     }
 }

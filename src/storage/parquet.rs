@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Date32Array, Int32Array, Int64Array, StringArray, UInt32Array,
-    UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+    StringArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -13,7 +13,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::contracts::{StorageError, StoredEvent};
+use crate::contracts::{FieldType, StorageError, StoredEvent, TableSchemaConfig};
+use crate::storage::payload_extractor::{self, ExtractedValue};
 
 /// Creates default Parquet writer properties optimized for Iceberg.
 ///
@@ -124,6 +125,242 @@ pub fn event_schema() -> Schema {
         Field::new("event_date", DataType::Date32, false),
         Field::new("event_hour", DataType::Int32, false),
     ])
+}
+
+/// Returns an Arrow schema with extracted columns for structured payloads.
+///
+/// Layout:
+/// - System columns: sequence, topic, partition, timestamp_ms, idempotency_key
+/// - Extracted columns: one per `TableSchemaConfig.fields` entry (nullable)
+/// - Overflow column: `_payload_overflow` (Binary, nullable) if `preserve_overflow`
+/// - Partition columns: event_date, event_hour
+pub fn event_schema_with_extraction(config: &TableSchemaConfig) -> Schema {
+    let mut fields = vec![
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("topic", DataType::Utf8, false),
+        Field::new("partition", DataType::UInt32, false),
+        // payload (field ID 4) is replaced by extracted + overflow columns
+        Field::new("timestamp_ms", DataType::Int64, false),
+        Field::new("idempotency_key", DataType::Utf8, true),
+    ];
+
+    // Add extracted field columns
+    for f in &config.fields {
+        let arrow_type = match f.data_type {
+            FieldType::Utf8 => DataType::Utf8,
+            FieldType::Int32 => DataType::Int32,
+            FieldType::Int64 => DataType::Int64,
+            FieldType::Float64 => DataType::Float64,
+            FieldType::Boolean => DataType::Boolean,
+            FieldType::Binary => DataType::Binary,
+        };
+        fields.push(Field::new(&f.name, arrow_type, f.nullable));
+    }
+
+    // Overflow column (replaces original payload column at field ID 4)
+    if config.preserve_overflow {
+        fields.push(Field::new("_payload_overflow", DataType::Binary, true));
+    }
+
+    // Partition columns
+    fields.push(Field::new("event_date", DataType::Date32, false));
+    fields.push(Field::new("event_hour", DataType::Int32, false));
+
+    Schema::new(fields)
+}
+
+/// Converts events to a RecordBatch with structured extracted columns.
+///
+/// Parses each event's payload according to the schema config, extracts typed
+/// columns, and collects overflow data. This is the core of the structured
+/// columns feature — called only at flush time (cold path).
+pub fn events_to_record_batch_structured(
+    events: &[StoredEvent],
+    config: &TableSchemaConfig,
+) -> Result<RecordBatch, StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot create batch from empty events".into(),
+        ));
+    }
+
+    let schema = Arc::new(event_schema_with_extraction(config));
+
+    // Extract fields from all payloads
+    let payloads: Vec<&[u8]> = events.iter().map(|e| e.payload.as_slice()).collect();
+    let extractions = payload_extractor::extract_batch(&payloads, config)?;
+
+    // Build system columns
+    let sequences: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+    let topics: Vec<&str> = events.iter().map(|e| e.topic.as_str()).collect();
+    let partitions: Vec<u32> = events.iter().map(|e| e.partition).collect();
+    let timestamps: Vec<i64> = events.iter().map(|e| e.timestamp_ms).collect();
+    let idempotency_keys: Vec<Option<&str>> = events
+        .iter()
+        .map(|e| e.idempotency_key.as_deref())
+        .collect();
+
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(sequences)),
+        Arc::new(StringArray::from(topics)),
+        Arc::new(UInt32Array::from(partitions)),
+        // Note: payload column is omitted — replaced by extracted + overflow
+        Arc::new(Int64Array::from(timestamps)),
+        Arc::new(StringArray::from(idempotency_keys)),
+    ];
+
+    // Build extracted field columns
+    for (field_idx, field_def) in config.fields.iter().enumerate() {
+        let array: ArrayRef = match field_def.data_type {
+            FieldType::Utf8 => {
+                let vals: Vec<Option<String>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Utf8(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(StringArray::from(vals))
+            }
+            FieldType::Int32 => {
+                let vals: Vec<Option<i32>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Int32(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int32Array::from(vals))
+            }
+            FieldType::Int64 => {
+                let vals: Vec<Option<i64>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Int64(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Int64Array::from(vals))
+            }
+            FieldType::Float64 => {
+                let vals: Vec<Option<f64>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Float64(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(Float64Array::from(vals))
+            }
+            FieldType::Boolean => {
+                let vals: Vec<Option<bool>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Boolean(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                Arc::new(BooleanArray::from(vals))
+            }
+            FieldType::Binary => {
+                let vals: Vec<Option<Vec<u8>>> = extractions
+                    .iter()
+                    .map(|ex| match &ex.values[field_idx] {
+                        Some(ExtractedValue::Binary(v)) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
+                Arc::new(BinaryArray::from(refs))
+            }
+        };
+        columns.push(array);
+    }
+
+    // Overflow column
+    if config.preserve_overflow {
+        let overflow_vals: Vec<Option<&[u8]>> = extractions
+            .iter()
+            .map(|ex| ex.overflow.as_deref())
+            .collect();
+        columns.push(Arc::new(BinaryArray::from(overflow_vals)));
+    }
+
+    // Partition columns
+    let partition_values: Vec<(i32, i32)> = events
+        .iter()
+        .map(|e| derive_partition_columns(e.timestamp_ms))
+        .collect();
+    let event_dates: Vec<i32> = partition_values.iter().map(|(d, _)| *d).collect();
+    let event_hours: Vec<i32> = partition_values.iter().map(|(_, h)| *h).collect();
+    columns.push(Arc::new(Date32Array::from(event_dates)));
+    columns.push(Arc::new(Int32Array::from(event_hours)));
+
+    RecordBatch::try_new(schema, columns).map_err(|e| StorageError::Serialization(e.to_string()))
+}
+
+/// Writes events to Parquet bytes with structured column extraction.
+pub fn write_parquet_to_bytes_structured(
+    events: &[StoredEvent],
+    config: &TableSchemaConfig,
+) -> Result<(Vec<u8>, ParquetFileMetadata), StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot write empty events to Parquet".into(),
+        ));
+    }
+
+    let batch = events_to_record_batch_structured(events, config)?;
+    let props = default_writer_properties();
+
+    let mut buffer = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props))
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    writer
+        .write(&batch)
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    writer
+        .close()
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    let column_stats = compute_column_statistics(events)?;
+    let partition_values = compute_partition_bounds(events)?;
+
+    let metadata = ParquetFileMetadata {
+        path: String::new(),
+        row_count: events.len(),
+        min_sequence: column_stats.sequence_min,
+        max_sequence: column_stats.sequence_max,
+        min_timestamp_ms: column_stats.timestamp_min,
+        max_timestamp_ms: column_stats.timestamp_max,
+        file_size_bytes: buffer.len() as u64,
+        partition_values,
+        column_stats,
+    };
+
+    Ok((buffer, metadata))
+}
+
+/// Writes events to Parquet bytes with structured extraction and sorting.
+pub fn write_parquet_to_bytes_structured_sorted(
+    events: &mut [StoredEvent],
+    config: &TableSchemaConfig,
+) -> Result<(Vec<u8>, ParquetFileMetadata), StorageError> {
+    if events.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "Cannot write empty events to Parquet".into(),
+        ));
+    }
+
+    events.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then(a.sequence.cmp(&b.sequence))
+    });
+
+    write_parquet_to_bytes_structured(events, config)
 }
 
 /// Converts a slice of StoredEvent to an Arrow RecordBatch.
@@ -854,5 +1091,194 @@ mod tests {
         // Events should be sorted
         assert_eq!(events[0].timestamp_ms, 1000);
         assert_eq!(events[1].timestamp_ms, 2000);
+    }
+
+    #[test]
+    fn test_structured_schema_has_extracted_columns() {
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "clicks".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![
+                ExtractedField {
+                    name: "user_id".into(),
+                    json_path: "user_id".into(),
+                    data_type: FieldType::Utf8,
+                    nullable: true,
+                },
+                ExtractedField {
+                    name: "value".into(),
+                    json_path: "value".into(),
+                    data_type: FieldType::Int64,
+                    nullable: true,
+                },
+            ],
+            preserve_overflow: true,
+        };
+
+        let schema = event_schema_with_extraction(&config);
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // System columns + extracted + overflow + partition
+        assert!(field_names.contains(&"sequence"));
+        assert!(field_names.contains(&"topic"));
+        assert!(field_names.contains(&"partition"));
+        assert!(field_names.contains(&"timestamp_ms"));
+        assert!(field_names.contains(&"idempotency_key"));
+        assert!(field_names.contains(&"user_id"));
+        assert!(field_names.contains(&"value"));
+        assert!(field_names.contains(&"_payload_overflow"));
+        assert!(field_names.contains(&"event_date"));
+        assert!(field_names.contains(&"event_hour"));
+
+        // payload column should NOT be present
+        assert!(!field_names.contains(&"payload"));
+    }
+
+    #[test]
+    fn test_structured_record_batch_roundtrip() {
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "clicks".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![
+                ExtractedField {
+                    name: "user_id".into(),
+                    json_path: "user_id".into(),
+                    data_type: FieldType::Utf8,
+                    nullable: true,
+                },
+                ExtractedField {
+                    name: "value".into(),
+                    json_path: "value".into(),
+                    data_type: FieldType::Int64,
+                    nullable: true,
+                },
+            ],
+            preserve_overflow: true,
+        };
+
+        let events = vec![
+            StoredEvent {
+                sequence: 1,
+                topic: "clicks".into(),
+                partition: 0,
+                payload: br#"{"user_id":"u1","value":42,"extra":"x"}"#.to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 2,
+                topic: "clicks".into(),
+                partition: 0,
+                payload: br#"{"user_id":"u2","value":99}"#.to_vec(),
+                timestamp_ms: 2000,
+                idempotency_key: Some("k2".into()),
+            },
+        ];
+
+        let (bytes, metadata) = write_parquet_to_bytes_structured(&events, &config).unwrap();
+        assert_eq!(metadata.row_count, 2);
+        assert!(!bytes.is_empty());
+
+        // Read back and verify columns exist
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let bytes = Bytes::from(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let reader = builder.build().unwrap();
+
+        let batches: Vec<_> = reader.into_iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        // Verify user_id column
+        let user_id_col = batch
+            .column_by_name("user_id")
+            .expect("user_id column should exist");
+        let user_ids = user_id_col.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(user_ids.value(0), "u1");
+        assert_eq!(user_ids.value(1), "u2");
+
+        // Verify value column
+        let value_col = batch
+            .column_by_name("value")
+            .expect("value column should exist");
+        let values = value_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.value(0), 42);
+        assert_eq!(values.value(1), 99);
+
+        // Verify overflow column exists
+        use arrow::array::Array;
+        let overflow_col = batch
+            .column_by_name("_payload_overflow")
+            .expect("overflow column should exist");
+        let overflow = overflow_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+
+        // First event had "extra" field → overflow should contain it
+        assert!(!overflow.is_null(0));
+        let overflow_json: serde_json::Value = serde_json::from_slice(overflow.value(0)).unwrap();
+        assert_eq!(overflow_json, serde_json::json!({"extra": "x"}));
+
+        // Second event had no extra fields → overflow should be null
+        assert!(overflow.is_null(1));
+    }
+
+    #[test]
+    fn test_structured_sorted_preserves_order() {
+        use crate::contracts::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
+
+        let config = TableSchemaConfig {
+            table: "test".into(),
+            payload_format: PayloadFormat::Json,
+            fields: vec![ExtractedField {
+                name: "v".into(),
+                json_path: "v".into(),
+                data_type: FieldType::Int64,
+                nullable: true,
+            }],
+            preserve_overflow: false,
+        };
+
+        let mut events = vec![
+            StoredEvent {
+                sequence: 2,
+                topic: "test".into(),
+                partition: 0,
+                payload: br#"{"v":2}"#.to_vec(),
+                timestamp_ms: 2000,
+                idempotency_key: None,
+            },
+            StoredEvent {
+                sequence: 1,
+                topic: "test".into(),
+                partition: 0,
+                payload: br#"{"v":1}"#.to_vec(),
+                timestamp_ms: 1000,
+                idempotency_key: None,
+            },
+        ];
+
+        let (_, metadata) = write_parquet_to_bytes_structured_sorted(&mut events, &config).unwrap();
+
+        // Events should be sorted by timestamp
+        assert_eq!(events[0].timestamp_ms, 1000);
+        assert_eq!(events[1].timestamp_ms, 2000);
+        assert_eq!(metadata.min_timestamp_ms, 1000);
+        assert_eq!(metadata.max_timestamp_ms, 2000);
+    }
+
+    #[test]
+    fn test_no_config_path_unchanged() {
+        // Verify existing behavior is completely untouched when no schema config
+        let events = make_test_events();
+        let batch = events_to_record_batch(&events).unwrap();
+
+        assert_eq!(batch.num_columns(), 8); // 6 original + 2 partition columns
+        assert_eq!(batch.schema().field(3).name(), "payload");
     }
 }

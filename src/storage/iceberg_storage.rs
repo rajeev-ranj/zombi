@@ -8,10 +8,11 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, LockResultExt, PendingSnapshotStats, SegmentInfo, StorageError,
-    StoredEvent,
+    ColdStorage, ColdStorageInfo, LockResultExt, PayloadFormat, PendingSnapshotStats, SegmentInfo,
+    StorageError, StoredEvent, TableSchemaConfig,
 };
 use crate::s3_retry;
+use crate::storage::parquet::write_parquet_to_bytes_structured_sorted;
 use crate::storage::retry::RetryConfig;
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
@@ -32,6 +33,9 @@ pub struct IcebergStorage {
     pending_data_files: RwLock<HashMap<String, Vec<(DataFile, ParquetFileMetadata)>>>,
     /// Retry configuration for S3 operations
     retry_config: RetryConfig,
+    /// Schema configs for structured column extraction, keyed by table/topic name.
+    /// When present for a topic, payloads are parsed and extracted into typed columns.
+    schema_configs: HashMap<String, TableSchemaConfig>,
 }
 
 impl IcebergStorage {
@@ -60,6 +64,7 @@ impl IcebergStorage {
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
             retry_config,
+            schema_configs: HashMap::new(),
         })
     }
 
@@ -105,7 +110,16 @@ impl IcebergStorage {
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
             retry_config,
+            schema_configs: HashMap::new(),
         })
+    }
+
+    /// Sets schema configurations for structured column extraction.
+    /// Call this after construction to enable payload extraction for specific topics.
+    pub fn set_schema_configs(&mut self, configs: Vec<TableSchemaConfig>) {
+        for config in configs {
+            self.schema_configs.insert(config.table.clone(), config);
+        }
     }
 
     /// Returns the bucket name.
@@ -119,6 +133,8 @@ impl IcebergStorage {
     }
 
     /// Gets or creates table metadata for a topic.
+    /// If a `TableSchemaConfig` is registered for this topic, the metadata
+    /// will use the structured schema with extracted columns.
     fn get_or_create_metadata(&self, topic: &str) -> Result<TableMetadata, StorageError> {
         let metadata = self.table_metadata.read().map_lock_err()?;
         if let Some(m) = metadata.get(topic) {
@@ -126,9 +142,13 @@ impl IcebergStorage {
         }
         drop(metadata);
 
-        // Create new metadata
+        // Create new metadata — use structured schema if config is available
         let location = format!("s3://{}/{}/{}", self.bucket, self.base_path, topic);
-        let new_metadata = TableMetadata::new(&location);
+        let new_metadata = if let Some(config) = self.schema_configs.get(topic) {
+            TableMetadata::with_schema_config(&location, config)
+        } else {
+            TableMetadata::new(&location)
+        };
 
         let mut metadata = self.table_metadata.write().map_lock_err()?;
         metadata.insert(topic.to_string(), new_metadata.clone());
@@ -320,8 +340,16 @@ impl ColdStorage for IcebergStorage {
         // Convert events to Parquet with sorting for optimized queries
         // Clone events since we need to sort them
         let mut events_to_write = events.to_vec();
-        let (parquet_bytes, parquet_metadata) =
-            write_parquet_to_bytes_sorted(&mut events_to_write)?;
+        let (parquet_bytes, parquet_metadata) = if let Some(config) = self.schema_configs.get(topic)
+        {
+            if config.payload_format == PayloadFormat::Json && !config.fields.is_empty() {
+                write_parquet_to_bytes_structured_sorted(&mut events_to_write, config)?
+            } else {
+                write_parquet_to_bytes_sorted(&mut events_to_write)?
+            }
+        } else {
+            write_parquet_to_bytes_sorted(&mut events_to_write)?
+        };
 
         // Generate data file name and key
         let filename = data_file_name();
