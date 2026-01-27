@@ -12,7 +12,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::contracts::{ColdStorage, HotStorage, StorageError};
+use crate::contracts::{ColdStorage, ColumnProjection, HotStorage, StorageError, KNOWN_COLUMNS};
 use crate::metrics::MetricsRegistry;
 use crate::proto;
 
@@ -209,6 +209,7 @@ impl ColdStorage for NoopColdStorage {
         _limit: usize,
         _since_ms: Option<i64>,
         _until_ms: Option<i64>,
+        _projection: &crate::contracts::ColumnProjection,
     ) -> Result<Vec<crate::contracts::StoredEvent>, StorageError> {
         Ok(Vec::new())
     }
@@ -280,6 +281,9 @@ pub struct ReadRecordsQuery {
     pub since: Option<i64>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Comma-separated list of columns to project (e.g. "payload,timestamp_ms").
+    /// When omitted, all columns are returned.
+    pub fields: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -289,16 +293,9 @@ fn default_limit() -> usize {
 /// Response for read operations.
 #[derive(Debug, Serialize)]
 pub struct ReadRecordsResponse {
-    pub records: Vec<RecordResponse>,
+    pub records: Vec<serde_json::Value>,
     pub count: usize,
     pub has_more: bool,
-}
-
-/// Single record in read response.
-#[derive(Debug, Serialize)]
-pub struct RecordResponse {
-    pub payload: String,
-    pub timestamp_ms: i64,
 }
 
 /// Error response.
@@ -588,15 +585,98 @@ fn safe_avg(sum: u64, count: u64) -> f64 {
     }
 }
 
+/// Parses and validates the `fields` query parameter into a `ColumnProjection`.
+fn parse_projection(fields: &Option<String>) -> Result<ColumnProjection, ApiError> {
+    match fields {
+        None => Ok(ColumnProjection::all()),
+        Some(raw) => {
+            let field_names: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if field_names.is_empty() {
+                return Ok(ColumnProjection::all());
+            }
+
+            for name in &field_names {
+                if !KNOWN_COLUMNS.contains(&name.as_str()) {
+                    return Err(ApiError::BadRequest(format!(
+                        "Unknown field '{}'. Valid fields: {}",
+                        name,
+                        KNOWN_COLUMNS.join(", ")
+                    )));
+                }
+            }
+
+            Ok(ColumnProjection::select(field_names))
+        }
+    }
+}
+
+/// Builds a JSON value for a single event, projecting only the requested fields.
+fn project_event(
+    event: &crate::contracts::StoredEvent,
+    projection: &ColumnProjection,
+) -> serde_json::Value {
+    match &projection.fields {
+        None => {
+            // Default response: payload + timestamp_ms (backward compatible)
+            serde_json::json!({
+                "payload": String::from_utf8_lossy(&event.payload),
+                "timestamp_ms": event.timestamp_ms,
+            })
+        }
+        Some(fields) => {
+            let mut map = serde_json::Map::new();
+            for field in fields {
+                match field.as_str() {
+                    "sequence" => {
+                        map.insert("sequence".into(), serde_json::json!(event.sequence));
+                    }
+                    "topic" => {
+                        map.insert("topic".into(), serde_json::json!(event.topic));
+                    }
+                    "partition" => {
+                        map.insert("partition".into(), serde_json::json!(event.partition));
+                    }
+                    "payload" => {
+                        map.insert(
+                            "payload".into(),
+                            serde_json::json!(String::from_utf8_lossy(&event.payload)),
+                        );
+                    }
+                    "timestamp_ms" => {
+                        map.insert("timestamp_ms".into(), serde_json::json!(event.timestamp_ms));
+                    }
+                    "idempotency_key" => {
+                        map.insert(
+                            "idempotency_key".into(),
+                            serde_json::json!(event.idempotency_key),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
 /// GET /tables/{table}
 /// Read records from a table (unified read from hot and cold storage).
 /// Results are ordered by timestamp.
+/// Supports optional `fields` query parameter for column projection.
 pub async fn read_records<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
     Query(query): Query<ReadRecordsQuery>,
 ) -> Result<Json<ReadRecordsResponse>, ApiError> {
     let start = Instant::now();
+
+    // Parse and validate projection
+    let projection = parse_projection(&query.fields)?;
 
     // Read from hot storage (pass None for start_offsets - could be added for consumer groups later)
     let mut all_events = state
@@ -612,15 +692,24 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
         let partitions = state.storage.list_partitions(&table).unwrap_or_default();
 
         // Create futures for all partition reads
+        let projection_ref = &projection;
         let read_futures: Vec<_> = partitions
             .iter()
             .map(|&partition| {
                 let cold = cold.clone();
                 let table = table.clone();
                 async move {
-                    cold.read_events(&table, partition, 0, query.limit + 1, query.since, None)
-                        .await
-                        .unwrap_or_default()
+                    cold.read_events(
+                        &table,
+                        partition,
+                        0,
+                        query.limit + 1,
+                        query.since,
+                        None,
+                        projection_ref,
+                    )
+                    .await
+                    .unwrap_or_default()
                 }
             })
             .collect();
@@ -649,12 +738,9 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     let has_more = all_events.len() > query.limit;
     let events: Vec<_> = all_events.into_iter().take(query.limit).collect();
 
-    let records: Vec<RecordResponse> = events
+    let records: Vec<serde_json::Value> = events
         .iter()
-        .map(|e| RecordResponse {
-            payload: String::from_utf8_lossy(&e.payload).to_string(),
-            timestamp_ms: e.timestamp_ms,
-        })
+        .map(|e| project_event(e, &projection))
         .collect();
 
     let count = records.len();

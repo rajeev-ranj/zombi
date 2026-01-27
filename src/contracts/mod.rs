@@ -10,4 +10,4 @@ pub use error::{LockResultExt, SequenceError, StorageError, ZombiError};
 pub use flusher::{FlushResult, Flusher};
 pub use schema::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};
 pub use sequence::SequenceGenerator;
-pub use storage::{BulkWriteEvent, HotStorage, StoredEvent};
+pub use storage::{BulkWriteEvent, ColumnProjection, HotStorage, StoredEvent, KNOWN_COLUMNS};

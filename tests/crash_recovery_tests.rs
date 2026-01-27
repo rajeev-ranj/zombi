@@ -631,6 +631,7 @@ impl ColdStorage for FileColdStorage {
         limit: usize,
         _since_ms: Option<i64>,
         _until_ms: Option<i64>,
+        _projection: &zombi::contracts::ColumnProjection,
     ) -> Result<Vec<StoredEvent>, zombi::contracts::StorageError> {
         let dir = self.segment_dir(topic, partition);
         if !dir.exists() {
@@ -840,7 +841,15 @@ async fn flushed_events_readable_after_restart() {
     {
         let cold_storage = FileColdStorage::new(cold_dir.path());
         let events = cold_storage
-            .read_events("test-topic", 0, 0, 1000, None, None)
+            .read_events(
+                "test-topic",
+                0,
+                0,
+                1000,
+                None,
+                None,
+                &zombi::contracts::ColumnProjection::all(),
+            )
             .await
             .expect("read should succeed");
 
@@ -938,7 +947,15 @@ async fn mixed_hot_cold_recovery() {
 
         // Cold storage should have only the first batch
         let cold_events = cold_storage
-            .read_events("test-topic", 0, 0, 1000, None, None)
+            .read_events(
+                "test-topic",
+                0,
+                0,
+                1000,
+                None,
+                None,
+                &zombi::contracts::ColumnProjection::all(),
+            )
             .await
             .expect("cold read should succeed");
         assert_eq!(

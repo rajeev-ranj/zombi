@@ -812,6 +812,7 @@ mod tests {
             _limit: usize,
             _since_ms: Option<i64>,
             _until_ms: Option<i64>,
+            _projection: &crate::contracts::ColumnProjection,
         ) -> Result<Vec<StoredEvent>, StorageError> {
             Ok(Vec::new())
         }

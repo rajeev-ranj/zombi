@@ -7,7 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use zombi::contracts::{ColdStorage, ColdStorageInfo, SegmentInfo, StorageError, StoredEvent};
+use zombi::contracts::{
+    ColdStorage, ColdStorageInfo, ColumnProjection, SegmentInfo, StorageError, StoredEvent,
+};
 use zombi::storage::RocksDbStorage;
 
 // =============================================================================
@@ -101,6 +103,7 @@ impl ColdStorage for FileColdStorage {
         limit: usize,
         _since_ms: Option<i64>,
         _until_ms: Option<i64>,
+        _projection: &ColumnProjection,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         let dir = self.segment_dir(topic, partition);
         if !dir.exists() {

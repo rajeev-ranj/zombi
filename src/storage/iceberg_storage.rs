@@ -392,6 +392,7 @@ impl ColdStorage for IcebergStorage {
         limit: usize,
         since_ms: Option<i64>,
         until_ms: Option<i64>,
+        _projection: &crate::contracts::ColumnProjection,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         // Log warning if time range not provided (less efficient)
         if since_ms.is_none() || until_ms.is_none() {
