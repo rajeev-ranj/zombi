@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 backon = "1"
+bloomfilter = "1"
+apache-avro = "0.17"
 
 [dev-dependencies]
 proptest = "1"

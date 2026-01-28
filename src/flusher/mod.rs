@@ -11,6 +11,7 @@ use crate::contracts::{
     ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError,
 };
 use crate::metrics::{FlushMetrics, IcebergMetrics};
+use crate::storage::CatalogClient;
 
 /// Configuration for the background flusher.
 #[derive(Debug, Clone)]
@@ -106,6 +107,10 @@ where
     flush_metrics: Arc<FlushMetrics>,
     /// Iceberg metrics
     iceberg_metrics: Arc<IcebergMetrics>,
+    /// Optional catalog client for auto-registration after snapshot commits.
+    catalog_client: Option<Arc<CatalogClient>>,
+    /// Topics that have been successfully registered with the catalog.
+    registered_topics: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl<H, C> BackgroundFlusher<H, C>
@@ -132,7 +137,14 @@ where
             topics: Arc::new(RwLock::new(Vec::new())),
             flush_metrics,
             iceberg_metrics,
+            catalog_client: None,
+            registered_topics: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Sets the catalog client for auto-registration after snapshot commits.
+    pub fn set_catalog_client(&mut self, client: Arc<CatalogClient>) {
+        self.catalog_client = Some(client);
     }
 
     /// Registers a topic/partition for flushing.
@@ -278,6 +290,8 @@ where
         let max_concurrent_uploads = self.config.max_concurrent_s3_uploads;
         let flush_metrics = Arc::clone(&self.flush_metrics);
         let iceberg_metrics = Arc::clone(&self.iceberg_metrics);
+        let catalog_client = self.catalog_client.clone();
+        let registered_topics = Arc::clone(&self.registered_topics);
 
         let handle = tokio::spawn(async move {
             tracing::info!(
@@ -451,6 +465,58 @@ where
                                         bytes = stats.total_bytes,
                                         "Committed Iceberg snapshot (batched)"
                                     );
+
+                                    // Catalog auto-registration (non-fatal)
+                                    if let Some(ref catalog) = catalog_client {
+                                        if let Some(metadata_json) =
+                                            cold_storage.table_metadata_json(&topic)
+                                        {
+                                            match serde_json::from_str::<
+                                                crate::storage::TableMetadata,
+                                            >(
+                                                &metadata_json
+                                            ) {
+                                                Ok(metadata) => {
+                                                    let is_new = registered_topics
+                                                        .read()
+                                                        .map(|r| !r.contains(&topic))
+                                                        .unwrap_or(true);
+                                                    let result = if is_new {
+                                                        catalog
+                                                            .register_table(&topic, &metadata)
+                                                            .await
+                                                    } else {
+                                                        catalog
+                                                            .update_table(&topic, &metadata)
+                                                            .await
+                                                    };
+                                                    match result {
+                                                        Ok(()) => {
+                                                            if let Ok(mut r) =
+                                                                registered_topics.write()
+                                                            {
+                                                                r.insert(topic.clone());
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                error = %e,
+                                                                topic = %topic,
+                                                                "Catalog update failed (non-fatal)"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        topic = %topic,
+                                                        "Failed to parse table metadata for catalog"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 Ok(None) => {
                                     tracing::debug!(
