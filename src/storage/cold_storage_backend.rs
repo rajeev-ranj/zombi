@@ -28,6 +28,17 @@ impl ColdStorageBackend {
     pub fn is_iceberg(&self) -> bool {
         matches!(self, Self::Iceberg(_))
     }
+
+    /// Returns the current table metadata for a topic (Iceberg only).
+    pub fn get_table_metadata(
+        &self,
+        topic: &str,
+    ) -> Result<Option<crate::storage::TableMetadata>, StorageError> {
+        match self {
+            Self::Iceberg(s) => s.get_table_metadata(topic),
+            Self::S3(_) => Ok(None),
+        }
+    }
 }
 
 impl ColdStorage for ColdStorageBackend {
@@ -110,6 +121,13 @@ impl ColdStorage for ColdStorageBackend {
         match self {
             Self::S3(s) => s.commit_snapshot(topic).await,
             Self::Iceberg(s) => s.commit_snapshot(topic).await,
+        }
+    }
+
+    fn table_metadata_json(&self, topic: &str) -> Option<String> {
+        match self {
+            Self::S3(_) => None,
+            Self::Iceberg(s) => s.table_metadata_json(topic),
         }
     }
 }

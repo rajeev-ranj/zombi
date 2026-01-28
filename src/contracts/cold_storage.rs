@@ -84,6 +84,12 @@ pub trait ColdStorage: Send + Sync {
     fn pending_snapshot_stats(&self, _topic: &str) -> PendingSnapshotStats {
         PendingSnapshotStats::default()
     }
+
+    /// Returns the current table metadata JSON for catalog registration.
+    /// Only Iceberg backends return Some; S3 backends return None.
+    fn table_metadata_json(&self, _topic: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Information about a stored segment.

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use apache_avro::types::{Record, Value as AvroValue};
+use apache_avro::{Schema as AvroSchema, Writer as AvroWriter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -698,6 +700,63 @@ impl ManifestFile {
             data_file,
         });
     }
+
+    /// Serializes this manifest file to Avro binary format per Iceberg v2 spec.
+    ///
+    /// The Avro file includes metadata headers required by Iceberg:
+    /// `schema`, `schema-id`, `partition-spec`, `partition-spec-id`, `format-version`, `content`.
+    pub fn to_avro_bytes(&self, table_metadata: &TableMetadata) -> Result<Vec<u8>, StorageError> {
+        let avro_schema = manifest_entry_avro_schema();
+        let mut writer = AvroWriter::new(&avro_schema, Vec::new());
+
+        // Set Iceberg-required metadata on the Avro file
+        let schema_json = serde_json::to_string(
+            table_metadata
+                .schemas
+                .first()
+                .unwrap_or(&IcebergSchema::default()),
+        )
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let partition_spec_json = serde_json::to_string(
+            table_metadata
+                .partition_specs
+                .first()
+                .map(|s| &s.fields)
+                .unwrap_or(&vec![]),
+        )
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        writer
+            .add_user_metadata("schema".to_string(), &schema_json)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .add_user_metadata("schema-id".to_string(), "0")
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .add_user_metadata("partition-spec".to_string(), &partition_spec_json)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .add_user_metadata("partition-spec-id".to_string(), "0")
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .add_user_metadata("format-version".to_string(), "2")
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .add_user_metadata("content".to_string(), "data")
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        for entry in &self.entries {
+            let record = manifest_entry_to_avro_record(&avro_schema, entry)?;
+            writer
+                .append(record)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        }
+
+        writer
+            .into_inner()
+            .map_err(|e| StorageError::Serialization(e.to_string()))
+    }
 }
 
 /// Manifest list entry pointing to a manifest file.
@@ -716,6 +775,259 @@ pub struct ManifestListEntry {
     pub added_rows_count: i64,
     pub existing_rows_count: i64,
     pub deleted_rows_count: i64,
+}
+
+/// Returns the Avro schema for an Iceberg v2 manifest entry.
+///
+/// This is a simplified schema covering the fields Zombi actually populates.
+/// The `data_file` sub-record includes file path, format, record count, size,
+/// and optional column statistics maps.
+fn manifest_entry_avro_schema() -> AvroSchema {
+    let raw = r#"
+    {
+        "type": "record",
+        "name": "manifest_entry",
+        "fields": [
+            {"name": "status", "type": "int"},
+            {"name": "snapshot_id", "type": ["null", "long"], "default": null},
+            {"name": "sequence_number", "type": ["null", "long"], "default": null},
+            {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
+            {
+                "name": "data_file",
+                "type": {
+                    "type": "record",
+                    "name": "r2",
+                    "fields": [
+                        {"name": "content", "type": "int", "default": 0},
+                        {"name": "file_path", "type": "string"},
+                        {"name": "file_format", "type": "string"},
+                        {"name": "record_count", "type": "long"},
+                        {"name": "file_size_in_bytes", "type": "long"},
+                        {
+                            "name": "column_sizes",
+                            "type": ["null", {"type": "map", "values": "long"}],
+                            "default": null
+                        },
+                        {
+                            "name": "value_counts",
+                            "type": ["null", {"type": "map", "values": "long"}],
+                            "default": null
+                        },
+                        {
+                            "name": "null_value_counts",
+                            "type": ["null", {"type": "map", "values": "long"}],
+                            "default": null
+                        },
+                        {
+                            "name": "lower_bounds",
+                            "type": ["null", {"type": "map", "values": "bytes"}],
+                            "default": null
+                        },
+                        {
+                            "name": "upper_bounds",
+                            "type": ["null", {"type": "map", "values": "bytes"}],
+                            "default": null
+                        },
+                        {
+                            "name": "split_offsets",
+                            "type": ["null", {"type": "array", "items": "long"}],
+                            "default": null
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    "#;
+    AvroSchema::parse_str(raw).expect("manifest_entry schema is valid")
+}
+
+/// Converts a `ManifestEntry` to an Avro `Record`.
+fn manifest_entry_to_avro_record<'a>(
+    schema: &'a AvroSchema,
+    entry: &ManifestEntry,
+) -> Result<Record<'a>, StorageError> {
+    let mut record = Record::new(schema).ok_or_else(|| {
+        StorageError::Serialization("Failed to create manifest_entry record".into())
+    })?;
+
+    record.put("status", AvroValue::Int(entry.status));
+    record.put(
+        "snapshot_id",
+        AvroValue::Union(1, Box::new(AvroValue::Long(entry.snapshot_id))),
+    );
+    record.put(
+        "sequence_number",
+        AvroValue::Union(0, Box::new(AvroValue::Null)),
+    );
+    record.put(
+        "file_sequence_number",
+        AvroValue::Union(0, Box::new(AvroValue::Null)),
+    );
+
+    // Build data_file sub-record
+    let df = &entry.data_file;
+    let data_file_schema = match schema {
+        AvroSchema::Record(rs) => rs
+            .fields
+            .iter()
+            .find(|f| f.name == "data_file")
+            .map(|f| &f.schema)
+            .ok_or_else(|| StorageError::Serialization("data_file field not found".into()))?,
+        _ => return Err(StorageError::Serialization("Expected record schema".into())),
+    };
+
+    let mut df_record = Record::new(data_file_schema)
+        .ok_or_else(|| StorageError::Serialization("Failed to create data_file record".into()))?;
+
+    df_record.put("content", AvroValue::Int(df.content));
+    df_record.put("file_path", AvroValue::String(df.file_path.clone()));
+    df_record.put("file_format", AvroValue::String(df.file_format.clone()));
+    df_record.put("record_count", AvroValue::Long(df.record_count));
+    df_record.put("file_size_in_bytes", AvroValue::Long(df.file_size_in_bytes));
+
+    // Optional map fields for column statistics
+    fn i32_key_map_to_avro_long(map: &Option<HashMap<i32, i64>>) -> AvroValue {
+        match map {
+            Some(m) => {
+                let avro_map: HashMap<String, AvroValue> = m
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), AvroValue::Long(*v)))
+                    .collect();
+                AvroValue::Union(1, Box::new(AvroValue::Map(avro_map)))
+            }
+            None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+        }
+    }
+
+    fn i32_key_map_to_avro_bytes(map: &Option<HashMap<i32, Vec<u8>>>) -> AvroValue {
+        match map {
+            Some(m) => {
+                let avro_map: HashMap<String, AvroValue> = m
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), AvroValue::Bytes(v.clone())))
+                    .collect();
+                AvroValue::Union(1, Box::new(AvroValue::Map(avro_map)))
+            }
+            None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+        }
+    }
+
+    df_record.put("column_sizes", i32_key_map_to_avro_long(&df.column_sizes));
+    df_record.put("value_counts", i32_key_map_to_avro_long(&df.value_counts));
+    df_record.put(
+        "null_value_counts",
+        i32_key_map_to_avro_long(&df.null_value_counts),
+    );
+    df_record.put("lower_bounds", i32_key_map_to_avro_bytes(&df.lower_bounds));
+    df_record.put("upper_bounds", i32_key_map_to_avro_bytes(&df.upper_bounds));
+
+    match &df.split_offsets {
+        Some(offsets) => {
+            let arr: Vec<AvroValue> = offsets.iter().map(|o| AvroValue::Long(*o)).collect();
+            df_record.put(
+                "split_offsets",
+                AvroValue::Union(1, Box::new(AvroValue::Array(arr))),
+            );
+        }
+        None => {
+            df_record.put(
+                "split_offsets",
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            );
+        }
+    }
+
+    record.put("data_file", df_record);
+    Ok(record)
+}
+
+/// Returns the Avro schema for an Iceberg v2 manifest list entry.
+fn manifest_list_entry_avro_schema() -> AvroSchema {
+    let raw = r#"
+    {
+        "type": "record",
+        "name": "manifest_file",
+        "fields": [
+            {"name": "manifest_path", "type": "string"},
+            {"name": "manifest_length", "type": "long"},
+            {"name": "partition_spec_id", "type": "int"},
+            {"name": "content", "type": "int"},
+            {"name": "sequence_number", "type": "long"},
+            {"name": "min_sequence_number", "type": "long"},
+            {"name": "added_snapshot_id", "type": "long"},
+            {"name": "added_files_count", "type": "int"},
+            {"name": "existing_files_count", "type": "int"},
+            {"name": "deleted_files_count", "type": "int"},
+            {"name": "added_rows_count", "type": "long"},
+            {"name": "existing_rows_count", "type": "long"},
+            {"name": "deleted_rows_count", "type": "long"}
+        ]
+    }
+    "#;
+    AvroSchema::parse_str(raw).expect("manifest_list schema is valid")
+}
+
+/// Serializes manifest list entries to Avro binary format per Iceberg v2 spec.
+pub fn manifest_list_to_avro_bytes(
+    entries: &[ManifestListEntry],
+    _metadata: &TableMetadata,
+) -> Result<Vec<u8>, StorageError> {
+    let schema = manifest_list_entry_avro_schema();
+    let mut writer = AvroWriter::new(&schema, Vec::new());
+
+    writer
+        .add_user_metadata("format-version".to_string(), "2")
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    for entry in entries {
+        let mut record = Record::new(&schema).ok_or_else(|| {
+            StorageError::Serialization("Failed to create manifest_file record".into())
+        })?;
+
+        record.put(
+            "manifest_path",
+            AvroValue::String(entry.manifest_path.clone()),
+        );
+        record.put("manifest_length", AvroValue::Long(entry.manifest_length));
+        record.put("partition_spec_id", AvroValue::Int(entry.partition_spec_id));
+        record.put("content", AvroValue::Int(entry.content));
+        record.put("sequence_number", AvroValue::Long(entry.sequence_number));
+        record.put(
+            "min_sequence_number",
+            AvroValue::Long(entry.min_sequence_number),
+        );
+        record.put(
+            "added_snapshot_id",
+            AvroValue::Long(entry.added_snapshot_id),
+        );
+        record.put("added_files_count", AvroValue::Int(entry.added_files_count));
+        record.put(
+            "existing_files_count",
+            AvroValue::Int(entry.existing_files_count),
+        );
+        record.put(
+            "deleted_files_count",
+            AvroValue::Int(entry.deleted_files_count),
+        );
+        record.put("added_rows_count", AvroValue::Long(entry.added_rows_count));
+        record.put(
+            "existing_rows_count",
+            AvroValue::Long(entry.existing_rows_count),
+        );
+        record.put(
+            "deleted_rows_count",
+            AvroValue::Long(entry.deleted_rows_count),
+        );
+
+        writer
+            .append(record)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+    }
+
+    writer
+        .into_inner()
+        .map_err(|e| StorageError::Serialization(e.to_string()))
 }
 
 /// Generates a unique snapshot ID.
@@ -1205,5 +1517,137 @@ mod tests {
         // Max should be extracted field: 101 (100 + 1)
         // But we also have system fields up to 8, and partition fields 7,8
         assert_eq!(schema.last_column_id(), 101); // EXTRACTED_START + 1
+    }
+
+    // =========================================================================
+    // Avro Serialization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_file_to_avro_roundtrip() {
+        use crate::storage::parquet::{ColumnStatistics, PartitionValues};
+
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        let parquet_meta = ParquetFileMetadata {
+            path: "/tmp/test.parquet".into(),
+            row_count: 500,
+            min_sequence: 1,
+            max_sequence: 500,
+            min_timestamp_ms: 1000,
+            max_timestamp_ms: 2000,
+            file_size_bytes: 25000,
+            partition_values: PartitionValues::default(),
+            column_stats: ColumnStatistics {
+                sequence_min: 1,
+                sequence_max: 500,
+                partition_min: 0,
+                partition_max: 0,
+                timestamp_min: 1000,
+                timestamp_max: 2000,
+                event_date_min: 19737,
+                event_date_max: 19737,
+                event_hour_min: 10,
+                event_hour_max: 14,
+            },
+        };
+
+        let mut manifest = ManifestFile::new(12345, 1);
+        manifest.add_data_file(DataFile::from_parquet_metadata(
+            &parquet_meta,
+            "s3://bucket/data/test.parquet",
+        ));
+
+        let avro_bytes = manifest.to_avro_bytes(&metadata).unwrap();
+        assert!(!avro_bytes.is_empty());
+
+        // Parse back with apache-avro
+        let reader = apache_avro::Reader::new(&avro_bytes[..]).unwrap();
+
+        // Verify metadata headers
+        let file_meta = reader.user_metadata();
+        assert_eq!(
+            std::str::from_utf8(file_meta.get("format-version").unwrap()).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            std::str::from_utf8(file_meta.get("content").unwrap()).unwrap(),
+            "data"
+        );
+        assert!(file_meta.contains_key("schema"));
+        assert!(file_meta.contains_key("partition-spec"));
+
+        // Verify records
+        let records: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+
+        // Check the first record's data_file has correct file_path
+        if let apache_avro::types::Value::Record(fields) = &records[0] {
+            let status = fields.iter().find(|(k, _)| k == "status").unwrap();
+            assert_eq!(status.1, apache_avro::types::Value::Int(1));
+
+            let df = fields.iter().find(|(k, _)| k == "data_file").unwrap();
+            if let apache_avro::types::Value::Record(df_fields) = &df.1 {
+                let path = df_fields.iter().find(|(k, _)| k == "file_path").unwrap();
+                assert_eq!(
+                    path.1,
+                    apache_avro::types::Value::String("s3://bucket/data/test.parquet".into())
+                );
+            } else {
+                panic!("data_file should be a Record");
+            }
+        } else {
+            panic!("Expected Record");
+        }
+    }
+
+    #[test]
+    fn test_manifest_list_to_avro_roundtrip() {
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        let entries = vec![ManifestListEntry {
+            manifest_path: "s3://bucket/metadata/abc-m0.avro".into(),
+            manifest_length: 1234,
+            partition_spec_id: 0,
+            content: 0,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 99999,
+            added_files_count: 5,
+            existing_files_count: 0,
+            deleted_files_count: 0,
+            added_rows_count: 10000,
+            existing_rows_count: 0,
+            deleted_rows_count: 0,
+        }];
+
+        let avro_bytes = manifest_list_to_avro_bytes(&entries, &metadata).unwrap();
+        assert!(!avro_bytes.is_empty());
+
+        // Parse back
+        let reader = apache_avro::Reader::new(&avro_bytes[..]).unwrap();
+
+        let file_meta = reader.user_metadata();
+        assert_eq!(
+            std::str::from_utf8(file_meta.get("format-version").unwrap()).unwrap(),
+            "2"
+        );
+
+        let records: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+
+        if let apache_avro::types::Value::Record(fields) = &records[0] {
+            let path = fields.iter().find(|(k, _)| k == "manifest_path").unwrap();
+            assert_eq!(
+                path.1,
+                apache_avro::types::Value::String("s3://bucket/metadata/abc-m0.avro".into())
+            );
+
+            let rows = fields
+                .iter()
+                .find(|(k, _)| k == "added_rows_count")
+                .unwrap();
+            assert_eq!(rows.1, apache_avro::types::Value::Long(10000));
+        }
     }
 }

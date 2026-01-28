@@ -9,7 +9,10 @@ use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConf
 use zombi::contracts::{Flusher, TableSchemaConfig};
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::metrics::MetricsRegistry;
-use zombi::storage::{ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage, S3Storage};
+use zombi::storage::{
+    CatalogClient, CatalogConfig, ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage,
+    S3Storage,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -156,14 +159,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
-        let flusher = Arc::new(BackgroundFlusher::new(
+        let mut flusher = BackgroundFlusher::new(
             Arc::clone(&storage),
             Arc::clone(cold),
             config,
             Arc::clone(&metrics_registry.flush),
             Arc::clone(&metrics_registry.iceberg),
-        ));
+        );
 
+        // Set up catalog auto-registration if configured
+        if let Ok(catalog_url) = std::env::var("ZOMBI_CATALOG_URL") {
+            let catalog_config = CatalogConfig {
+                base_url: catalog_url.clone(),
+                namespace: std::env::var("ZOMBI_CATALOG_NAMESPACE")
+                    .unwrap_or_else(|_| "zombi".into()),
+                auth_token: std::env::var("ZOMBI_CATALOG_TOKEN").ok(),
+                timeout_secs: 30,
+            };
+            match CatalogClient::new(catalog_config) {
+                Ok(client) => {
+                    tracing::info!(
+                        url = %catalog_url,
+                        "Catalog auto-registration enabled"
+                    );
+                    flusher.set_catalog_client(Arc::new(client));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create catalog client");
+                }
+            }
+        }
+
+        let flusher = Arc::new(flusher);
         flusher.start().await?;
         tracing::info!("Background flusher started");
 

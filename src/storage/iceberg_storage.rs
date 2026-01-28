@@ -15,9 +15,10 @@ use crate::s3_retry;
 use crate::storage::parquet::write_parquet_to_bytes_structured_sorted;
 use crate::storage::retry::RetryConfig;
 use crate::storage::{
-    data_file_name, derive_partition_columns, format_partition_date, manifest_list_file_name,
-    metadata_file_name, write_parquet_to_bytes_sorted, DataFile, ManifestListEntry,
-    ParquetFileMetadata, SnapshotOperation, TableMetadata,
+    data_file_name, derive_partition_columns, format_partition_date, manifest_file_name,
+    manifest_list_file_name, manifest_list_to_avro_bytes, metadata_file_name,
+    write_parquet_to_bytes_sorted, DataFile, ManifestFile, ManifestListEntry, ParquetFileMetadata,
+    SnapshotOperation, TableMetadata,
 };
 
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
@@ -234,19 +235,27 @@ impl IcebergStorage {
         let total_files = pending.len();
         let total_rows: i64 = pending.iter().map(|(_, m)| m.row_count as i64).sum();
 
-        // Create manifest list entry (simplified - in production would write actual Avro manifest)
         let snapshot_id = crate::storage::generate_snapshot_id();
-        let manifest_list_filename = manifest_list_file_name(snapshot_id);
-        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
-        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
 
-        // Create a simple manifest list (JSON for now, Avro in production)
-        let manifest_entries: Vec<ManifestListEntry> = vec![ManifestListEntry {
-            manifest_path: format!(
-                "s3://{}/{}/{}/metadata/manifest.avro",
-                self.bucket, self.base_path, topic
-            ),
-            manifest_length: 0,
+        // Build manifest file with all data file entries
+        let mut manifest = ManifestFile::new(snapshot_id, metadata.last_sequence_number + 1);
+        for (data_file, _) in &pending {
+            manifest.add_data_file(data_file.clone());
+        }
+
+        // Serialize manifest to Avro and upload
+        let manifest_filename = manifest_file_name();
+        let manifest_key = self.metadata_key(topic, &manifest_filename);
+        let manifest_s3_path = format!("s3://{}/{}", self.bucket, manifest_key);
+        let manifest_avro_bytes = manifest.to_avro_bytes(&metadata)?;
+        let manifest_length = manifest_avro_bytes.len() as i64;
+        self.upload_bytes(&manifest_key, manifest_avro_bytes, "application/avro")
+            .await?;
+
+        // Build manifest list entry pointing to the real manifest
+        let manifest_list_entries = vec![ManifestListEntry {
+            manifest_path: manifest_s3_path,
+            manifest_length,
             partition_spec_id: 0,
             content: 0,
             sequence_number: metadata.last_sequence_number + 1,
@@ -260,10 +269,12 @@ impl IcebergStorage {
             deleted_rows_count: 0,
         }];
 
-        // Write manifest list as JSON (simplified)
-        let manifest_list_json = serde_json::to_vec(&manifest_entries)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        self.upload_bytes(&manifest_list_key, manifest_list_json, "application/json")
+        // Serialize manifest list to Avro and upload
+        let manifest_list_filename = manifest_list_file_name(snapshot_id);
+        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
+        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
+        let manifest_list_avro = manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
+        self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
             .await?;
 
         // Add snapshot to metadata
@@ -537,6 +548,13 @@ impl ColdStorage for IcebergStorage {
 
     async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
         self.commit_snapshot(topic).await
+    }
+
+    fn table_metadata_json(&self, topic: &str) -> Option<String> {
+        self.get_table_metadata(topic)
+            .ok()
+            .flatten()
+            .and_then(|m| m.to_json().ok())
     }
 
     fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {

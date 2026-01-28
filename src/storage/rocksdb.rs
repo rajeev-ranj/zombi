@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use bloomfilter::Bloom;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rocksdb::{BlockBasedOptions, Options, ReadOptions, WriteBatch, WriteOptions, DB};
@@ -20,6 +21,57 @@ const CONSUMER_PREFIX: &str = "consumer";
 /// Key prefix for timestamp index (for O(1) time-based queries)
 const TIMESTAMP_INDEX_PREFIX: &str = "ts";
 
+/// Configuration for Bloom filter-based idempotency key lookups.
+#[derive(Debug, Clone)]
+pub struct BloomConfig {
+    /// Whether Bloom filters are enabled.
+    pub enabled: bool,
+    /// Expected number of unique idempotency keys per (topic, partition).
+    pub expected_items: usize,
+    /// Target false positive rate (e.g., 0.01 = 1%).
+    pub fp_rate: f64,
+    /// Whether to rebuild Bloom filters from RocksDB on startup.
+    pub rebuild_on_startup: bool,
+}
+
+impl Default for BloomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            expected_items: 1_000_000,
+            fp_rate: 0.01,
+            rebuild_on_startup: true,
+        }
+    }
+}
+
+impl BloomConfig {
+    /// Creates a BloomConfig from environment variables.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("ZOMBI_BLOOM_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fp_rate = std::env::var("ZOMBI_BLOOM_FP_RATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
+        let expected_items = std::env::var("ZOMBI_BLOOM_EXPECTED_ITEMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let rebuild_on_startup = std::env::var("ZOMBI_BLOOM_REBUILD_ON_STARTUP")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
+        Self {
+            enabled,
+            fp_rate,
+            expected_items,
+            rebuild_on_startup,
+        }
+    }
+}
+
 /// RocksDB-backed hot storage implementation.
 pub struct RocksDbStorage {
     db: DB,
@@ -35,6 +87,10 @@ pub struct RocksDbStorage {
     /// Enable secondary timestamp index for O(1) time-based queries.
     /// Slightly increases write overhead but enables efficient time-range scans.
     timestamp_index_enabled: bool,
+    /// Per-(topic, partition) Bloom filters for idempotency key lookups.
+    bloom_filters: DashMap<(String, u32), RwLock<Bloom<String>>>,
+    /// Bloom filter configuration.
+    bloom_config: BloomConfig,
 }
 
 impl RocksDbStorage {
@@ -84,14 +140,35 @@ impl RocksDbStorage {
             tracing::info!("Timestamp secondary index enabled for time-based queries");
         }
 
-        Ok(Self {
+        let bloom_config = BloomConfig::from_env();
+        if bloom_config.enabled {
+            tracing::info!(
+                expected_items = bloom_config.expected_items,
+                fp_rate = bloom_config.fp_rate,
+                rebuild_on_startup = bloom_config.rebuild_on_startup,
+                "Bloom filter enabled for idempotency key lookups"
+            );
+        }
+
+        let bloom_filters = DashMap::new();
+
+        let storage = Self {
             db,
             sequences: DashMap::new(),
             partitions_cache: DashMap::new(),
             topics_cache: DashMap::new(),
             data_path: path.to_path_buf(),
             timestamp_index_enabled,
-        })
+            bloom_filters,
+            bloom_config,
+        };
+
+        // Rebuild bloom filters from existing idempotency keys if configured
+        if storage.bloom_config.enabled && storage.bloom_config.rebuild_on_startup {
+            storage.rebuild_bloom_filters();
+        }
+
+        Ok(storage)
     }
 
     /// Creates storage with explicit timestamp index setting (for testing).
@@ -102,6 +179,19 @@ impl RocksDbStorage {
     ) -> Result<Self, StorageError> {
         let mut storage = Self::open(path)?;
         storage.timestamp_index_enabled = timestamp_index_enabled;
+        Ok(storage)
+    }
+
+    /// Creates storage with Bloom filters enabled (for testing).
+    #[cfg(test)]
+    pub fn open_with_bloom(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let mut storage = Self::open(path)?;
+        storage.bloom_config = BloomConfig {
+            enabled: true,
+            expected_items: 10_000,
+            fp_rate: 0.01,
+            rebuild_on_startup: false,
+        };
         Ok(storage)
     }
 
@@ -223,6 +313,80 @@ impl RocksDbStorage {
             .insert(topic.to_string());
     }
 
+    /// Checks the Bloom filter for an idempotency key.
+    /// Returns `true` if the key is *possibly* present (requires RocksDB confirmation).
+    /// Returns `false` if the key is *definitely* absent (skip RocksDB read).
+    fn bloom_maybe_contains(&self, topic: &str, partition: u32, idem_key: &str) -> bool {
+        if !self.bloom_config.enabled {
+            return true; // Conservative: assume present when bloom is disabled
+        }
+        let key = (topic.to_string(), partition);
+        if let Some(entry) = self.bloom_filters.get(&key) {
+            if let Ok(bloom) = entry.value().read() {
+                return bloom.check(&idem_key.to_string());
+            }
+        }
+        // No bloom filter for this partition yet — conservatively return true
+        true
+    }
+
+    /// Inserts an idempotency key into the Bloom filter for the given (topic, partition).
+    fn bloom_insert(&self, topic: &str, partition: u32, idem_key: &str) {
+        if !self.bloom_config.enabled {
+            return;
+        }
+        let key = (topic.to_string(), partition);
+        let entry = self.bloom_filters.entry(key).or_insert_with(|| {
+            RwLock::new(Bloom::new_for_fp_rate(
+                self.bloom_config.expected_items,
+                self.bloom_config.fp_rate,
+            ))
+        });
+        if let Ok(mut bloom) = entry.value().write() {
+            bloom.set(&idem_key.to_string());
+        };
+    }
+
+    /// Rebuilds Bloom filters by scanning all `idem:` prefix keys in RocksDB.
+    fn rebuild_bloom_filters(&self) {
+        let prefix = format!("{}:", IDEM_PREFIX);
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+
+        let mut count: usize = 0;
+        for item in iter {
+            let (key, _) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Error during bloom rebuild scan");
+                    break;
+                }
+            };
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            // Key format: idem:{topic}:{partition}:{idempotency_key}
+            let parts: Vec<&str> = key_str.splitn(4, ':').collect();
+            if parts.len() == 4 {
+                let topic = parts[1];
+                if let Ok(partition) = parts[2].parse::<u32>() {
+                    self.bloom_insert(topic, partition, parts[3]);
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(
+                keys = count,
+                "Rebuilt Bloom filters from existing idempotency keys"
+            );
+        }
+    }
+
     /// Creates optimized write options with WAL sync disabled (#4).
     fn write_options() -> WriteOptions {
         let mut opts = WriteOptions::default();
@@ -286,12 +450,14 @@ impl HotStorage for RocksDbStorage {
         timestamp_ms: i64,
         idempotency_key: Option<&str>,
     ) -> Result<u64, StorageError> {
-        // Check idempotency first (this read is unavoidable)
+        // Check idempotency: Bloom filter short-circuits the RocksDB read when key is absent
         if let Some(idem_key) = idempotency_key {
-            if let Some(existing_offset) =
-                self.get_idempotency_offset(topic, partition, idem_key)?
-            {
-                return Ok(existing_offset);
+            if self.bloom_maybe_contains(topic, partition, idem_key) {
+                if let Some(existing_offset) =
+                    self.get_idempotency_offset(topic, partition, idem_key)?
+                {
+                    return Ok(existing_offset);
+                }
             }
         }
 
@@ -325,6 +491,8 @@ impl HotStorage for RocksDbStorage {
         if let Some(idem_key) = idempotency_key {
             let idem_db_key = Self::idempotency_key(topic, partition, idem_key);
             batch.put(idem_db_key.as_bytes(), sequence.to_be_bytes());
+            // Insert into bloom filter so future lookups can short-circuit
+            self.bloom_insert(topic, partition, idem_key);
         }
 
         // Add high watermark update to batch
@@ -368,13 +536,15 @@ impl HotStorage for RocksDbStorage {
         let mut partitions_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for event in events {
-            // Check idempotency first
+            // Check idempotency: Bloom filter short-circuits the RocksDB read
             if let Some(ref idem_key) = event.idempotency_key {
-                if let Some(existing_offset) =
-                    self.get_idempotency_offset(topic, event.partition, idem_key)?
-                {
-                    sequences.push(existing_offset);
-                    continue;
+                if self.bloom_maybe_contains(topic, event.partition, idem_key) {
+                    if let Some(existing_offset) =
+                        self.get_idempotency_offset(topic, event.partition, idem_key)?
+                    {
+                        sequences.push(existing_offset);
+                        continue;
+                    }
                 }
             }
 
@@ -403,6 +573,7 @@ impl HotStorage for RocksDbStorage {
             if let Some(ref idem_key) = event.idempotency_key {
                 let idem_db_key = Self::idempotency_key(topic, event.partition, idem_key);
                 batch.put(idem_db_key.as_bytes(), sequence.to_be_bytes());
+                self.bloom_insert(topic, event.partition, idem_key);
             }
 
             // Add timestamp index if enabled
@@ -1158,5 +1329,101 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload, b"b");
+    }
+
+    // =========================================================================
+    // Bloom Filter Tests
+    // =========================================================================
+
+    fn create_bloom_storage() -> (RocksDbStorage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open_with_bloom(dir.path()).unwrap();
+        (storage, dir)
+    }
+
+    #[test]
+    fn bloom_unseen_key_returns_not_present() {
+        let (storage, _dir) = create_bloom_storage();
+        // Insert a key to create the bloom filter for this partition
+        storage.bloom_insert("test", 0, "existing-key");
+        // A different key should not be found
+        assert!(!storage.bloom_maybe_contains("test", 0, "absent-key"));
+    }
+
+    #[test]
+    fn bloom_inserted_key_returns_maybe_present() {
+        let (storage, _dir) = create_bloom_storage();
+        storage.bloom_insert("test", 0, "my-key");
+        assert!(storage.bloom_maybe_contains("test", 0, "my-key"));
+    }
+
+    #[test]
+    fn bloom_idempotent_writes_still_correct() {
+        let (storage, _dir) = create_bloom_storage();
+
+        let offset1 = storage
+            .write("test-topic", 0, b"payload", 0, Some("req-123"))
+            .unwrap();
+
+        let offset2 = storage
+            .write("test-topic", 0, b"payload", 0, Some("req-123"))
+            .unwrap();
+
+        assert_eq!(offset1, offset2);
+
+        // Should only have one event
+        let events = storage.read("test-topic", 0, 0, 100).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn bloom_unique_keys_skip_rocksdb() {
+        let (storage, _dir) = create_bloom_storage();
+
+        // Write 100 unique keys — bloom should allow all without RocksDB reads
+        for i in 0..100 {
+            let key = format!("unique-{}", i);
+            let offset = storage
+                .write("test-topic", 0, b"data", 0, Some(&key))
+                .unwrap();
+            assert_eq!(offset, (i + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn bloom_rebuild_on_reopen() {
+        let dir = TempDir::new().unwrap();
+
+        // First: open, write with idempotency keys
+        {
+            let storage = RocksDbStorage::open_with_bloom(dir.path()).unwrap();
+            storage
+                .write("test-topic", 0, b"data1", 0, Some("key-1"))
+                .unwrap();
+            storage
+                .write("test-topic", 0, b"data2", 0, Some("key-2"))
+                .unwrap();
+        }
+
+        // Second: reopen with rebuild — bloom should have existing keys
+        {
+            let mut storage = RocksDbStorage::open(dir.path()).unwrap();
+            storage.bloom_config = BloomConfig {
+                enabled: true,
+                expected_items: 10_000,
+                fp_rate: 0.01,
+                rebuild_on_startup: true,
+            };
+            storage.rebuild_bloom_filters();
+
+            assert!(storage.bloom_maybe_contains("test-topic", 0, "key-1"));
+            assert!(storage.bloom_maybe_contains("test-topic", 0, "key-2"));
+
+            // Idempotent write should return same offset
+            let offset = storage
+                .write("test-topic", 0, b"data1", 0, Some("key-1"))
+                .unwrap();
+            assert_eq!(offset, 1);
+        }
     }
 }
