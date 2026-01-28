@@ -251,6 +251,37 @@ class BenchmarkSuite:
         except Exception:
             return False, (time.perf_counter() - start) * 1000
 
+    def write_bulk(self, payloads: List[dict], partition: int = 0) -> Tuple[bool, float, int]:
+        """Write multiple events using bulk API endpoint.
+
+        Returns (success, latency_ms, events_written).
+        """
+        records = [
+            {
+                "payload": json.dumps(p),
+                "partition": partition,
+                "timestamp_ms": int(time.time() * 1000),
+            }
+            for p in payloads
+        ]
+        data = {"records": records}
+
+        start = time.perf_counter()
+        try:
+            r = self.session.post(
+                f"{self.url}/tables/{self.table}/bulk",
+                json=data,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            latency = (time.perf_counter() - start) * 1000
+            if r.status_code in (200, 201, 202):
+                resp = r.json()
+                return True, latency, resp.get("count", len(payloads))
+            return False, latency, 0
+        except Exception:
+            return False, (time.perf_counter() - start) * 1000, 0
+
     # ---- Read Tests ----
 
     def read_records(self, since: int = 0, limit: int = 100) -> Tuple[List[dict], float]:
@@ -370,6 +401,67 @@ class BenchmarkSuite:
         print(f"  Errors: {summary['errors']}")
 
         self.results["write_throughput"] = results
+        return results
+
+    def test_bulk_write_throughput(self, duration_sec: int = 30, workers: int = 10, batch_size: int = 100) -> dict:
+        """Measure bulk write throughput using /tables/{table}/bulk endpoint.
+
+        This uses the bulk API which batches multiple events per HTTP request,
+        significantly reducing per-event overhead.
+        """
+        print("\n=== BULK WRITE THROUGHPUT ===")
+
+        stats = Stats()
+        stop_flag = threading.Event()
+        events_written = [0]  # Use list for mutable counter across threads
+        events_lock = threading.Lock()
+
+        def worker():
+            while not stop_flag.is_set():
+                # Generate a batch of payloads
+                payloads = [generate_payload(100) for _ in range(batch_size)]
+                success, latency, count = self.write_bulk(payloads)
+                # Record per-request stats (not per-event)
+                stats.record(success, latency, batch_size * 100)
+                if success:
+                    with events_lock:
+                        events_written[0] += count
+
+        print(f"Running bulk throughput test ({duration_sec}s, {workers} workers, {batch_size} events/batch)...")
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+
+        time.sleep(duration_sec)
+        stop_flag.set()
+
+        for t in threads:
+            t.join(timeout=2)
+
+        summary = stats.summary()
+        total_events = events_written[0]
+        events_per_sec = total_events / duration_sec
+        requests_per_sec = summary["success"] / duration_sec
+
+        results = {
+            "events_per_sec": events_per_sec,
+            "requests_per_sec": requests_per_sec,
+            "total_events": total_events,
+            "total_requests": summary["total"],
+            "batch_size": batch_size,
+            "errors": summary["errors"],
+            "p50_ms": summary["p50_ms"],
+            "p95_ms": summary["p95_ms"],
+            "p99_ms": summary["p99_ms"],
+        }
+
+        print(f"  Events/sec: {events_per_sec:,.0f}")
+        print(f"  Requests/sec: {requests_per_sec:,.0f}")
+        print(f"  Total events: {total_events:,}")
+        print(f"  P50: {summary['p50_ms']:.1f}ms, P95: {summary['p95_ms']:.1f}ms, P99: {summary['p99_ms']:.1f}ms")
+        print(f"  Errors: {summary['errors']}")
+
+        self.results["bulk_write_throughput"] = results
         return results
 
     def test_read_throughput(self, num_reads: int = 100, batch_size: int = 100) -> dict:
