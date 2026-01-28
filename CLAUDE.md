@@ -209,3 +209,91 @@ Closes #38
 - Change invariant behavior without discussion
 - Add dependencies without justification
 - Mix refactoring with feature changes in one PR
+
+---
+
+## Product Vision
+
+Zombi's mission is to provide the **lowest-cost, lowest-operational-overhead path from production data to data lake (Iceberg)**.
+
+### Core Principles
+
+1. **Low Cost**: Fully utilize server resources — performance regressions are critical bugs
+2. **Low Ops**: Minimal configuration, auto-registration, self-healing
+3. **Data Freshness**: Close the gap between production and analytics
+
+### Architecture Layers
+
+| Layer | Purpose | Technology |
+|-------|---------|------------|
+| Hot Storage | Sub-second reads of recent events | RocksDB |
+| Cold Storage | Durable analytics-ready data | Iceberg on S3 |
+| Unified API | Abstracts hot/cold for consumers | Zombi read endpoint |
+
+### Roadmap
+
+- **Phase 1 (Current)**: Event ingestion (clickstream, application events)
+- **Phase 2**: Unified consumer API (data available before S3 via streaming endpoint OR unified Iceberg view)
+- **Phase 3**: Binlog ingestion (MySQL CDC, Postgres logical replication)
+- **Phase 4**: Third-party connectors (Kafka, Kinesis, webhooks)
+
+---
+
+## Performance Invariants
+
+These performance baselines are **minimum acceptable** on t3.micro (2 vCPU, 1GB RAM).
+Any PR causing >30% regression should be flagged and investigated.
+
+| ID | Metric | Baseline | How to Verify |
+|----|--------|----------|---------------|
+| PERF-1 | Single-event writes | >5,000 req/s | `zombi_load.py run --scenario single-write` |
+| PERF-2 | Bulk writes (100/batch) | >50,000 ev/s | `zombi_load.py run --scenario bulk-write` |
+| PERF-3 | Server write latency | <100 μs | `/stats` endpoint `avg_latency_us` |
+| PERF-4 | Iceberg snapshot commit | <500 ms | Flush timing logs |
+
+### Cost Model (100M events to Iceberg)
+
+**Assumptions:**
+- Event size: ~127 bytes (100 bytes payload + overhead)
+- Parquet compression: ~4:1 → 3.2 GB stored per 100M events
+
+**Time to write:**
+- At 50,000 ev/s (sustained bulk): ~33 minutes
+- At 80,000 ev/s (peak bulk): ~21 minutes
+
+**AWS cost:**
+```
+EC2 (t3.micro, 0.5 hr):     $0.005
+S3 PUT requests (~1000):    $0.005
+S3 storage (3.2 GB/month):  $0.074
+---------------------------------
+Total per 100M events:      ~$0.08
+```
+
+---
+
+## Debugging
+
+### Logging
+```bash
+RUST_LOG=zombi=debug cargo run
+RUST_LOG=zombi::storage=trace cargo run  # Verbose storage logs
+```
+
+### Check Iceberg Data
+```bash
+# List files in MinIO
+aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/ --recursive
+
+# Check for metadata and data directories
+aws --endpoint-url http://localhost:9000 s3 ls s3://zombi-events/tables/events/
+```
+
+---
+
+## Bash Guidelines
+
+### Avoid output buffering issues
+- DO NOT pipe output through `head`, `tail`, `less`, or `more` when monitoring
+- Let commands complete fully, or use command-specific flags (e.g., `git log -n 10`)
+- Avoid chained pipes that can cause output to buffer indefinitely
