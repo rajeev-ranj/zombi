@@ -246,29 +246,10 @@ Any PR causing >30% regression should be flagged and investigated.
 
 | ID | Metric | Baseline | How to Verify |
 |----|--------|----------|---------------|
-| PERF-1 | Single-event writes | >5,000 req/s | `zombi_load.py run --scenario single-write` |
-| PERF-2 | Bulk writes (100/batch) | >50,000 ev/s | `zombi_load.py run --scenario bulk-write` |
-| PERF-3 | Server write latency | <100 μs | `/stats` endpoint `avg_latency_us` |
+| PERF-1 | Single-event writes | >10,000 req/s | `hey` single-write test |
+| PERF-2 | Bulk writes (100/batch) | >100,000 ev/s | `hey` bulk-write test |
+| PERF-3 | Server write latency | <10 μs | `/stats` endpoint `avg_latency_us` |
 | PERF-4 | Iceberg snapshot commit | <500 ms | Flush timing logs |
-
-### Cost Model (100M events to Iceberg)
-
-**Assumptions:**
-- Event size: ~127 bytes (100 bytes payload + overhead)
-- Parquet compression: ~4:1 → 3.2 GB stored per 100M events
-
-**Time to write:**
-- At 50,000 ev/s (sustained bulk): ~33 minutes
-- At 80,000 ev/s (peak bulk): ~21 minutes
-
-**AWS cost:**
-```
-EC2 (t3.micro, 0.5 hr):     $0.005
-S3 PUT requests (~1000):    $0.005
-S3 storage (3.2 GB/month):  $0.074
----------------------------------
-Total per 100M events:      ~$0.08
-```
 
 ---
 
