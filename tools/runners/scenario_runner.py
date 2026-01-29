@@ -37,7 +37,7 @@ from .base import BaseRunner, RunnerConfig
 SCENARIO_MAP = {
     # New unified names
     "single-write": "multi-producer",
-    "bulk-write": "benchmark-write",
+    "bulk-write": "benchmark-bulk",  # Fixed: uses /tables/{table}/bulk endpoint
     "read-throughput": "benchmark-read",
     "write-read-lag": "benchmark-lag",
     "mixed-workload": "mixed",
@@ -48,6 +48,8 @@ SCENARIO_MAP = {
     "multi-producer": "multi-producer",
     "consumer": "consumer",
     "mixed": "mixed",
+    # Keep old name for backwards compatibility
+    "benchmark-write": "benchmark-write",
 }
 
 
@@ -258,6 +260,31 @@ class ScenarioRunner(BaseRunner):
                 p95_ms=result.get("p95_ms", 0),
                 p99_ms=result.get("p99_ms", 0),
                 details={"samples": result.get("samples", 0)},
+            )
+
+        elif self._impl_name == "benchmark-bulk":
+            # Use the bulk API endpoint for true bulk write performance
+            result = bench.test_bulk_write_throughput(
+                duration_sec=self.config.duration_secs,
+                workers=self.config.num_workers,
+                batch_size=100,  # 100 events per request
+            )
+            duration = time.time() - start_time
+
+            return self.create_output(
+                name=self.name,
+                success=result.get("errors", 0) == 0,
+                duration_secs=duration,
+                events_per_sec=result.get("events_per_sec", 0),
+                bytes_total=result.get("total_events", 0) * self.config.payload_size,
+                p50_ms=result.get("p50_ms", 0),
+                p95_ms=result.get("p95_ms", 0),
+                p99_ms=result.get("p99_ms", 0),
+                errors=result.get("errors", 0),
+                details={
+                    "batch_size": result.get("batch_size", 100),
+                    "requests_per_sec": result.get("requests_per_sec", 0),
+                },
             )
 
         return self.create_output(

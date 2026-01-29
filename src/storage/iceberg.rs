@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use apache_avro::types::{Record, Value as AvroValue};
 use apache_avro::{Schema as AvroSchema, Writer as AvroWriter};
@@ -707,7 +708,7 @@ impl ManifestFile {
     /// `schema`, `schema-id`, `partition-spec`, `partition-spec-id`, `format-version`, `content`.
     pub fn to_avro_bytes(&self, table_metadata: &TableMetadata) -> Result<Vec<u8>, StorageError> {
         let avro_schema = manifest_entry_avro_schema();
-        let mut writer = AvroWriter::new(&avro_schema, Vec::new());
+        let mut writer = AvroWriter::new(avro_schema, Vec::new());
 
         // Set Iceberg-required metadata on the Avro file
         let schema_json = serde_json::to_string(
@@ -747,7 +748,7 @@ impl ManifestFile {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         for entry in &self.entries {
-            let record = manifest_entry_to_avro_record(&avro_schema, entry)?;
+            let record = manifest_entry_to_avro_record(avro_schema, entry)?;
             writer
                 .append(record)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -777,69 +778,106 @@ pub struct ManifestListEntry {
     pub deleted_rows_count: i64,
 }
 
-/// Returns the Avro schema for an Iceberg v2 manifest entry.
+/// Cached Avro schema for manifest entries (parsed once, reused forever).
+/// This eliminates repeated JSON parsing overhead on every snapshot commit.
+static MANIFEST_ENTRY_SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
+
+/// Cached Avro schema for manifest list entries (parsed once, reused forever).
+static MANIFEST_LIST_SCHEMA: OnceLock<AvroSchema> = OnceLock::new();
+
+/// JSON schema string for Iceberg v2 manifest entry.
+const MANIFEST_ENTRY_SCHEMA_JSON: &str = r#"
+{
+    "type": "record",
+    "name": "manifest_entry",
+    "fields": [
+        {"name": "status", "type": "int"},
+        {"name": "snapshot_id", "type": ["null", "long"], "default": null},
+        {"name": "sequence_number", "type": ["null", "long"], "default": null},
+        {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
+        {
+            "name": "data_file",
+            "type": {
+                "type": "record",
+                "name": "r2",
+                "fields": [
+                    {"name": "content", "type": "int", "default": 0},
+                    {"name": "file_path", "type": "string"},
+                    {"name": "file_format", "type": "string"},
+                    {"name": "record_count", "type": "long"},
+                    {"name": "file_size_in_bytes", "type": "long"},
+                    {
+                        "name": "column_sizes",
+                        "type": ["null", {"type": "map", "values": "long"}],
+                        "default": null
+                    },
+                    {
+                        "name": "value_counts",
+                        "type": ["null", {"type": "map", "values": "long"}],
+                        "default": null
+                    },
+                    {
+                        "name": "null_value_counts",
+                        "type": ["null", {"type": "map", "values": "long"}],
+                        "default": null
+                    },
+                    {
+                        "name": "lower_bounds",
+                        "type": ["null", {"type": "map", "values": "bytes"}],
+                        "default": null
+                    },
+                    {
+                        "name": "upper_bounds",
+                        "type": ["null", {"type": "map", "values": "bytes"}],
+                        "default": null
+                    },
+                    {
+                        "name": "split_offsets",
+                        "type": ["null", {"type": "array", "items": "long"}],
+                        "default": null
+                    }
+                ]
+            }
+        }
+    ]
+}
+"#;
+
+/// JSON schema string for Iceberg v2 manifest list entry.
+const MANIFEST_LIST_SCHEMA_JSON: &str = r#"
+{
+    "type": "record",
+    "name": "manifest_file",
+    "fields": [
+        {"name": "manifest_path", "type": "string"},
+        {"name": "manifest_length", "type": "long"},
+        {"name": "partition_spec_id", "type": "int"},
+        {"name": "content", "type": "int"},
+        {"name": "sequence_number", "type": "long"},
+        {"name": "min_sequence_number", "type": "long"},
+        {"name": "added_snapshot_id", "type": "long"},
+        {"name": "added_files_count", "type": "int"},
+        {"name": "existing_files_count", "type": "int"},
+        {"name": "deleted_files_count", "type": "int"},
+        {"name": "added_rows_count", "type": "long"},
+        {"name": "existing_rows_count", "type": "long"},
+        {"name": "deleted_rows_count", "type": "long"}
+    ]
+}
+"#;
+
+/// Returns the cached Avro schema for an Iceberg v2 manifest entry.
 ///
 /// This is a simplified schema covering the fields Zombi actually populates.
 /// The `data_file` sub-record includes file path, format, record count, size,
 /// and optional column statistics maps.
-fn manifest_entry_avro_schema() -> AvroSchema {
-    let raw = r#"
-    {
-        "type": "record",
-        "name": "manifest_entry",
-        "fields": [
-            {"name": "status", "type": "int"},
-            {"name": "snapshot_id", "type": ["null", "long"], "default": null},
-            {"name": "sequence_number", "type": ["null", "long"], "default": null},
-            {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
-            {
-                "name": "data_file",
-                "type": {
-                    "type": "record",
-                    "name": "r2",
-                    "fields": [
-                        {"name": "content", "type": "int", "default": 0},
-                        {"name": "file_path", "type": "string"},
-                        {"name": "file_format", "type": "string"},
-                        {"name": "record_count", "type": "long"},
-                        {"name": "file_size_in_bytes", "type": "long"},
-                        {
-                            "name": "column_sizes",
-                            "type": ["null", {"type": "map", "values": "long"}],
-                            "default": null
-                        },
-                        {
-                            "name": "value_counts",
-                            "type": ["null", {"type": "map", "values": "long"}],
-                            "default": null
-                        },
-                        {
-                            "name": "null_value_counts",
-                            "type": ["null", {"type": "map", "values": "long"}],
-                            "default": null
-                        },
-                        {
-                            "name": "lower_bounds",
-                            "type": ["null", {"type": "map", "values": "bytes"}],
-                            "default": null
-                        },
-                        {
-                            "name": "upper_bounds",
-                            "type": ["null", {"type": "map", "values": "bytes"}],
-                            "default": null
-                        },
-                        {
-                            "name": "split_offsets",
-                            "type": ["null", {"type": "array", "items": "long"}],
-                            "default": null
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-    "#;
-    AvroSchema::parse_str(raw).expect("manifest_entry schema is valid")
+///
+/// The schema is parsed once on first call and cached for all subsequent calls,
+/// eliminating the overhead of repeated JSON parsing.
+fn manifest_entry_avro_schema() -> &'static AvroSchema {
+    MANIFEST_ENTRY_SCHEMA.get_or_init(|| {
+        AvroSchema::parse_str(MANIFEST_ENTRY_SCHEMA_JSON).expect("manifest_entry schema is valid")
+    })
 }
 
 /// Converts a `ManifestEntry` to an Avro `Record`.
@@ -942,30 +980,14 @@ fn manifest_entry_to_avro_record<'a>(
     Ok(record)
 }
 
-/// Returns the Avro schema for an Iceberg v2 manifest list entry.
-fn manifest_list_entry_avro_schema() -> AvroSchema {
-    let raw = r#"
-    {
-        "type": "record",
-        "name": "manifest_file",
-        "fields": [
-            {"name": "manifest_path", "type": "string"},
-            {"name": "manifest_length", "type": "long"},
-            {"name": "partition_spec_id", "type": "int"},
-            {"name": "content", "type": "int"},
-            {"name": "sequence_number", "type": "long"},
-            {"name": "min_sequence_number", "type": "long"},
-            {"name": "added_snapshot_id", "type": "long"},
-            {"name": "added_files_count", "type": "int"},
-            {"name": "existing_files_count", "type": "int"},
-            {"name": "deleted_files_count", "type": "int"},
-            {"name": "added_rows_count", "type": "long"},
-            {"name": "existing_rows_count", "type": "long"},
-            {"name": "deleted_rows_count", "type": "long"}
-        ]
-    }
-    "#;
-    AvroSchema::parse_str(raw).expect("manifest_list schema is valid")
+/// Returns the cached Avro schema for an Iceberg v2 manifest list entry.
+///
+/// The schema is parsed once on first call and cached for all subsequent calls,
+/// eliminating the overhead of repeated JSON parsing.
+fn manifest_list_entry_avro_schema() -> &'static AvroSchema {
+    MANIFEST_LIST_SCHEMA.get_or_init(|| {
+        AvroSchema::parse_str(MANIFEST_LIST_SCHEMA_JSON).expect("manifest_list schema is valid")
+    })
 }
 
 /// Serializes manifest list entries to Avro binary format per Iceberg v2 spec.
@@ -974,14 +996,14 @@ pub fn manifest_list_to_avro_bytes(
     _metadata: &TableMetadata,
 ) -> Result<Vec<u8>, StorageError> {
     let schema = manifest_list_entry_avro_schema();
-    let mut writer = AvroWriter::new(&schema, Vec::new());
+    let mut writer = AvroWriter::new(schema, Vec::new());
 
     writer
         .add_user_metadata("format-version".to_string(), "2")
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     for entry in entries {
-        let mut record = Record::new(&schema).ok_or_else(|| {
+        let mut record = Record::new(schema).ok_or_else(|| {
             StorageError::Serialization("Failed to create manifest_file record".into())
         })?;
 
