@@ -383,7 +383,8 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     let start = Instant::now();
     let body_len = body.len() as u64;
 
-    // Acquire backpressure permit before processing
+    // Check backpressure against raw body size (not parsed payload size) so we
+    // reject oversized requests before spending CPU on JSON deserialization.
     let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
         state.metrics.record_error();
         state
@@ -497,7 +498,8 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     let start = Instant::now();
     let body_len = body.len() as u64;
 
-    // Acquire backpressure permit before processing
+    // Check backpressure against raw body size (not parsed payload size) so we
+    // reject oversized requests before spending CPU on JSON deserialization.
     let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
         state.metrics.record_error();
         state
