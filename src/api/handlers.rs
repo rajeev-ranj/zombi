@@ -548,6 +548,12 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
             .record_write(total_bytes / record_count as u64, per_event_latency);
     }
 
+    // Record to enhanced metrics (histogram) - once per bulk request
+    state
+        .metrics_registry
+        .enhanced_api
+        .record_write(&table, latency_us);
+
     Ok((
         StatusCode::ACCEPTED,
         Json(BulkWriteResponse {
