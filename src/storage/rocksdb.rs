@@ -91,6 +91,8 @@ pub struct RocksDbStorage {
     bloom_filters: DashMap<(String, u32), RwLock<Bloom<String>>>,
     /// Bloom filter configuration.
     bloom_config: BloomConfig,
+    /// Whether WAL is enabled for write operations.
+    wal_enabled: bool,
 }
 
 impl RocksDbStorage {
@@ -152,6 +154,14 @@ impl RocksDbStorage {
 
         let bloom_filters = DashMap::new();
 
+        let wal_enabled = std::env::var("ZOMBI_ROCKSDB_WAL_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        tracing::info!(
+            wal_enabled = wal_enabled,
+            "RocksDB WAL policy configured"
+        );
+
         let storage = Self {
             db,
             sequences: DashMap::new(),
@@ -161,6 +171,7 @@ impl RocksDbStorage {
             timestamp_index_enabled,
             bloom_filters,
             bloom_config,
+            wal_enabled,
         };
 
         // Rebuild bloom filters from existing idempotency keys if configured
@@ -387,10 +398,11 @@ impl RocksDbStorage {
         }
     }
 
-    /// Creates optimized write options with WAL sync disabled (#4).
-    fn write_options() -> WriteOptions {
+    /// Creates optimized write options with configurable WAL policy (#4).
+    fn write_options(&self) -> WriteOptions {
         let mut opts = WriteOptions::default();
-        opts.disable_wal(true); // Skip WAL for throughput (data in memtable is still durable)
+        // Skip WAL for throughput unless explicitly enabled
+        opts.disable_wal(!self.wal_enabled);
         opts
     }
 
@@ -507,7 +519,7 @@ impl HotStorage for RocksDbStorage {
 
         // Single atomic write for all operations (with WAL disabled for throughput #4)
         self.db
-            .write_opt(batch, &Self::write_options())
+            .write_opt(batch, &self.write_options())
             .map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
         // Register partition and topic in cache for fast lookups
@@ -601,7 +613,7 @@ impl HotStorage for RocksDbStorage {
 
         // Single atomic write for ALL events (with WAL disabled for throughput)
         self.db
-            .write_opt(batch, &Self::write_options())
+            .write_opt(batch, &self.write_options())
             .map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
         // Register partitions and topic in cache
@@ -705,7 +717,7 @@ impl HotStorage for RocksDbStorage {
     ) -> Result<(), StorageError> {
         let key = Self::consumer_offset_key(group, topic, partition);
         self.db
-            .put(key.as_bytes(), offset.to_be_bytes())
+            .put_opt(key.as_bytes(), offset.to_be_bytes(), &self.write_options())
             .map_err(|e| StorageError::RocksDb(e.to_string()))
     }
 

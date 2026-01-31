@@ -119,6 +119,8 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 
 - `ZOMBI_FLUSH_BATCH_SIZE` is advisory only and currently unused in flush logic.
   Use `ZOMBI_FLUSH_MAX_SEGMENT` or `ZOMBI_TARGET_FILE_SIZE_MB` to control batching.
+- `ZOMBI_ROCKSDB_WAL_ENABLED` controls WAL usage for event writes and consumer offset commits.
+  Default is `false` (WAL disabled) for throughput.
 
 ### Schema
 ```
