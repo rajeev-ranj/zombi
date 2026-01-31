@@ -121,6 +121,10 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
   Use `ZOMBI_FLUSH_MAX_SEGMENT` or `ZOMBI_TARGET_FILE_SIZE_MB` to control batching.
 - `ZOMBI_ROCKSDB_WAL_ENABLED` controls WAL usage for event writes and consumer offset commits.
   Default is `false` (WAL disabled) for throughput.
+- RocksDB tuning env vars (defaults in parentheses): `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` (64),
+  `ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS` (3), `ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER` (4),
+  `ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB` (64), `ZOMBI_ROCKSDB_BLOCK_CACHE_MB` (128),
+  `ZOMBI_ROCKSDB_BLOCK_SIZE_KB` (16).
 
 ### Schema
 ```

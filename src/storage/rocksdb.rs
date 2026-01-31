@@ -20,6 +20,8 @@ const HWM_PREFIX: &str = "hwm";
 const CONSUMER_PREFIX: &str = "consumer";
 /// Key prefix for timestamp index (for O(1) time-based queries)
 const TIMESTAMP_INDEX_PREFIX: &str = "ts";
+const KB: usize = 1024;
+const MB: usize = 1024 * 1024;
 
 /// Configuration for Bloom filter-based idempotency key lookups.
 #[derive(Debug, Clone)]
@@ -72,6 +74,94 @@ impl BloomConfig {
     }
 }
 
+/// Configuration for RocksDB tuning parameters.
+#[derive(Debug, Clone)]
+pub struct RocksDbConfig {
+    /// Memtable size in bytes.
+    pub write_buffer_size_bytes: usize,
+    /// Number of write buffers before stalling.
+    pub max_write_buffers: i32,
+    /// L0 compaction trigger.
+    pub l0_compaction_trigger: i32,
+    /// Target SST file size in bytes.
+    pub target_file_size_base_bytes: u64,
+    /// Block cache size in bytes.
+    pub block_cache_size_bytes: usize,
+    /// Block size in bytes.
+    pub block_size_bytes: usize,
+}
+
+impl Default for RocksDbConfig {
+    fn default() -> Self {
+        Self {
+            write_buffer_size_bytes: 64 * MB,
+            max_write_buffers: 3,
+            l0_compaction_trigger: 4,
+            target_file_size_base_bytes: (64 * MB) as u64,
+            block_cache_size_bytes: 128 * MB,
+            block_size_bytes: 16 * KB,
+        }
+    }
+}
+
+impl RocksDbConfig {
+    /// Creates a RocksDbConfig from environment variables.
+    ///
+    /// Environment variables:
+    /// - `ZOMBI_ROCKSDB_WRITE_BUFFER_MB`: Memtable size in MB (default: 64)
+    /// - `ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS`: Number of write buffers (default: 3)
+    /// - `ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER`: L0 compaction trigger (default: 4)
+    /// - `ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB`: Target SST file size in MB (default: 64)
+    /// - `ZOMBI_ROCKSDB_BLOCK_CACHE_MB`: Block cache size in MB (default: 128)
+    /// - `ZOMBI_ROCKSDB_BLOCK_SIZE_KB`: Block size in KB (default: 16)
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        let write_buffer_size_bytes = std::env::var("ZOMBI_ROCKSDB_WRITE_BUFFER_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * MB)
+            .unwrap_or(default.write_buffer_size_bytes);
+        let max_write_buffers = std::env::var("ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.max_write_buffers);
+        let l0_compaction_trigger = std::env::var("ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.l0_compaction_trigger);
+        let target_file_size_base_bytes = std::env::var("ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * MB as u64)
+            .unwrap_or(default.target_file_size_base_bytes);
+        let block_cache_size_bytes = std::env::var("ZOMBI_ROCKSDB_BLOCK_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * MB)
+            .unwrap_or(default.block_cache_size_bytes);
+        let block_size_bytes = std::env::var("ZOMBI_ROCKSDB_BLOCK_SIZE_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|kb| kb * KB)
+            .unwrap_or(default.block_size_bytes);
+
+        Self {
+            write_buffer_size_bytes,
+            max_write_buffers,
+            l0_compaction_trigger,
+            target_file_size_base_bytes,
+            block_cache_size_bytes,
+            block_size_bytes,
+        }
+    }
+}
+
 /// RocksDB-backed hot storage implementation.
 pub struct RocksDbStorage {
     db: DB,
@@ -101,13 +191,23 @@ impl RocksDbStorage {
         let path = path.as_ref();
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        let rocksdb_config = RocksDbConfig::from_env();
+        tracing::info!(
+            write_buffer_mb = rocksdb_config.write_buffer_size_bytes / MB,
+            max_write_buffers = rocksdb_config.max_write_buffers,
+            l0_compaction_trigger = rocksdb_config.l0_compaction_trigger,
+            target_file_size_mb = rocksdb_config.target_file_size_base_bytes / MB as u64,
+            block_cache_mb = rocksdb_config.block_cache_size_bytes / MB,
+            block_size_kb = rocksdb_config.block_size_bytes / KB,
+            "RocksDB tuning parameters configured"
+        );
 
         // Compression: LZ4 is fast with decent compression
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
         // Write buffer: larger buffer = fewer flushes to disk
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB write buffer
-        opts.set_max_write_buffer_number(3); // Keep 3 buffers before stalling
+        opts.set_write_buffer_size(rocksdb_config.write_buffer_size_bytes);
+        opts.set_max_write_buffer_number(rocksdb_config.max_write_buffers);
 
         // Parallelism: use available CPU cores
         let parallelism = std::thread::available_parallelism()
@@ -117,13 +217,15 @@ impl RocksDbStorage {
         opts.set_max_background_jobs(parallelism.min(4)); // Background compaction/flush
 
         // Level compaction tuning
-        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
-        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_target_file_size_base(rocksdb_config.target_file_size_base_bytes);
+        opts.set_level_zero_file_num_compaction_trigger(rocksdb_config.l0_compaction_trigger);
 
         // Block cache: explicitly configure for read performance (#6)
         let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(128 * 1024 * 1024)); // 128MB cache
-        block_opts.set_block_size(16 * 1024); // 16KB blocks (good for sequential reads)
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(
+            rocksdb_config.block_cache_size_bytes,
+        ));
+        block_opts.set_block_size(rocksdb_config.block_size_bytes);
         block_opts.set_cache_index_and_filter_blocks(true); // Cache index blocks too
         opts.set_block_based_table_factory(&block_opts);
 
@@ -957,12 +1059,81 @@ impl RocksDbStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_rocksdb_env() {
+        std::env::remove_var("ZOMBI_ROCKSDB_WRITE_BUFFER_MB");
+        std::env::remove_var("ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS");
+        std::env::remove_var("ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER");
+        std::env::remove_var("ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB");
+        std::env::remove_var("ZOMBI_ROCKSDB_BLOCK_CACHE_MB");
+        std::env::remove_var("ZOMBI_ROCKSDB_BLOCK_SIZE_KB");
+    }
 
     fn create_test_storage() -> (RocksDbStorage, TempDir) {
         let dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(dir.path()).unwrap();
         (storage, dir)
+    }
+
+    #[test]
+    fn rocksdb_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_rocksdb_env();
+        let config = RocksDbConfig::from_env();
+        assert_eq!(config.write_buffer_size_bytes, 64 * MB);
+        assert_eq!(config.max_write_buffers, 3);
+        assert_eq!(config.l0_compaction_trigger, 4);
+        assert_eq!(config.target_file_size_base_bytes, (64 * MB) as u64);
+        assert_eq!(config.block_cache_size_bytes, 128 * MB);
+        assert_eq!(config.block_size_bytes, 16 * KB);
+    }
+
+    #[test]
+    fn rocksdb_config_from_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_rocksdb_env();
+        std::env::set_var("ZOMBI_ROCKSDB_WRITE_BUFFER_MB", "128");
+        std::env::set_var("ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS", "6");
+        std::env::set_var("ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER", "8");
+        std::env::set_var("ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB", "96");
+        std::env::set_var("ZOMBI_ROCKSDB_BLOCK_CACHE_MB", "256");
+        std::env::set_var("ZOMBI_ROCKSDB_BLOCK_SIZE_KB", "32");
+
+        let config = RocksDbConfig::from_env();
+        assert_eq!(config.write_buffer_size_bytes, 128 * MB);
+        assert_eq!(config.max_write_buffers, 6);
+        assert_eq!(config.l0_compaction_trigger, 8);
+        assert_eq!(config.target_file_size_base_bytes, (96 * MB) as u64);
+        assert_eq!(config.block_cache_size_bytes, 256 * MB);
+        assert_eq!(config.block_size_bytes, 32 * KB);
+
+        clear_rocksdb_env();
+    }
+
+    #[test]
+    fn rocksdb_config_ignores_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_rocksdb_env();
+        std::env::set_var("ZOMBI_ROCKSDB_WRITE_BUFFER_MB", "0");
+        std::env::set_var("ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS", "-1");
+        std::env::set_var("ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER", "nope");
+        std::env::set_var("ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB", "");
+        std::env::set_var("ZOMBI_ROCKSDB_BLOCK_CACHE_MB", "0");
+        std::env::set_var("ZOMBI_ROCKSDB_BLOCK_SIZE_KB", "0");
+
+        let config = RocksDbConfig::from_env();
+        assert_eq!(config.write_buffer_size_bytes, 64 * MB);
+        assert_eq!(config.max_write_buffers, 3);
+        assert_eq!(config.l0_compaction_trigger, 4);
+        assert_eq!(config.target_file_size_base_bytes, (64 * MB) as u64);
+        assert_eq!(config.block_cache_size_bytes, 128 * MB);
+        assert_eq!(config.block_size_bytes, 16 * KB);
+
+        clear_rocksdb_env();
     }
 
     #[test]
