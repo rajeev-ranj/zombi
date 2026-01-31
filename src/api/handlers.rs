@@ -470,12 +470,6 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
         .metrics_registry
         .consumer
         .update_high_watermark(&table, partition, offset);
-    if let Ok(lwm) = state.storage.low_watermark(&table, partition) {
-        state
-            .metrics_registry
-            .hot
-            .update(&table, partition, lwm, offset);
-    }
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1156,6 +1150,7 @@ pub async fn health_ready<H: HotStorage, C: ColdStorage>(
 pub async fn metrics<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
 ) -> impl IntoResponse {
+    refresh_hot_storage_metrics(state.as_ref());
     let metrics = &state.metrics;
 
     let uptime_secs = metrics
@@ -1254,4 +1249,61 @@ pub async fn metrics<H: HotStorage, C: ColdStorage>(
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         output,
     )
+}
+
+fn refresh_hot_storage_metrics<H: HotStorage, C: ColdStorage>(state: &AppState<H, C>) {
+    let topics = match state.storage.list_topics() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list topics for hot storage metrics");
+            return;
+        }
+    };
+
+    for topic in topics {
+        let partitions = match state.storage.list_partitions(&topic) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic,
+                    error = %e,
+                    "Failed to list partitions for hot storage metrics"
+                );
+                continue;
+            }
+        };
+
+        for partition in partitions {
+            let low = match state.storage.low_watermark(&topic, partition) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(
+                        topic = %topic,
+                        partition = partition,
+                        error = %e,
+                        "Failed to read low watermark for metrics"
+                    );
+                    continue;
+                }
+            };
+
+            let high = match state.storage.high_watermark(&topic, partition) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(
+                        topic = %topic,
+                        partition = partition,
+                        error = %e,
+                        "Failed to read high watermark for metrics"
+                    );
+                    continue;
+                }
+            };
+
+            state
+                .metrics_registry
+                .hot
+                .update(&topic, partition, low, high);
+        }
+    }
 }
