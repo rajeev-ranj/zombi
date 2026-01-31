@@ -1102,12 +1102,14 @@ async fn test_bulk_write() {
                 .method("POST")
                 .uri("/tables/bulk_test/bulk")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{
+                .body(Body::from(
+                    r#"{
                     "records": [
                         {"payload": "event1", "partition": 0},
                         {"payload": "event2", "partition": 0}
                     ]
-                }"#))
+                }"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -1119,7 +1121,7 @@ async fn test_bulk_write() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    
+
     assert_eq!(json["count"], 2);
     assert_eq!(json["table"], "bulk_test");
     assert!(json["offsets"].as_array().unwrap().len() == 2);
