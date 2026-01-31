@@ -1089,7 +1089,7 @@ async fn test_read_with_fields_and_since_filter() {
     let record = &json["records"][0];
     assert_eq!(record["payload"], "new event");
     assert!(record["sequence"].is_number());
-    assert!(record.get(\"timestamp_ms\").is_none());
+    assert!(record.get("timestamp_ms").is_none());
 }
 
 #[tokio::test]
