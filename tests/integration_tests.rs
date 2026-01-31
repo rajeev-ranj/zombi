@@ -594,6 +594,98 @@ async fn test_backpressure_bytes_limit() {
     assert_eq!(json["code"], "SERVER_OVERLOADED");
 }
 
+#[tokio::test]
+async fn test_bulk_backpressure_bytes_limit() {
+    // Create app with very low byte limit to test backpressure
+    let config = BackpressureConfig {
+        max_inflight_writes: 10000,
+        max_inflight_bytes: 10, // Only 10 bytes allowed
+    };
+    let (app, _dir) = create_test_app_with_backpressure(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/test/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"records":[{"payload":"small"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "SERVER_OVERLOADED");
+}
+
+#[tokio::test]
+async fn test_bulk_invalid_json_returns_400_when_under_limit() {
+    // Create app with sufficient byte limit so parsing happens
+    let config = BackpressureConfig {
+        max_inflight_writes: 10000,
+        max_inflight_bytes: 1024,
+    };
+    let (app, _dir) = create_test_app_with_backpressure(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/test/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"records":[{"payload":"oops"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn test_bulk_write_succeeds_under_backpressure_limit() {
+    let config = BackpressureConfig {
+        max_inflight_writes: 10000,
+        max_inflight_bytes: 1024,
+    };
+    let (app, _dir) = create_test_app_with_backpressure(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/test/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"records":[{"payload":"a","partition":0},{"payload":"b","partition":0}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["offsets"].as_array().unwrap().len(), 2);
+}
+
 // ============================================================================
 // Health Check Tests (#10)
 // ============================================================================

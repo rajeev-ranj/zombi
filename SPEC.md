@@ -113,6 +113,13 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 - **File Format:** Parquet with Zstd compression
 - **Partitioning:** By event date/hour (configurable)
 
+---
+
+## Operational Notes
+
+- `ZOMBI_FLUSH_BATCH_SIZE` is advisory only and currently unused in flush logic.
+  Use `ZOMBI_FLUSH_MAX_SEGMENT` or `ZOMBI_TARGET_FILE_SIZE_MB` to control batching.
+
 ### Schema
 ```
 ┌─────────────────┬──────────┬──────────┬──────────┐
