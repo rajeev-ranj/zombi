@@ -861,6 +861,49 @@ async fn test_metrics_values_update_after_writes() {
     assert!(body_str.contains("zombi_writes_bytes_total"));
 }
 
+#[tokio::test]
+async fn test_metrics_include_hot_storage_events_after_writes() {
+    let (app, _dir) = create_test_app();
+
+    // Write a record to create topic/partition
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/hot_metrics_test")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "hot", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Scrape metrics (triggers refresh_hot_storage_metrics)
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        body_str.contains("zombi_hot_storage_events{topic=\"hot_metrics_test\",partition=\"0\"} 1")
+    );
+}
+
 // ============================================================================
 // Column Projection Tests (#38)
 // ============================================================================
