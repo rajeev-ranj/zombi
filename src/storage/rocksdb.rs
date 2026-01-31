@@ -157,10 +157,7 @@ impl RocksDbStorage {
         let wal_enabled = std::env::var("ZOMBI_ROCKSDB_WAL_ENABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        tracing::info!(
-            wal_enabled = wal_enabled,
-            "RocksDB WAL policy configured"
-        );
+        tracing::info!(wal_enabled = wal_enabled, "RocksDB WAL policy configured");
 
         let storage = Self {
             db,
