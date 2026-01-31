@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use futures::future::join_all;
 use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
 use zombi::metrics::MetricsRegistry;
 use zombi::proto;
-use zombi::storage::RocksDbStorage;
+use zombi::storage::{RocksDbStorage, WriteCombiner, WriteCombinerConfig};
 
 fn create_test_app_with_backpressure(
     config: BackpressureConfig,
@@ -36,6 +37,24 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
+    let router = create_router(state);
+    (router, dir)
+}
+
+fn create_test_app_with_combiner(config: WriteCombinerConfig) -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = Arc::new(RocksDbStorage::open(dir.path()).unwrap());
+    let combiner = Arc::new(WriteCombiner::new(Arc::clone(&storage), config));
+    let state = Arc::new(
+        AppState::new(
+            storage,
+            None::<Arc<NoopColdStorage>>,
+            Arc::new(Metrics::new()),
+            Arc::new(MetricsRegistry::new()),
+            BackpressureConfig::default(),
+        )
+        .with_write_combiner(Some(combiner)),
+    );
     let router = create_router(state);
     (router, dir)
 }
@@ -97,6 +116,51 @@ async fn test_write_record() {
     assert_eq!(json["offset"], 1);
     assert_eq!(json["partition"], 0);
     assert_eq!(json["table"], "user_events");
+}
+
+#[tokio::test]
+async fn test_write_record_with_combiner() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 5,
+        window: std::time::Duration::from_micros(500),
+        queue_capacity: 50,
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let requests = (0..20).map(|i| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tables/user_events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"payload\": \"hello {}\", \"partition\": 0}}",
+                        i
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let responses = join_all(requests).await;
+    let mut offsets: Vec<u64> = Vec::new();
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        offsets.push(json["offset"].as_u64().unwrap());
+    }
+
+    offsets.sort_unstable();
+    let expected: Vec<u64> = (1..=20).collect();
+    assert_eq!(offsets, expected);
 }
 
 #[tokio::test]

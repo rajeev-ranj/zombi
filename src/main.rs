@@ -11,7 +11,7 @@ use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::metrics::MetricsRegistry;
 use zombi::storage::{
     CatalogClient, CatalogConfig, ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage,
-    S3Storage,
+    S3Storage, WriteCombiner, WriteCombinerConfig,
 };
 
 #[tokio::main]
@@ -213,13 +213,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_inflight_bytes_mb = backpressure_config.max_inflight_bytes / (1024 * 1024),
         "Backpressure configured"
     );
-    let state = Arc::new(AppState::new(
-        storage,
-        cold_storage,
-        Arc::new(Metrics::new()),
-        Arc::clone(&metrics_registry),
-        backpressure_config,
-    ));
+    let write_combiner_config = WriteCombinerConfig::from_env();
+    let write_combiner = if write_combiner_config.enabled {
+        tracing::info!(
+            batch_size = write_combiner_config.batch_size,
+            window_us = write_combiner_config.window.as_micros(),
+            queue_capacity = write_combiner_config.queue_capacity,
+            "Write combiner enabled for single writes"
+        );
+        Some(Arc::new(WriteCombiner::new(
+            Arc::clone(&storage),
+            write_combiner_config,
+        )))
+    } else {
+        None
+    };
+
+    let state = Arc::new(
+        AppState::new(
+            storage,
+            cold_storage,
+            Arc::new(Metrics::new()),
+            Arc::clone(&metrics_registry),
+            backpressure_config,
+        )
+        .with_write_combiner(write_combiner),
+    );
 
     // Start server
     let config = ServerConfig {
