@@ -899,9 +899,9 @@ async fn test_metrics_include_hot_storage_events_after_writes() {
         .unwrap();
     let body_str = String::from_utf8(body.to_vec()).unwrap();
 
-    assert!(body_str.contains(
-        "zombi_hot_storage_events{topic=\"hot_metrics_test\",partition=\"0\"} 1"
-    ));
+    assert!(
+        body_str.contains("zombi_hot_storage_events{topic=\"hot_metrics_test\",partition=\"0\"} 1")
+    );
 }
 
 // ============================================================================
