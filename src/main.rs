@@ -111,14 +111,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         // Override with environment variables if specified
+        let batch_size_env = std::env::var("ZOMBI_FLUSH_BATCH_SIZE").ok();
+        if batch_size_env.is_some() {
+            tracing::warn!(
+                "ZOMBI_FLUSH_BATCH_SIZE is set but currently unused; use ZOMBI_FLUSH_MAX_SEGMENT or ZOMBI_TARGET_FILE_SIZE_MB"
+            );
+        }
+
         let config = FlusherConfig {
             interval: std::env::var("ZOMBI_FLUSH_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(base_config.interval),
-            batch_size: std::env::var("ZOMBI_FLUSH_BATCH_SIZE")
-                .ok()
+            batch_size: batch_size_env
+                .as_ref()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(base_config.batch_size),
             max_segment_size: std::env::var("ZOMBI_FLUSH_MAX_SEGMENT")

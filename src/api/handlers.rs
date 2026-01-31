@@ -492,9 +492,26 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
 pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
-    Json(request): Json<BulkWriteRequest>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<BulkWriteResponse>), ApiError> {
     let start = Instant::now();
+    let body_len = body.len() as u64;
+
+    // Acquire backpressure permit before processing
+    let _permit = state.try_acquire_write_permit(body_len).map_err(|e| {
+        state.metrics.record_error();
+        state
+            .metrics_registry
+            .enhanced_api
+            .record_backpressure_rejection();
+        ApiError::from(e)
+    })?;
+
+    let request: BulkWriteRequest = serde_json::from_slice(&body).map_err(|e| {
+        state.metrics.record_error();
+        ApiError::BadRequest(format!("Invalid JSON: {}", e))
+    })?;
+
     let record_count = request.records.len();
 
     if record_count == 0 {
@@ -521,16 +538,6 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
         .collect();
 
     let total_bytes: u64 = events.iter().map(|e| e.payload.len() as u64).sum();
-
-    // Acquire backpressure permit before processing
-    let _permit = state.try_acquire_write_permit(total_bytes).map_err(|e| {
-        state.metrics.record_error();
-        state
-            .metrics_registry
-            .enhanced_api
-            .record_backpressure_rejection();
-        ApiError::from(e)
-    })?;
 
     // Single batch write for all events
     let offsets = state.storage.write_batch(&table, &events).map_err(|e| {
