@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use crate::contracts::{ColdStorage, ColumnProjection, HotStorage, StorageError, KNOWN_COLUMNS};
 use crate::metrics::MetricsRegistry;
 use crate::proto;
+use crate::storage::WriteCombiner;
 
 /// Server metrics for monitoring.
 #[derive(Default)]
@@ -117,6 +118,8 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub inflight_bytes: AtomicU64,
     /// Maximum inflight bytes before rejecting writes
     pub max_inflight_bytes: u64,
+    /// Optional write combiner for batching single writes
+    pub write_combiner: Option<Arc<WriteCombiner<H>>>,
 }
 
 impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
@@ -136,7 +139,13 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
             write_semaphore: Arc::new(Semaphore::new(backpressure.max_inflight_writes)),
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
+            write_combiner: None,
         }
+    }
+
+    pub fn with_write_combiner(mut self, combiner: Option<Arc<WriteCombiner<H>>>) -> Self {
+        self.write_combiner = combiner;
+        self
     }
 
     /// Tries to acquire backpressure permits for a write of the given size.
@@ -444,19 +453,35 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
             )
         };
 
-    let offset = state
-        .storage
-        .write(
-            &table,
-            partition,
-            &payload,
-            timestamp_ms,
-            idempotency_key.as_deref(),
-        )
-        .map_err(|e| {
-            state.metrics.record_error();
-            ApiError::from(e)
-        })?;
+    let offset = if let Some(combiner) = &state.write_combiner {
+        combiner
+            .write(
+                table.clone(),
+                partition,
+                payload,
+                timestamp_ms,
+                idempotency_key,
+            )
+            .await
+            .map_err(|e| {
+                state.metrics.record_error();
+                ApiError::from(e)
+            })?
+    } else {
+        state
+            .storage
+            .write(
+                &table,
+                partition,
+                &payload,
+                timestamp_ms,
+                idempotency_key.as_deref(),
+            )
+            .map_err(|e| {
+                state.metrics.record_error();
+                ApiError::from(e)
+            })?
+    };
 
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_write(body_len, latency_us);

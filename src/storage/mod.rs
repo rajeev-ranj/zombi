@@ -1,5 +1,6 @@
 mod catalog;
 mod cold_storage_backend;
+mod combiner;
 mod compaction;
 mod iceberg;
 mod iceberg_storage;
@@ -12,6 +13,7 @@ mod sequence;
 
 pub use catalog::{CatalogClient, CatalogConfig};
 pub use cold_storage_backend::ColdStorageBackend;
+pub use combiner::{WriteCombiner, WriteCombinerConfig};
 pub use compaction::{CompactionConfig, CompactionResult, Compactor};
 pub use iceberg::{
     current_timestamp_ms, data_file_name, generate_snapshot_id, iceberg_encoding,
