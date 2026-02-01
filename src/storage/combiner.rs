@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,69 +141,129 @@ async fn run_combiner<H: HotStorage>(
     mut receiver: mpsc::Receiver<WriteRequest>,
     config: WriteCombinerConfig,
 ) {
-    let mut pending: Option<WriteRequest> = None;
+    let mut batches: HashMap<String, PendingBatch> = HashMap::new();
 
     loop {
-        let first = match pending.take().or_else(|| receiver.try_recv().ok()) {
-            Some(req) => req,
+        let next_deadline = batches.values().map(|batch| batch.deadline).min();
+
+        match next_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    maybe_req = receiver.recv() => {
+                        match maybe_req {
+                            Some(req) => {
+                                handle_request(&mut batches, req, &config, &storage);
+                                flush_expired_batches(&mut batches, &storage);
+                            }
+                            None => {
+                                flush_all_batches(&mut batches, &storage);
+                                break;
+                            }
+                        }
+                    }
+                    _ = time::sleep_until(deadline) => {
+                        flush_expired_batches(&mut batches, &storage);
+                    }
+                }
+            }
             None => match receiver.recv().await {
-                Some(req) => req,
+                Some(req) => {
+                    handle_request(&mut batches, req, &config, &storage);
+                }
                 None => break,
             },
-        };
+        }
+    }
+}
 
-        let table = first.table.clone();
-        let mut events = Vec::with_capacity(config.batch_size);
-        let mut responders = Vec::with_capacity(config.batch_size);
+struct PendingBatch {
+    events: Vec<BulkWriteEvent>,
+    responders: Vec<oneshot::Sender<Result<u64, StorageError>>>,
+    deadline: Instant,
+}
 
-        events.push(first.event);
-        responders.push(first.response);
+fn handle_request<H: HotStorage>(
+    batches: &mut HashMap<String, PendingBatch>,
+    req: WriteRequest,
+    config: &WriteCombinerConfig,
+    storage: &Arc<H>,
+) {
+    let now = Instant::now();
+    let batch = batches
+        .entry(req.table.clone())
+        .or_insert_with(|| PendingBatch {
+            events: Vec::with_capacity(config.batch_size),
+            responders: Vec::with_capacity(config.batch_size),
+            deadline: now + config.window,
+        });
 
-        let deadline = Instant::now() + config.window;
+    batch.events.push(req.event);
+    batch.responders.push(req.response);
 
-        while events.len() < config.batch_size {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
+    if batch.events.len() >= config.batch_size {
+        flush_batch(storage, req.table, batches);
+    }
+}
+
+fn flush_expired_batches<H: HotStorage>(
+    batches: &mut HashMap<String, PendingBatch>,
+    storage: &Arc<H>,
+) {
+    let now = Instant::now();
+    let expired_tables: Vec<String> = batches
+        .iter()
+        .filter_map(|(table, batch)| {
+            if batch.deadline <= now {
+                Some(table.clone())
+            } else {
+                None
             }
+        })
+        .collect();
 
-            match time::timeout(remaining, receiver.recv()).await {
-                Ok(Some(req)) => {
-                    if req.table != table {
-                        pending = Some(req);
-                        break;
-                    }
-                    events.push(req.event);
-                    responders.push(req.response);
+    for table in expired_tables {
+        flush_batch(storage, table, batches);
+    }
+}
+
+fn flush_all_batches<H: HotStorage>(batches: &mut HashMap<String, PendingBatch>, storage: &Arc<H>) {
+    let tables: Vec<String> = batches.keys().cloned().collect();
+    for table in tables {
+        flush_batch(storage, table, batches);
+    }
+}
+
+fn flush_batch<H: HotStorage>(
+    storage: &Arc<H>,
+    table: String,
+    batches: &mut HashMap<String, PendingBatch>,
+) {
+    let Some(batch) = batches.remove(&table) else {
+        return;
+    };
+
+    let result = storage.write_batch(&table, &batch.events);
+
+    match result {
+        Ok(offsets) => {
+            if offsets.len() == batch.responders.len() {
+                for (offset, responder) in offsets.into_iter().zip(batch.responders) {
+                    let _ = responder.send(Ok(offset));
                 }
-                Ok(None) => break,
-                Err(_) => break,
+            } else {
+                let error = StorageError::Serialization(format!(
+                    "Combiner offset mismatch: {} responses for {} offsets",
+                    batch.responders.len(),
+                    offsets.len()
+                ));
+                for responder in batch.responders {
+                    let _ = responder.send(Err(clone_storage_error(&error)));
+                }
             }
         }
-
-        let result = storage.write_batch(&table, &events);
-
-        match result {
-            Ok(offsets) => {
-                if offsets.len() == responders.len() {
-                    for (offset, responder) in offsets.into_iter().zip(responders) {
-                        let _ = responder.send(Ok(offset));
-                    }
-                } else {
-                    let error = StorageError::Serialization(format!(
-                        "Combiner offset mismatch: {} responses for {} offsets",
-                        responders.len(),
-                        offsets.len()
-                    ));
-                    for responder in responders {
-                        let _ = responder.send(Err(clone_storage_error(&error)));
-                    }
-                }
-            }
-            Err(err) => {
-                for responder in responders {
-                    let _ = responder.send(Err(clone_storage_error(&err)));
-                }
+        Err(err) => {
+            for responder in batch.responders {
+                let _ = responder.send(Err(clone_storage_error(&err)));
             }
         }
     }
