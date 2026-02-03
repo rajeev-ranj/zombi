@@ -9,6 +9,17 @@ message Event {
   map<string, string> headers = 4;
 }
 
+message BulkWriteRecord {
+  bytes payload = 1;
+  uint32 partition = 2;
+  int64 timestamp_ms = 3;
+  string idempotency_key = 4;
+}
+
+message BulkWriteRequest {
+  repeated BulkWriteRecord records = 1;
+}
+
 message StoredEvent {
   uint64 sequence = 1;
   string topic = 2;

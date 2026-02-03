@@ -92,6 +92,10 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/BulkWriteRequest"
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
       responses:
         "202":
           description: Accepted

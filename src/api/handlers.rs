@@ -512,6 +512,7 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
 pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<BulkWriteResponse>), ApiError> {
     let start = Instant::now();
@@ -528,12 +529,54 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
         ApiError::from(e)
     })?;
 
-    let request: BulkWriteRequest = serde_json::from_slice(&body).map_err(|e| {
-        state.metrics.record_error();
-        ApiError::BadRequest(format!("Invalid JSON: {}", e))
-    })?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
 
-    let record_count = request.records.len();
+    let (events, record_count) = if content_type.starts_with("application/x-protobuf") {
+        let request = proto::BulkWriteRequest::decode(body).map_err(|e| {
+            state.metrics.record_error();
+            ApiError::BadRequest(format!("Invalid protobuf: {}", e))
+        })?;
+        let record_count = request.records.len();
+        let events: Vec<crate::contracts::BulkWriteEvent> = request
+            .records
+            .into_iter()
+            .map(|r| crate::contracts::BulkWriteEvent {
+                partition: r.partition,
+                payload: r.payload,
+                timestamp_ms: if r.timestamp_ms == 0 {
+                    current_timestamp_ms()
+                } else {
+                    r.timestamp_ms
+                },
+                idempotency_key: if r.idempotency_key.is_empty() {
+                    None
+                } else {
+                    Some(r.idempotency_key)
+                },
+            })
+            .collect();
+        (events, record_count)
+    } else {
+        let request: BulkWriteRequest = serde_json::from_slice(&body).map_err(|e| {
+            state.metrics.record_error();
+            ApiError::BadRequest(format!("Invalid JSON: {}", e))
+        })?;
+        let record_count = request.records.len();
+        let events: Vec<crate::contracts::BulkWriteEvent> = request
+            .records
+            .into_iter()
+            .map(|r| crate::contracts::BulkWriteEvent {
+                partition: r.partition,
+                payload: r.payload.into_bytes(),
+                timestamp_ms: r.timestamp_ms.unwrap_or_else(current_timestamp_ms),
+                idempotency_key: r.idempotency_key,
+            })
+            .collect();
+        (events, record_count)
+    };
 
     if record_count == 0 {
         return Ok((
@@ -545,18 +588,6 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
             }),
         ));
     }
-
-    // Convert to BulkWriteEvent format
-    let events: Vec<crate::contracts::BulkWriteEvent> = request
-        .records
-        .into_iter()
-        .map(|r| crate::contracts::BulkWriteEvent {
-            partition: r.partition,
-            payload: r.payload.into_bytes(),
-            timestamp_ms: r.timestamp_ms.unwrap_or_else(current_timestamp_ms),
-            idempotency_key: r.idempotency_key,
-        })
-        .collect();
 
     let total_bytes: u64 = events.iter().map(|e| e.payload.len() as u64).sum();
 
