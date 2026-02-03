@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use futures::future::join_all;
 use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
 use zombi::metrics::MetricsRegistry;
 use zombi::proto;
-use zombi::storage::RocksDbStorage;
+use zombi::storage::{RocksDbStorage, WriteCombiner, WriteCombinerConfig};
 
 fn create_test_app_with_backpressure(
     config: BackpressureConfig,
@@ -36,6 +37,29 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
     ));
+    let router = create_router(state);
+    (router, dir)
+}
+
+fn create_test_app_with_combiner(config: WriteCombinerConfig) -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = Arc::new(RocksDbStorage::open(dir.path()).unwrap());
+    let metrics_registry = Arc::new(MetricsRegistry::new());
+    let combiner = Arc::new(WriteCombiner::new(
+        Arc::clone(&storage),
+        config,
+        Arc::clone(&metrics_registry.combiner),
+    ));
+    let state = Arc::new(
+        AppState::new(
+            storage,
+            None::<Arc<NoopColdStorage>>,
+            Arc::new(Metrics::new()),
+            metrics_registry,
+            BackpressureConfig::default(),
+        )
+        .with_write_combiner(Some(combiner)),
+    );
     let router = create_router(state);
     (router, dir)
 }
@@ -97,6 +121,108 @@ async fn test_write_record() {
     assert_eq!(json["offset"], 1);
     assert_eq!(json["partition"], 0);
     assert_eq!(json["table"], "user_events");
+}
+
+#[tokio::test]
+async fn test_write_record_with_combiner() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 5,
+        window: std::time::Duration::from_micros(500),
+        queue_capacity: 50,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let requests = (0..20).map(|i| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tables/user_events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"payload\": \"hello {}\", \"partition\": 0}}",
+                        i
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let responses = join_all(requests).await;
+    let mut offsets: Vec<u64> = Vec::new();
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        offsets.push(json["offset"].as_u64().unwrap());
+    }
+
+    offsets.sort_unstable();
+    let expected: Vec<u64> = (1..=20).collect();
+    assert_eq!(offsets, expected);
+}
+
+#[tokio::test]
+async fn test_combiner_interleaved_writes() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 4,
+        window: std::time::Duration::from_micros(500),
+        queue_capacity: 100,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let requests = (0..20).map(|i| {
+        let app = app.clone();
+        let table = if i % 2 == 0 { "table_a" } else { "table_b" };
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tables/{}", table))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"payload\": \"hello {}\", \"partition\": 0}}",
+                        i
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let responses = join_all(requests).await;
+    let mut offsets_a = Vec::new();
+    let mut offsets_b = Vec::new();
+
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let table = json["table"].as_str().unwrap();
+        let offset = json["offset"].as_u64().unwrap();
+        match table {
+            "table_a" => offsets_a.push(offset),
+            "table_b" => offsets_b.push(offset),
+            other => panic!("unexpected table: {}", other),
+        }
+    }
+
+    offsets_a.sort_unstable();
+    offsets_b.sort_unstable();
+    assert_eq!(offsets_a, (1..=10).collect::<Vec<_>>());
+    assert_eq!(offsets_b, (1..=10).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -1133,4 +1259,232 @@ async fn test_read_with_fields_and_since_filter() {
     assert_eq!(record["payload"], "new event");
     assert!(record["sequence"].is_number());
     assert!(record.get("timestamp_ms").is_none());
+}
+
+// ============================================================================
+// Sharded Write Combiner Tests (#94)
+// ============================================================================
+
+#[tokio::test]
+async fn test_combiner_shard_isolation() {
+    // Use 2 shards so tables hash to different shards.
+    // Write heavily to one table; verify the other table still completes promptly.
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 5,
+        window: std::time::Duration::from_millis(50),
+        queue_capacity: 200,
+        shards: 2,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    // Fire 40 writes to table_heavy and 10 to table_light concurrently
+    let requests = (0..50).map(|i| {
+        let app = app.clone();
+        let table = if i < 40 { "table_heavy" } else { "table_light" };
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/tables/{}", table))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            "{{\"payload\": \"event {}\", \"partition\": 0}}",
+                            i
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (table.to_string(), resp)
+        }
+    });
+
+    let results = join_all(requests).await;
+    let mut heavy_ok = 0;
+    let mut light_ok = 0;
+    for (table, resp) in results {
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        match table.as_str() {
+            "table_heavy" => heavy_ok += 1,
+            "table_light" => light_ok += 1,
+            _ => panic!("unexpected table"),
+        }
+    }
+    assert_eq!(heavy_ok, 40);
+    assert_eq!(light_ok, 10);
+}
+
+#[tokio::test]
+async fn test_combiner_selective_flush() {
+    // Use a long window so timer-based flush is the only way batches drain.
+    // Write to two tables, then wait for the window to expire.
+    // Both tables should eventually flush (via selective flush).
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 100, // high batch_size so size-triggered flush won't fire
+        window: std::time::Duration::from_millis(50),
+        queue_capacity: 200,
+        shards: 1, // single shard to test selective flush logic specifically
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    // Write 3 events to table_a
+    for i in 0..3 {
+        let app = app.clone();
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/table_a")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"payload\": \"a-{}\", \"partition\": 0}}",
+                    i
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Write 2 events to table_b
+    for i in 0..2 {
+        let app = app.clone();
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/table_b")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"payload\": \"b-{}\", \"partition\": 0}}",
+                    i
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Wait for the combiner window to expire and flush
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Read back both tables — they should have all events
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tables/table_a?limit=100")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 3);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/table_b?limit=100")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 2);
+}
+
+#[tokio::test]
+async fn test_combiner_byte_backpressure() {
+    // Set a very small byte limit (1 KB) to trigger byte-based backpressure.
+    // Use high batch_size + long window so the combiner never flushes, keeping
+    // inflight bytes accumulated across concurrent writes.
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 100,
+        window: std::time::Duration::from_secs(10),
+        queue_capacity: 10_000,
+        shards: 1,
+        max_queue_bytes: 1024, // 1 KB byte limit
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    // Fire many concurrent writes with large payloads so inflight bytes accumulate
+    // before any flush can drain them.
+    let large_payload = "x".repeat(600); // ~600 bytes each
+    let requests = (0..10).map(|i| {
+        let app = app.clone();
+        let payload = large_payload.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/tables/byte_test")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            "{{\"payload\": \"{}\", \"partition\": 0}}",
+                            payload
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (i, resp.status())
+        }
+    });
+
+    let results = join_all(requests).await;
+    let saw_overload = results
+        .iter()
+        .any(|(_, status)| *status == StatusCode::SERVICE_UNAVAILABLE);
+
+    assert!(
+        saw_overload,
+        "Expected byte backpressure to trigger 503 when concurrent writes exceed 1KB limit"
+    );
+}
+
+#[tokio::test]
+async fn test_combiner_metrics_in_prometheus_output() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 100,
+        window: std::time::Duration::from_secs(10),
+        shards: 2,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+    // Per-shard gauges should be present (registered at combiner creation)
+    assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"0\"}"));
+    assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"1\"}"));
+    assert!(body_str.contains("zombi_write_combiner_queue_depth_total"));
 }

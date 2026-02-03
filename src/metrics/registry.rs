@@ -31,6 +31,8 @@ pub struct MetricsRegistry {
     pub hot: Arc<HotStorageMetrics>,
     /// Enhanced API metrics with histograms and per-topic breakdowns
     pub enhanced_api: Arc<EnhancedApiMetrics>,
+    /// Write combiner queue depth metrics
+    pub combiner: Arc<WriteCombinerMetrics>,
 }
 
 impl MetricsRegistry {
@@ -42,6 +44,7 @@ impl MetricsRegistry {
             consumer: Arc::new(ConsumerMetrics::default()),
             hot: Arc::new(HotStorageMetrics::default()),
             enhanced_api: Arc::new(EnhancedApiMetrics::default()),
+            combiner: Arc::new(WriteCombinerMetrics::default()),
         }
     }
 
@@ -63,6 +66,9 @@ impl MetricsRegistry {
 
         // Enhanced API metrics
         output.push_str(&self.enhanced_api.format_prometheus());
+
+        // Write combiner metrics
+        output.push_str(&self.combiner.format_prometheus());
 
         output
     }
@@ -427,6 +433,83 @@ impl HotStorageMetrics {
     }
 }
 
+/// Metrics for write combiner queue depth per shard.
+#[derive(Default)]
+pub struct WriteCombinerMetrics {
+    /// Queue depth per shard (events buffered in channel).
+    queue_depth_by_shard: DashMap<u32, AtomicU64>,
+}
+
+impl WriteCombinerMetrics {
+    /// Register a shard for tracking. Called once per shard at combiner startup.
+    pub fn register_shard(&self, shard: u32) {
+        self.queue_depth_by_shard.insert(shard, AtomicU64::new(0));
+    }
+
+    /// Increment queue depth for a shard (called after successful enqueue).
+    #[inline]
+    pub fn increment_depth(&self, shard: u32) {
+        if let Some(depth) = self.queue_depth_by_shard.get(&shard) {
+            depth.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Decrement queue depth for a shard (called after successful dequeue).
+    #[inline]
+    pub fn decrement_depth(&self, shard: u32) {
+        if let Some(depth) = self.queue_depth_by_shard.get(&shard) {
+            depth.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Formats write combiner metrics in Prometheus exposition format.
+    pub fn format_prometheus(&self) -> String {
+        if self.queue_depth_by_shard.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::with_capacity(512);
+        let mut total: u64 = 0;
+
+        let _ = writeln!(
+            output,
+            "# HELP zombi_write_combiner_queue_depth Queued events per combiner shard"
+        );
+        let _ = writeln!(output, "# TYPE zombi_write_combiner_queue_depth gauge");
+
+        // Collect and sort by shard ID for deterministic output
+        let mut shards: Vec<(u32, u64)> = self
+            .queue_depth_by_shard
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        shards.sort_by_key(|(shard, _)| *shard);
+
+        for (shard, depth) in &shards {
+            let _ = writeln!(
+                output,
+                "zombi_write_combiner_queue_depth{{shard=\"{}\"}} {}",
+                shard, depth
+            );
+            total += depth;
+        }
+        output.push('\n');
+
+        let _ = writeln!(
+            output,
+            "# HELP zombi_write_combiner_queue_depth_total Total queued events across all shards"
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE zombi_write_combiner_queue_depth_total gauge"
+        );
+        let _ = writeln!(output, "zombi_write_combiner_queue_depth_total {}", total);
+        output.push('\n');
+
+        output
+    }
+}
+
 /// Enhanced API metrics with histograms and per-topic breakdowns.
 #[derive(Default)]
 pub struct EnhancedApiMetrics {
@@ -621,6 +704,29 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn test_write_combiner_metrics() {
+        let metrics = WriteCombinerMetrics::default();
+        metrics.register_shard(0);
+        metrics.register_shard(1);
+        metrics.increment_depth(0);
+        metrics.increment_depth(0);
+        metrics.increment_depth(1);
+        metrics.decrement_depth(0);
+
+        let output = metrics.format_prometheus();
+        assert!(output.contains("zombi_write_combiner_queue_depth{shard=\"0\"} 1"));
+        assert!(output.contains("zombi_write_combiner_queue_depth{shard=\"1\"} 1"));
+        assert!(output.contains("zombi_write_combiner_queue_depth_total 2"));
+    }
+
+    #[test]
+    fn test_write_combiner_metrics_empty_when_no_shards() {
+        let metrics = WriteCombinerMetrics::default();
+        let output = metrics.format_prometheus();
+        assert!(output.is_empty());
     }
 
     #[test]
