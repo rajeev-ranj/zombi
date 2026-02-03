@@ -1,4 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +19,12 @@ pub struct WriteCombinerConfig {
     pub batch_size: usize,
     /// Maximum time to wait before flushing a batch.
     pub window: Duration,
-    /// Maximum number of queued events.
+    /// Maximum number of queued events per shard.
     pub queue_capacity: usize,
+    /// Number of combiner worker shards.
+    pub shards: usize,
+    /// Maximum total queued bytes across all shards (secondary defense).
+    pub max_queue_bytes: usize,
 }
 
 impl Default for WriteCombinerConfig {
@@ -27,6 +34,8 @@ impl Default for WriteCombinerConfig {
             batch_size: 10,
             window: Duration::from_micros(100),
             queue_capacity: 10_000,
+            shards: 4,
+            max_queue_bytes: 256 * 1024 * 1024, // 256 MB
         }
     }
 }
@@ -38,7 +47,9 @@ impl WriteCombinerConfig {
     /// - `ZOMBI_WRITE_COMBINER_ENABLED`: Enable combiner (default: false)
     /// - `ZOMBI_WRITE_COMBINER_SIZE`: Batch size (default: 10)
     /// - `ZOMBI_WRITE_COMBINER_WINDOW_US`: Flush window in microseconds (default: 100)
-    /// - `ZOMBI_WRITE_COMBINER_QUEUE_CAPACITY`: Queue capacity (default: 10000)
+    /// - `ZOMBI_WRITE_COMBINER_QUEUE_CAPACITY`: Queue capacity per shard (default: 10000)
+    /// - `ZOMBI_WRITE_COMBINER_SHARDS`: Number of worker shards (default: 4)
+    /// - `ZOMBI_WRITE_COMBINER_QUEUE_BYTES_MB`: Max queued bytes in MB (default: 256)
     pub fn from_env() -> Self {
         let default = Self::default();
         let enabled = std::env::var("ZOMBI_WRITE_COMBINER_ENABLED")
@@ -60,18 +71,32 @@ impl WriteCombinerConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(default.queue_capacity);
+        let shards = std::env::var("ZOMBI_WRITE_COMBINER_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.shards);
+        let max_queue_bytes = std::env::var("ZOMBI_WRITE_COMBINER_QUEUE_BYTES_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(default.max_queue_bytes);
 
         Self {
             enabled,
             batch_size,
             window,
             queue_capacity,
+            shards,
+            max_queue_bytes,
         }
     }
 }
 
 pub struct WriteCombiner<H: HotStorage> {
-    sender: mpsc::Sender<WriteRequest>,
+    senders: Vec<mpsc::Sender<WriteRequest>>,
+    inflight_bytes: Arc<AtomicU64>,
     _storage: Arc<H>,
     config: WriteCombinerConfig,
 }
@@ -79,7 +104,14 @@ pub struct WriteCombiner<H: HotStorage> {
 struct WriteRequest {
     table: String,
     event: BulkWriteEvent,
+    payload_size: u64,
     response: oneshot::Sender<Result<u64, StorageError>>,
+}
+
+fn shard_for_table(table: &str, num_shards: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    table.hash(&mut hasher);
+    hasher.finish() as usize % num_shards
 }
 
 impl<H: HotStorage> WriteCombiner<H> {
@@ -87,15 +119,23 @@ impl<H: HotStorage> WriteCombiner<H> {
     where
         H: 'static,
     {
-        let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        let worker_storage = Arc::clone(&storage);
-        let worker_config = config.clone();
-        tokio::spawn(async move {
-            run_combiner(worker_storage, receiver, worker_config).await;
-        });
+        let inflight_bytes = Arc::new(AtomicU64::new(0));
+        let mut senders = Vec::with_capacity(config.shards);
+
+        for _ in 0..config.shards {
+            let (sender, receiver) = mpsc::channel(config.queue_capacity);
+            let worker_storage = Arc::clone(&storage);
+            let worker_config = config.clone();
+            let worker_bytes = Arc::clone(&inflight_bytes);
+            tokio::spawn(async move {
+                run_combiner(worker_storage, receiver, worker_config, worker_bytes).await;
+            });
+            senders.push(sender);
+        }
 
         Self {
-            sender,
+            senders,
+            inflight_bytes,
             _storage: storage,
             config,
         }
@@ -113,6 +153,22 @@ impl<H: HotStorage> WriteCombiner<H> {
         timestamp_ms: i64,
         idempotency_key: Option<String>,
     ) -> Result<u64, StorageError> {
+        let payload_size = payload.len() as u64;
+
+        // Byte-based backpressure: fetch_add then rollback if over limit (TOCTOU-safe)
+        let prev = self
+            .inflight_bytes
+            .fetch_add(payload_size, Ordering::AcqRel);
+        if prev + payload_size > self.config.max_queue_bytes as u64 {
+            self.inflight_bytes
+                .fetch_sub(payload_size, Ordering::Release);
+            return Err(StorageError::Overloaded(
+                "Write combiner byte limit exceeded; try bulk writes or reduce payload size".into(),
+            ));
+        }
+
+        let shard = shard_for_table(&table, self.senders.len());
+
         let (response_tx, response_rx) = oneshot::channel();
         let request = WriteRequest {
             table,
@@ -122,17 +178,23 @@ impl<H: HotStorage> WriteCombiner<H> {
                 timestamp_ms,
                 idempotency_key,
             },
+            payload_size,
             response: response_tx,
         };
 
-        self.sender.try_send(request).map_err(|err| match err {
-            mpsc::error::TrySendError::Full(_) => StorageError::Overloaded(
-                "Write combiner queue full; try bulk writes or reduce load".into(),
-            ),
-            mpsc::error::TrySendError::Closed(_) => {
-                StorageError::Overloaded("Write combiner unavailable".into())
-            }
-        })?;
+        if let Err(err) = self.senders[shard].try_send(request) {
+            // Rollback bytes on channel send failure
+            self.inflight_bytes
+                .fetch_sub(payload_size, Ordering::Release);
+            return Err(match err {
+                mpsc::error::TrySendError::Full(_) => StorageError::Overloaded(
+                    "Write combiner queue full; try bulk writes or reduce load".into(),
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    StorageError::Overloaded("Write combiner unavailable".into())
+                }
+            });
+        }
 
         response_rx
             .await
@@ -144,6 +206,7 @@ async fn run_combiner<H: HotStorage>(
     storage: Arc<H>,
     mut receiver: mpsc::Receiver<WriteRequest>,
     config: WriteCombinerConfig,
+    inflight_bytes: Arc<AtomicU64>,
 ) {
     let mut batches: HashMap<String, PendingBatch> = HashMap::new();
 
@@ -156,22 +219,22 @@ async fn run_combiner<H: HotStorage>(
                     maybe_req = receiver.recv() => {
                         match maybe_req {
                             Some(req) => {
-                                handle_request(&mut batches, req, &config, &storage);
+                                handle_request(&mut batches, req, &config, &storage, &inflight_bytes);
                             }
                             None => {
-                                flush_all_batches(&mut batches, &storage);
+                                flush_all_batches(&mut batches, &storage, &inflight_bytes);
                                 break;
                             }
                         }
                     }
                     _ = time::sleep_until(deadline) => {
-                        flush_all_batches(&mut batches, &storage);
+                        flush_expired_batches(&mut batches, &storage, &inflight_bytes);
                     }
                 }
             }
             None => match receiver.recv().await {
                 Some(req) => {
-                    handle_request(&mut batches, req, &config, &storage);
+                    handle_request(&mut batches, req, &config, &storage, &inflight_bytes);
                 }
                 None => break,
             },
@@ -182,6 +245,7 @@ async fn run_combiner<H: HotStorage>(
 struct PendingBatch {
     events: Vec<BulkWriteEvent>,
     responders: Vec<oneshot::Sender<Result<u64, StorageError>>>,
+    batch_bytes: u64,
     deadline: Instant,
 }
 
@@ -190,28 +254,52 @@ fn handle_request<H: HotStorage>(
     req: WriteRequest,
     config: &WriteCombinerConfig,
     storage: &Arc<H>,
+    inflight_bytes: &Arc<AtomicU64>,
 ) {
     let now = Instant::now();
+    let payload_size = req.payload_size;
     let batch = batches
         .entry(req.table.clone())
         .or_insert_with(|| PendingBatch {
             events: Vec::with_capacity(config.batch_size),
             responders: Vec::with_capacity(config.batch_size),
+            batch_bytes: 0,
             deadline: now + config.window,
         });
 
     batch.events.push(req.event);
     batch.responders.push(req.response);
+    batch.batch_bytes += payload_size;
 
     if batch.events.len() >= config.batch_size {
-        flush_batch(storage, req.table, batches);
+        flush_batch(storage, req.table, batches, inflight_bytes);
     }
 }
 
-fn flush_all_batches<H: HotStorage>(batches: &mut HashMap<String, PendingBatch>, storage: &Arc<H>) {
+fn flush_expired_batches<H: HotStorage>(
+    batches: &mut HashMap<String, PendingBatch>,
+    storage: &Arc<H>,
+    inflight_bytes: &Arc<AtomicU64>,
+) {
+    let now = Instant::now();
+    let expired: Vec<String> = batches
+        .iter()
+        .filter(|(_, batch)| batch.deadline <= now)
+        .map(|(table, _)| table.clone())
+        .collect();
+    for table in expired {
+        flush_batch(storage, table, batches, inflight_bytes);
+    }
+}
+
+fn flush_all_batches<H: HotStorage>(
+    batches: &mut HashMap<String, PendingBatch>,
+    storage: &Arc<H>,
+    inflight_bytes: &Arc<AtomicU64>,
+) {
     let tables: Vec<String> = batches.keys().cloned().collect();
     for table in tables {
-        flush_batch(storage, table, batches);
+        flush_batch(storage, table, batches, inflight_bytes);
     }
 }
 
@@ -219,12 +307,17 @@ fn flush_batch<H: HotStorage>(
     storage: &Arc<H>,
     table: String,
     batches: &mut HashMap<String, PendingBatch>,
+    inflight_bytes: &Arc<AtomicU64>,
 ) {
     let Some(batch) = batches.remove(&table) else {
         return;
     };
 
+    let batch_bytes = batch.batch_bytes;
     let result = storage.write_batch(&table, &batch.events);
+
+    // Decrement inflight bytes after the write completes
+    inflight_bytes.fetch_sub(batch_bytes, Ordering::Release);
 
     match result {
         Ok(offsets) => {
