@@ -24,6 +24,9 @@ All notable changes to Zombi are documented here.
   - A/B tested on t3.micro: +4.3% throughput, −15.9% p99 latency at c=500
   - No regression on bulk write path (bypasses combiner)
 
+- **Bulk Protobuf Support** (Issue #85)
+  - `POST /tables/{table}/bulk` accepts `application/x-protobuf`
+
 - **Monitoring Infrastructure**
   - `docker-compose.monitoring.yml` - Full observability stack (Zombi + MinIO + Prometheus + Grafana)
   - Prometheus scrape configuration

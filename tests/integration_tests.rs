@@ -170,6 +170,59 @@ async fn test_write_record_with_combiner() {
 }
 
 #[tokio::test]
+async fn test_write_record_protobuf_with_combiner() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 4,
+        window: std::time::Duration::from_micros(500),
+        queue_capacity: 50,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let requests = (0..10).map(|i| {
+        let app = app.clone();
+        async move {
+            let event = proto::Event {
+                payload: format!("proto {}", i).into_bytes(),
+                timestamp_ms: 1234567890,
+                idempotency_key: String::new(),
+                headers: std::collections::HashMap::new(),
+            };
+            let mut buf = Vec::new();
+            event.encode(&mut buf).unwrap();
+
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tables/proto_events")
+                    .header("content-type", "application/x-protobuf")
+                    .header("x-partition", "0")
+                    .body(Body::from(buf))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let responses = join_all(requests).await;
+    let mut offsets: Vec<u64> = Vec::new();
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        offsets.push(json["offset"].as_u64().unwrap());
+    }
+
+    offsets.sort_unstable();
+    let expected: Vec<u64> = (1..=10).collect();
+    assert_eq!(offsets, expected);
+}
+
+#[tokio::test]
 async fn test_combiner_interleaved_writes() {
     let config = WriteCombinerConfig {
         enabled: true,
@@ -797,6 +850,52 @@ async fn test_bulk_write_succeeds_under_backpressure_limit() {
                 .body(Body::from(
                     r#"{"records":[{"payload":"a","partition":0},{"payload":"b","partition":0}]}"#,
                 ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["offsets"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_bulk_write_protobuf() {
+    let (app, _dir) = create_test_app();
+
+    let request = proto::BulkWriteRequest {
+        records: vec![
+            proto::BulkWriteRecord {
+                payload: b"alpha".to_vec(),
+                partition: 0,
+                timestamp_ms: 0,
+                idempotency_key: String::new(),
+            },
+            proto::BulkWriteRecord {
+                payload: b"beta".to_vec(),
+                partition: 1,
+                timestamp_ms: 123456789,
+                idempotency_key: "idem-1".into(),
+            },
+        ],
+    };
+
+    let mut buf = Vec::new();
+    request.encode(&mut buf).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/test/bulk")
+                .header("content-type", "application/x-protobuf")
+                .body(Body::from(buf))
                 .unwrap(),
         )
         .await
