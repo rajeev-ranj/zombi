@@ -315,14 +315,46 @@ jobs:
 
           echo "✅ PR description check complete"
 
-  # Benchmark regression check - opt-in via label or keyword
-  # To trigger: add 'performance' label OR include '[benchmark]' in PR title/body
+  # Detect performance-sensitive changes (used to gate benchmark regression checks)
+  perf-changes:
+    name: Perf Change Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      perf: ${{ steps.filter.outputs.perf }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect performance-sensitive changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            perf:
+              - 'src/api/**'
+              - 'src/storage/**'
+              - 'src/flusher/**'
+              - 'src/metrics/**'
+              - 'src/contracts/**'
+              - 'src/main.rs'
+              - 'benches/**'
+              - 'proto/**'
+              - 'build.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  # Benchmark regression check - auto for perf-sensitive changes, or opt-in via label/keyword
+  # To trigger manually: add 'performance' label OR include '[benchmark]' in PR title/body
   bench-regression:
     name: Benchmark Regression Check
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: perf-changes
     if: |
       github.event_name == 'pull_request' && (
+        needs.perf-changes.outputs.perf == 'true' ||
         contains(github.event.pull_request.labels.*.name, 'performance') ||
         contains(github.event.pull_request.title, '[benchmark]') ||
         contains(github.event.pull_request.body, '[benchmark]')
@@ -359,39 +391,64 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install critcmp (cached)
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: critcmp
-          version: "0.1"
-
-      - name: Run benchmarks on PR branch
-        run: |
-          cargo bench --bench write_throughput -- --save-baseline pr
-
-      - name: Checkout main branch
+      - name: Run benchmarks on main branch (baseline)
         run: |
           git fetch origin main
           git checkout origin/main
-
-      - name: Run benchmarks on main branch
-        run: |
           cargo bench --bench write_throughput -- --save-baseline main
+
+      - name: Run benchmarks on PR branch (compare to main)
+        run: |
+          git checkout -
+          cargo bench --bench write_throughput -- --baseline main --save-baseline pr 2>&1 | tee comparison.txt
 
       - name: Compare benchmarks
         run: |
-          critcmp main pr > comparison.txt || true
           cat comparison.txt
 
-          # Check for regressions > 10% (matches 10.0% through 999.9%)
-          if grep -E "\+(1[0-9]|[2-9][0-9]|[0-9]{3,})\.[0-9]+%" comparison.txt; then
+          # Check for regressions > 10% based on criterion's change output
+          if awk '
+            /change:/ {
+              line=$0
+              n=0
+              while (match(line, /[-+]?[0-9]+(\.[0-9]+)?%/)) {
+                val=substr(line, RSTART, RLENGTH)
+                sub(/%/, "", val)
+                vals[++n]=val
+                line=substr(line, RSTART+RLENGTH)
+              }
+              if (n > 0) {
+                upper=vals[n] + 0
+                if (upper > 10) { print $0; found=1 }
+              }
+              delete vals
+            }
+            END { exit found ? 0 : 1 }
+          ' comparison.txt; then
             echo "❌ Significant performance regression detected (>10%)"
             echo "See comparison above. If this is expected, provide justification in PR."
             exit 1
           fi
 
           # Warn about regressions 5-10%
-          if grep -E "\+[5-9]\.[0-9]+%" comparison.txt; then
+          if awk '
+            /change:/ {
+              line=$0
+              n=0
+              while (match(line, /[-+]?[0-9]+(\.[0-9]+)?%/)) {
+                val=substr(line, RSTART, RLENGTH)
+                sub(/%/, "", val)
+                vals[++n]=val
+                line=substr(line, RSTART+RLENGTH)
+              }
+              if (n > 0) {
+                upper=vals[n] + 0
+                if (upper > 5 && upper <= 10) { print $0; warn=1 }
+              }
+              delete vals
+            }
+            END { exit warn ? 0 : 1 }
+          ' comparison.txt; then
             echo "⚠️  Performance regression 5-10% detected"
             echo "This requires justification and maintainer approval."
           fi
