@@ -1,10 +1,12 @@
 # Zombi Specification v2.0
 
-> The lowest-cost path from events to Iceberg, with optional streaming support.
+> Iceberg-native event ingestion gateway — the lowest-cost path from events to queryable Iceberg tables.
 
 ---
 
 ## Vision
+
+**Primary identity:** Zombi is an Iceberg-native event ingestion gateway. It accepts events and produces correct, efficient Iceberg tables.
 
 **Problem:** Getting data into Iceberg today requires expensive, complex infrastructure:
 ```
@@ -18,7 +20,7 @@ Producer → Zombi → Iceberg
            Simple   Queryable by Spark/Trino/DuckDB
 ```
 
-**Secondary Goal:** Replace Kafka for simple streaming use cases where consumers need real-time access to recent events.
+**Optional:** Real-time visibility of unflushed data via an Iceberg-compatible plugin (not a separate read API).
 
 ---
 
@@ -26,33 +28,167 @@ Producer → Zombi → Iceberg
 
 ### Single Node (Current)
 ```
-Producer → HTTP API → RocksDB (hot) → Flusher → Iceberg (S3)
-                           │                        │
-                           ↓                        ↓
-                    Streaming Consumer      Analytics (Spark/Trino)
+Producer → HTTP API → RocksDB (hot buffer) → Flusher → Iceberg (S3)
+                                                        ↓
+                                              Spark/Trino/DuckDB
 ```
 
-### Multi-Node (Target)
+Iceberg is the read interface. An optional Iceberg catalog plugin can merge hot + cold data for real-time reads without bypassing Iceberg semantics.
+
+### Detailed Architecture
+
 ```
-                    ┌─────────────────────────────────────┐
-                    │         Zombi Cluster               │
-Producer → LB ────→ │  ┌──────────┐  ┌──────────┐        │
-                    │  │ Proxy 1  │  │ Proxy 2  │        │
-                    │  │ RocksDB  │  │ RocksDB  │        │
-                    │  └────┬─────┘  └────┬─────┘        │
-                    └───────┼─────────────┼──────────────┘
-                            │             │
-                            └──────┬──────┘
-                                   ↓
-                             ┌──────────┐
-                             │  Redis   │ (offset coordination)
-                             └────┬─────┘
-                                  ↓
-                          ┌──────────────┐
-                          │   Iceberg    │ ←── Spark/Trino/DuckDB
-                          │  (S3/GCS)    │
-                          └──────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            HTTP Layer (Axum)                                  │
+│                                                                               │
+│  POST /tables/{table}       POST /tables/{table}/bulk    GET /tables/{table}  │
+│  (JSON or Protobuf)         (JSON; Protobuf planned)     (JSON or Arrow IPC)  │
+│         │                           │                          ▲              │
+│         ▼                           ▼                          │              │
+│  ┌─────────────┐           ┌─────────────────┐          ┌─────┴──────┐       │
+│  │ Backpressure │           │  Backpressure    │          │ Content    │       │
+│  │ (Semaphore + │           │  (Semaphore +    │          │ Negotiation│       │
+│  │  AtomicU64   │           │   AtomicU64      │          │            │       │
+│  │  byte limit) │           │   byte limit)    │          │ JSON(impl) │       │
+│  └──────┬──────┘           └────────┬────────┘          │ Arrow(P1)  │       │
+│         │                           │                    └─────┬──────┘       │
+│         ▼                           │                          │              │
+│  ┌──────────────────┐               │                          │              │
+│  │  WriteCombiner    │               │                          │              │
+│  │  (optional)       │               │                          │              │
+│  │                   │               │                          │              │
+│  │  N shards (def 4) │               │                          │              │
+│  │  mpsc channels    │               │                          │              │
+│  │  micro-batch by   │               │                          │              │
+│  │  size or 100μs    │               │                          │              │
+│  │  window           │               │                          │              │
+│  └──────┬───────────┘               │                          │              │
+│         │                           │                          │              │
+│         ▼                           ▼                          │              │
+│  ┌──────────────────────────────────────────────────────────────┐             │
+│  │           RocksDbStorage                                     │             │
+│  │                                                              │             │
+│  │  Write path:                        Read path:               │             │
+│  │  1. Idempotency check (Bloom+get)   1. Range scan by prefix  │             │
+│  │  2. Sequence gen (DashMap+AtomicU64) 2. bincode → StoredEvent │             │
+│  │  3. WriteBatch:                      3. Optional ts filter    │             │
+│  │     evt:{topic}:{part}:{seq} → bin   4. Column projection     │             │
+│  │     idem:{topic}:{part}:{key} → seq                          │             │
+│  │     hwm:{topic}:{part} → seq                                 │             │
+│  │  4. Atomic write (WAL configurable)                          │             │
+│  └──────────────────────┬───────────────────────────────────────┘             │
+│                         │                                                     │
+└─────────────────────────┼─────────────────────────────────────────────────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+    ┌──────────┐   ┌───────────┐   ┌──────────────┐
+    │  Metrics  │   │ RocksDB   │   │ Background   │
+    │ Registry  │   │ (disk)    │   │ Flusher      │
+    │           │   │           │   │              │
+    │ counters  │   │ WAL +     │   │ Timer loop   │
+    │ histograms│   │ LSM tree  │   │ (def 5min)   │
+    │ Prometheus│   │ memtable  │   │              │
+    └──────────┘   └───────────┘   └──────┬───────┘
+                                          │
+                              ┌───────────┼──────────────┐
+                              │    Per-partition flush    │
+                              │                          │
+                              │  1. Read from RocksDB    │
+                              │     (watermark → HWM)    │
+                              │  2. Size-based batching   │
+                              │     (128MB target)       │
+                              │  3. Split by hour        │
+                              │     boundary (planned)   │
+                              └────────────┬─────────────┘
+                                           │
+                              ┌─────────────▼──────────────┐
+                              │    IcebergStorage           │
+                              │                             │
+                              │  write_segment():           │
+                              │    1. Validate same hour    │
+                              │    2. Sort by sequence      │
+                              │    3. Write Parquet (Zstd)  │
+                              │    4. Upload to S3          │
+                              │    5. Track pending files   │
+                              │                             │
+                              │  commit_snapshot():         │
+                              │    1. Build manifest (Avro) │
+                              │    2. Build manifest list   │
+                              │    3. Write metadata.json   │
+                              │    4. Upload all to S3      │
+                              │    5. Register with catalog │
+                              └─────────────┬──────────────┘
+                                            │
+                                            ▼
+                              ┌──────────────────────────┐
+                              │  S3 (Iceberg Table)       │
+                              │                           │
+                              │  metadata/                │
+                              │    v{N}.metadata.json     │
+                              │    snap-{id}-manifest.avro│
+                              │    manifest-{uuid}.avro   │
+                              │  data/                    │
+                              │    event_date=YYYY-MM-DD/ │
+                              │      event_hour=HH/       │
+                              │        partition=N/       │
+                              │          data-{uuid}.par  │
+                              └──────────┬───────────────┘
+                                         │
+                  ┌──────────────────────┼──────────────────────┐
+                  │                      │                      │
+                  ▼                      ▼                      ▼
+           ┌────────────┐        ┌─────────────┐        ┌──────────┐
+           │ Spark      │        │ Trino       │        │ DuckDB   │
+           │            │        │             │        │          │
+           │ Direct     │        │ Direct      │        │ Direct   │
+           │ Iceberg    │        │ Iceberg     │        │ Iceberg  │
+           │ read       │        │ read        │        │ read     │
+           └────────────┘        └─────────────┘        └──────────┘
+                  │                      │                      │
+                  └──────────┬───────────┘                      │
+                             ▼                                  │
+                  ┌─────────────────────┐                       │
+                  │ ZombiCatalog (P2)   │◄──────────────────────┘
+                  │ (optional plugin)   │
+                  │                     │
+                  │ 1. Load Iceberg     │    ┌─────────────────────┐
+                  │    metadata (S3)    │───▶│ Zombi HTTP endpoint │
+                  │ 2. Get watermark    │    │ GET /tables/{table} │
+                  │ 3. Plan: cold files │◄───│ Accept: arrow.stream│
+                  │    + hot "virtual   │    └─────────────────────┘
+                  │    files"           │
+                  │ 4. Merge cold       │
+                  │    Parquet + hot    │
+                  │    Arrow IPC        │
+                  └─────────────────────┘
 ```
+
+#### Key Data Structures
+
+| Struct | Location | Purpose |
+|--------|----------|---------|
+| `StoredEvent` | `contracts/storage.rs` | Event after write (has sequence) |
+| `BulkWriteEvent` | `contracts/storage.rs` | Event in bulk request (pre-sequence) |
+| `AppState<H,C>` | `api/handlers.rs` | Server state: storage, metrics, backpressure |
+| `RocksDbStorage` | `storage/rocksdb.rs` | Hot storage: DB handle, DashMap sequences, bloom filters |
+| `WriteCombiner` | `storage/combiner.rs` | Sharded micro-batcher with per-event oneshot ack |
+| `IcebergStorage` | `storage/iceberg_storage.rs` | Cold storage: S3 client, metadata cache, pending files |
+| `BackgroundFlusher` | `flusher/mod.rs` | Timer loop, concurrent S3 uploads, snapshot batching |
+| `TableMetadata` | `storage/iceberg.rs` | Iceberg v2 metadata: schemas, snapshots, partitions |
+
+#### RocksDB Key Formats
+
+```
+evt:{topic}:{partition}:{sequence:016x}     → bincode(StoredEvent)
+idem:{topic}:{partition}:{idempotency_key}  → sequence (8 bytes BE)
+hwm:{topic}:{partition}                     → sequence (8 bytes BE)
+consumer:{group}:{topic}:{partition}        → offset (8 bytes BE)  [deprecated]
+ts:{topic}:{partition}:{ts_hex}:{seq_hex}   → sequence (optional timestamp index)
+```
+
+All integer values are stored big-endian for correct lexicographic ordering in RocksDB iterators.
 
 ---
 
@@ -60,15 +196,15 @@ Producer → LB ────→ │  ┌──────────┐  ┌�
 
 | Tier | Technology | Purpose | Latency | Retention |
 |------|------------|---------|---------|-----------|
-| **L1 Hot** | RocksDB | Streaming consumers | <1ms | Hours |
+| **L1 Hot** | RocksDB | Write buffer + optional low-latency reads | <1ms | Bounded (delete after flush; configurable window) |
 | **L2 Cold** | Iceberg (Parquet) | Analytics queries | 50-500ms | Forever |
 
 ### Design Principles
 
-1. **Iceberg is the source of truth** - All data eventually lands in Iceberg
-2. **RocksDB is ephemeral** - A write buffer for streaming, not permanent storage
-3. **Stateless reads for analytics** - Query engines read Iceberg directly
-4. **Simple streaming** - Offset-based reads for real-time consumers
+1. **Iceberg is the source of truth** - Writes must produce correct Iceberg metadata; reads should be Iceberg-native
+2. **Hot data is a bounded cache** - RocksDB is a write buffer; delete after successful Iceberg commit
+3. **Persist the hot/cold boundary** - Flush watermarks are durable and exposed
+4. **Optional real-time plugin** - Low-latency reads must be Iceberg-compatible via a catalog/plugin
 
 ---
 
@@ -76,25 +212,18 @@ Producer → LB ────→ │  ┌──────────┐  ┌�
 
 ### Write Path
 ```
-1. Producer sends event via HTTP
-2. Zombi writes to RocksDB (sub-ms, durable via WAL)
+1. Producer sends event via HTTP (table name validated)
+2. Zombi writes to RocksDB (WAL configurable; recommended enabled for durability)
 3. Returns offset to producer
-4. Background flusher batches events
-5. Writes Parquet file to S3
+4. Background flusher splits batches by (event_date, event_hour) and target file size
+5. Writes Parquet files to S3
 6. Commits Iceberg metadata (atomic)
-7. Optional: Register with REST catalog
+7. Persists flush watermark (and records boundary in snapshot summary — planned)
+8. Deletes hot data up to watermark (configurable retention window)
+9. Optional: Register/update with external REST catalog
 ```
 
-### Read Path - Streaming
-```
-Consumer: GET /tables/{table}/stream?partition=0&offset=1000
-
-1. Read from RocksDB by offset
-2. Return events in sequence order
-3. Consumer tracks offset, commits periodically
-```
-
-### Read Path - Analytics
+### Read Path - Primary (Iceberg)
 ```
 Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 
@@ -104,6 +233,26 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 4. Zombi not involved (stateless)
 ```
 
+### Read Path - Optional Real-Time Plugin (Planned)
+```
+Spark/Trino/DuckDB → ZombiCatalog plugin
+
+1. Load Iceberg metadata (cold data)
+2. Fetch hot data boundary (watermark)
+3. Plan cold files + hot “virtual files”
+4. Engine reads cold Parquet + hot Arrow/Parquet bytes
+```
+
+### Read Path - HTTP (Hot Buffer Only)
+```
+GET /tables/{table}?partition=0&offset=1000&limit=100
+Accept: application/json                         → JSON response (default)
+Accept: application/vnd.apache.arrow.stream      → Arrow IPC bytes (planned)
+
+Operational/tail reads from RocksDB hot buffer. Not Iceberg-consistent.
+See API section for full parameter reference.
+```
+
 ---
 
 ## Iceberg Integration
@@ -111,7 +260,7 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 ### Table Format
 - **Format Version:** Iceberg v2 (v3 when stable)
 - **File Format:** Parquet with Zstd compression
-- **Partitioning:** By event date/hour (configurable)
+- **Partitioning:** By event date/hour (events in a segment must share the same hour)
 
 ---
 
@@ -120,7 +269,10 @@ Spark/Trino: SELECT * FROM iceberg.zombi.events WHERE timestamp > X
 - `ZOMBI_FLUSH_BATCH_SIZE` is advisory only and currently unused in flush logic.
   Use `ZOMBI_FLUSH_MAX_SEGMENT` or `ZOMBI_TARGET_FILE_SIZE_MB` to control batching.
 - `ZOMBI_ROCKSDB_WAL_ENABLED` controls WAL usage for event writes and consumer offset commits.
-  Default is `false` (WAL disabled) for throughput.
+- WAL is recommended for durability. Disabling WAL (current default) is a performance mode
+  with potential data loss on crash. The default will flip to `true` as part of P0 hardening.
+- **(Planned — P0)** Flush watermarks will be persisted in RocksDB per (topic, partition) to prevent duplicate Iceberg writes on restart.
+- **(Planned — P0)** Hot data will be deleted after successful Iceberg commit, with an optional retention window for in-flight reads.
 - RocksDB tuning env vars (defaults in parentheses): `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` (64),
   `ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS` (3), `ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER` (4),
   `ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB` (64), `ZOMBI_ROCKSDB_BLOCK_CACHE_MB` (128),
@@ -180,7 +332,8 @@ s3://bucket/tables/{topic}/
 | Catalog | Status | Use Case |
 |---------|--------|----------|
 | Filesystem | ✅ Implemented | Development, simple deployments |
-| REST Catalog | ✅ Implemented | Production (AWS Glue, Tabular, etc.) |
+| REST Catalog (client registration) | ✅ Implemented | Auto-register tables in external catalogs |
+| REST Catalog API (server) | Planned | Engine discovery via Zombi |
 | Hive Metastore | Planned | Legacy Hadoop environments |
 
 ### Query Engine Compatibility
@@ -207,7 +360,7 @@ POST /tables/{table}
 Content-Type: application/json
 
 {
-  "payload": "base64-or-string",
+  "payload": "string (UTF-8)",
   "partition": 0,
   "timestamp_ms": 1704067200000,
   "idempotency_key": "unique-key"
@@ -227,7 +380,7 @@ POST /tables/{table}/bulk
 Content-Type: application/json
 
 {
-  "events": [
+  "records": [
     {"partition": 0, "payload": "event1"},
     {"partition": 0, "payload": "event2"},
     {"partition": 1, "payload": "event3"}
@@ -241,35 +394,67 @@ Response 202:
 }
 ```
 
-### Read Events - Streaming
+### Write Events (Protobuf)
 
-**By Offset (for streaming consumers):**
+Single writes also accept `Content-Type: application/x-protobuf`. Partition is specified via the `X-Partition` header (default 0).
+
 ```http
-GET /tables/{table}/stream?partition=0&offset=1000&limit=100
+POST /tables/{table}
+Content-Type: application/x-protobuf
+X-Partition: 0
 
-Response 200:
+<binary protobuf bytes>
+
+Response 202:
 {
-  "events": [
-    {"sequence": 1000, "payload": "...", "timestamp_ms": ...},
-    {"sequence": 1001, "payload": "...", "timestamp_ms": ...}
-  ],
-  "next_offset": 1100,
-  "has_more": true
+  "offset": 12345,
+  "partition": 0,
+  "table": "events"
 }
 ```
 
-**Long Polling (optional):**
-```http
-GET /tables/{table}/stream?partition=0&offset=1000&wait_ms=5000
+**Proto schema** (`proto/event.proto`):
+```protobuf
+syntax = "proto3";
+package zombi;
 
-Waits up to 5 seconds for new events if none available.
+message Event {
+  bytes payload = 1;
+  int64 timestamp_ms = 2;
+  string idempotency_key = 3;
+  map<string, string> headers = 4;
+}
 ```
 
-### Read Events - Simple Query
+**Bulk protobuf writes** are planned. The `Event` message will gain a `uint32 partition = 5` field
+(non-breaking in proto3, defaults to 0) to support per-event partition routing in bulk requests.
 
-**For light queries (not analytics):**
+### Table Name Validation (Planned — P0)
+
+Table names must be safe for internal keys and S3 paths. The following regex will be enforced at the API boundary (not yet implemented):
+
+```
+^[a-zA-Z][a-zA-Z0-9_-]{0,127}$
+```
+
+Once enforced, invalid names will return `400 Bad Request`.
+
+### Payload Encoding
+
+The JSON API treats `payload` as UTF-8 text. Binary-safe JSON payloads should use base64 encoding (planned),
+and real-time reads should use Arrow IPC via content negotiation (`Accept: application/vnd.apache.arrow.stream`).
+
+### Read Events - Primary (Iceberg)
+
+Iceberg is the read interface. Query engines (Spark/Trino/DuckDB/Athena) read tables directly.
+
+### Read Events - Operational/Tail (Hot Buffer Only)
+
+Lightweight HTTP read for monitoring, debugging, and tailing recent events. Reads from the
+RocksDB hot buffer only — does **not** merge with cold storage or provide Iceberg-consistent semantics.
+
 ```http
-GET /tables/{table}?since=1704067200000&limit=100
+GET /tables/{table}?partition=0&offset=1000&limit=100
 
 Response 200:
 {
@@ -279,7 +464,30 @@ Response 200:
 }
 ```
 
-### Consumer Offsets
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `partition` | all | Partition to read from |
+| `offset` | 0 | Starting sequence number |
+| `limit` | 100 | Max records to return |
+| `since` | - | Optional: filter by timestamp (ms) |
+| `fields` | all | Optional: column projection (e.g., `payload,timestamp_ms`) |
+
+**Content negotiation:**
+
+| Accept Header | Format | Status |
+|---------------|--------|--------|
+| `application/json` (default) | JSON object with `records`, `count`, `has_more` | Implemented |
+| `application/vnd.apache.arrow.stream` | Arrow IPC stream bytes | Planned (P1) |
+
+The Arrow IPC format is designed for the ZombiCatalog plugin, which presents hot buffer data
+as Iceberg-compatible "virtual files" to query engines.
+
+For complete, consistent reads use Iceberg query engines. For real-time merged reads (hot + cold),
+use the ZombiCatalog plugin (planned).
+
+The legacy `/tables/{table}/stream` endpoint is deprecated and not part of the v1 architecture.
+
+### Consumer Offsets (Deprecated)
 
 ```http
 POST /consumers/{group}/commit
@@ -289,6 +497,12 @@ GET /consumers/{group}/offset?topic=events&partition=0
 {"offset": 2000}
 ```
 
+### Planned Endpoints (Not Yet Implemented)
+
+- **Arrow IPC response format** — `Accept: application/vnd.apache.arrow.stream` on `GET /tables/{table}` for plugin reads
+- **Watermark boundary** — per-partition committed flush watermark
+- **Iceberg REST Catalog API** — standards-compliant catalog endpoints for engine discovery
+
 ### Admin APIs
 
 ```http
@@ -297,10 +511,9 @@ GET /health/live               # Kubernetes liveness probe
 GET /health/ready              # Kubernetes readiness probe
 GET /stats                     # Server statistics (JSON)
 GET /metrics                   # Prometheus metrics format
-GET /tables                    # List all tables
 GET /tables/{table}/metadata   # Iceberg metadata location
-POST /tables/{table}/compact   # Trigger compaction
-POST /tables/{table}/flush     # Force flush to Iceberg
+POST /tables/{table}/compact   # Trigger compaction (currently not wired)
+POST /tables/{table}/flush     # Force flush to Iceberg (currently not wired)
 ```
 
 #### Health Endpoints
@@ -406,30 +619,15 @@ zombi_inflight_writes_available 9500
 - Storage: Limited by local disk
 - Suitable for: Small-medium workloads, development
 
-### Multi-Node Architecture
+### Multi-Node (Deferred)
 
-**Coordination via Redis:**
-```
-Redis stores:
-  offset:{topic}:{partition} → next offset (atomic increment)
-  consumer:{group}:{topic}:{partition} → committed offset
-  flush:{topic}:{partition} → flush watermark
-```
-
-**Scaling Strategy:**
-1. **Writes:** Any proxy can accept writes (Redis coordinates offsets)
-2. **Streaming reads:** Route to proxy that has data in RocksDB, or read from Iceberg
-3. **Analytics:** Direct to Iceberg (Zombi not involved)
-
-**Consistency Model:**
-- Writes: Strongly consistent (Redis atomic increment)
-- Streaming reads: Eventually consistent (local RocksDB or Iceberg)
-- Analytics: Read committed (Iceberg snapshots)
+Multi-node coordination (Redis, partition ownership, distributed idempotency) is future scope
+and **not** required for v1 of the ingestion-gateway identity.
 
 ### Partition Strategy
 - Producers specify partition (hash-based or explicit)
 - Each partition has independent offset sequence
-- Partitions can be distributed across proxies
+- Partitions are local to a node in the current single-node architecture
 
 ---
 
@@ -459,17 +657,18 @@ Redis stores:
 | `ZOMBI_SNAPSHOT_THRESHOLD_GB` | `1` | Min GB before snapshot commit |
 | `ZOMBI_MAX_CONCURRENT_S3_UPLOADS` | `4` | Max concurrent S3 uploads |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `300` | Flush interval (Iceberg mode) |
-| `ZOMBI_FLUSH_MIN_EVENTS` | `10000` | Min events before flush |
+| `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per flush segment |
+| `ZOMBI_ROCKSDB_WAL_ENABLED` | `false` | Enable WAL for durability (P0: default will flip to `true`) |
 | **Catalog** |
-| `ZOMBI_CATALOG_TYPE` | `filesystem` | `filesystem` or `rest` |
 | `ZOMBI_CATALOG_URL` | - | REST catalog URL |
 | `ZOMBI_CATALOG_NAMESPACE` | `zombi` | Iceberg namespace |
+| `ZOMBI_CATALOG_TOKEN` | - | REST catalog auth token |
 | **Backpressure** |
 | `ZOMBI_MAX_INFLIGHT_WRITES` | `10000` | Max concurrent writes |
 | `ZOMBI_MAX_INFLIGHT_BYTES_MB` | `64` | Max inflight bytes (MB) |
-| **Scaling** |
-| `ZOMBI_REDIS_URL` | - | Redis URL (enables multi-node) |
-| `ZOMBI_NODE_ID` | `auto` | Unique node identifier |
+| **Scaling (Deferred)** |
+| `ZOMBI_REDIS_URL` | - | Reserved for future multi-node coordination |
+| `ZOMBI_NODE_ID` | `auto` | Reserved for future multi-node coordination |
 | **Optimization** |
 | `ZOMBI_TIMESTAMP_INDEX_ENABLED` | `false` | Enable timestamp secondary index |
 | **Observability** |
@@ -516,11 +715,14 @@ export ZOMBI_FLUSH_INTERVAL_SECS=60
 | ID | Invariant | Scope |
 |----|-----------|-------|
 | INV-1 | Sequences are monotonically increasing | Per partition |
-| INV-2 | No data loss after ACK | Always |
+| INV-2 | No data loss after ACK (requires WAL enabled) | Always |
 | INV-3 | Order preserved within partition | Per partition |
 | INV-4 | Idempotent writes | Per partition |
 | INV-5 | Iceberg commits are atomic | Always |
 | INV-6 | Compaction preserves all data | Always |
+| INV-7 | Hot storage bounded (delete after flush + retention window) | Per partition |
+| INV-8 | Flush watermarks survive restart (persisted in RocksDB) | Always |
+| INV-9 | Topic names validated at API boundary | Always |
 
 ---
 
@@ -528,39 +730,30 @@ export ZOMBI_FLUSH_INTERVAL_SECS=60
 
 These are explicitly **not** in scope:
 
+- **Kafka replacement semantics** - No durable log semantics or consumer group balancing
 - **Exactly-once delivery** - At-least-once with idempotency keys
 - **Complex stream processing** - Use Flink/Spark for that
 - **Schema enforcement** - Payload is opaque bytes
 - **Multi-tenancy** - Single tenant per deployment
+- **Multi-node coordination (v1)** - Redis coordination/partition ownership are future scope
 - **Transaction support** - Append-only model
 - **Message replay by time** - Use Iceberg time travel instead
 
 ---
 
-## Comparison
+## Positioning
 
-| Feature | Kafka | Zombi |
-|---------|-------|-------|
-| Streaming | Full-featured | Simple (offset-based) |
-| Analytics | Requires ETL | Native Iceberg |
-| Infrastructure | Brokers + ZK/KRaft | Single binary + S3 |
-| Cost | $$$ | $ |
-| Latency (write) | ~5ms | <1ms |
-| Latency (analytics) | N/A | 50-500ms (Iceberg) |
-| Retention | Expensive | Cheap (S3) |
-| Query engines | Limited | Spark/Trino/DuckDB/etc |
+Zombi is an ingestion gateway to Iceberg, **not** a Kafka replacement.
 
 **Use Zombi when:**
-- Primary goal is analytics on event data
-- Simple streaming needs (few consumers)
-- Cost is a concern
-- Want to query with standard SQL engines
+- Primary goal is analytics-ready Iceberg tables
+- You want the lowest-cost ingestion path (single binary + S3)
+- Reads are via Iceberg engines, with optional real-time plugin
 
 **Use Kafka when:**
-- Complex streaming topologies
-- Many consumer groups with rebalancing
-- Exactly-once semantics required
-- Kafka Connect ecosystem needed
+- You need durable log semantics and consumer groups
+- You run complex streaming topologies
+- You depend on the Kafka Connect ecosystem
 
 ---
 
@@ -570,6 +763,6 @@ These are explicitly **not** in scope:
 |---------|--------|--------------|
 | v0.1 | ✅ Done | RocksDB + S3 JSON |
 | v0.2 | ✅ Done | Iceberg/Parquet output |
-| v0.3 | 🚧 Next | Partitioning, catalog registration |
-| v0.4 | Planned | Redis coordination (multi-node) |
+| v0.3 | 🚧 Next | Correctness hardening (watermarks, bounded hot buffer, WAL default) |
+| v0.4 | Planned | Iceberg catalog API + real-time plugin (optional) |
 | v1.0 | Planned | Production ready |

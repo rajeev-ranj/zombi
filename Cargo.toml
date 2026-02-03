@@ -2,10 +2,10 @@
 name = "zombi"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight Kafka-replacement event streaming with RocksDB and S3"
+description = "Iceberg-native event ingestion gateway with a RocksDB hot buffer and S3 storage"
 repository = "https://github.com/rajeev-ranj/zombi"
 homepage = "https://github.com/rajeev-ranj/zombi"
-keywords = ["event-streaming", "kafka", "rocksdb", "s3", "iceberg"]
+keywords = ["iceberg", "ingestion", "rocksdb", "s3", "parquet"]
 categories = ["database", "asynchronous"]
 license = "MIT"
 readme = "README.md"

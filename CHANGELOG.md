@@ -43,9 +43,30 @@ All notable changes to Zombi are documented here.
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 
 ### Planned
-- Streaming endpoint (`GET /tables/{table}/stream`)
-- Redis coordination for multi-node deployment
-- Avro manifest files (full Iceberg compliance)
+- **P0 Correctness Hardening**
+  - Hour-boundary flush splitting
+  - Persist flush watermarks (restart-safe)
+  - Delete hot data after Iceberg commit (bounded hot buffer)
+  - Enable WAL by default (explicit performance opt-out)
+  - Table name validation for safe keys/S3 paths
+- **P1 Iceberg-Native Interfaces**
+  - Iceberg REST Catalog API (server-side)
+  - Arrow IPC content negotiation on read endpoint (`Accept` header)
+  - Watermark boundary endpoint
+  - Watermark in snapshot summary
+  - Compaction snapshot rewrite integration
+  - Configurable snapshot thresholds
+- **P2 Optional Real-Time Plugin**
+  - ZombiCatalog + ZombiTable + hot InputFile
+  - End-to-end engine integration tests
+- **P3 Operational Maturity**
+  - Wire `/flush` and `/compact` admin endpoints
+  - Deprecate/remove consumer offsets
+  - Optional auth (token/mTLS)
+- **P4 Enhancements**
+  - JSON base64 payload support
+  - Debug read dedup fix
+  - Idempotency atomicity when combiner disabled
 
 ---
 
@@ -135,6 +156,6 @@ Zombi follows [Semantic Versioning](https://semver.org/):
 |---------|-------|--------|
 | v0.1 | Core storage + API | Done |
 | v0.2 | Iceberg integration | Done |
-| v0.3 | Streaming + observability | Next |
-| v0.4 | Multi-node (Redis) | Planned |
+| v0.3 | Correctness hardening | Next |
+| v0.4 | Iceberg-native interfaces + optional plugin | Planned |
 | v1.0 | Production hardening | Planned |

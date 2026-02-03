@@ -19,6 +19,35 @@ paths:
                 properties:
                   status:
                     type: string
+  /health/live:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+  /health/ready:
+    get:
+      summary: Readiness probe
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+        "503":
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
   /stats:
     get:
       summary: Server stats
@@ -29,6 +58,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatsResponse"
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
   /tables/{table}:
     post:
       summary: Write a record
@@ -58,7 +97,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
     get:
-      summary: Read records (unified hot + cold)
+      summary: Read records (hot buffer; use Iceberg for analytics)
+      description: Reads from the RocksDB hot buffer only. For production analytics, query Iceberg tables directly via Spark/Trino/DuckDB.
       parameters:
         - $ref: "#/components/parameters/TableParam"
         - name: since
@@ -99,45 +139,11 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BulkWriteResponse"
-  /tables/{table}/stream:
-    get:
-      summary: Stream read records from a partition
-      parameters:
-        - $ref: "#/components/parameters/TableParam"
-        - name: partition
-          in: query
-          required: false
-          schema:
-            type: integer
-            default: 0
-        - name: offset
-          in: query
-          required: true
-          schema:
-            type: integer
-            format: int64
-        - name: limit
-          in: query
-          required: false
-          schema:
-            type: integer
-            default: 100
-        - name: wait_ms
-          in: query
-          required: false
-          schema:
-            type: integer
-            format: int64
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StreamReadResponse"
   /consumers/{group}/commit:
     post:
       summary: Commit a consumer group offset
+      description: "Deprecated: will be removed in a future version. Migrate to Iceberg-native reads."
+      deprecated: true
       parameters:
         - $ref: "#/components/parameters/GroupParam"
       requestBody:
@@ -156,6 +162,8 @@ paths:
   /consumers/{group}/offset:
     get:
       summary: Get a consumer group offset
+      description: "Deprecated: will be removed in a future version. Migrate to Iceberg-native reads."
+      deprecated: true
       parameters:
         - $ref: "#/components/parameters/GroupParam"
         - name: topic
@@ -191,6 +199,7 @@ paths:
   /tables/{table}/flush:
     post:
       summary: Force flush to cold storage
+      description: Currently returns status "not_implemented" until the flusher is wired.
       parameters:
         - $ref: "#/components/parameters/TableParam"
       responses:
@@ -203,6 +212,7 @@ paths:
   /tables/{table}/compact:
     post:
       summary: Trigger compaction
+      description: Currently returns status "not_implemented" until the compactor is wired.
       parameters:
         - $ref: "#/components/parameters/TableParam"
       responses:
@@ -217,9 +227,11 @@ components:
     TableParam:
       name: table
       in: path
+      description: "Table name. Pattern not yet enforced server-side (planned P0)."
       required: true
       schema:
         type: string
+        pattern: "^[a-zA-Z][a-zA-Z0-9_-]{0,127}$"
     GroupParam:
       name: group
       in: path
@@ -307,29 +319,6 @@ components:
           type: integer
         has_more:
           type: boolean
-    StreamEventResponse:
-      type: object
-      properties:
-        sequence:
-          type: integer
-          format: int64
-        payload:
-          type: string
-        timestamp_ms:
-          type: integer
-          format: int64
-    StreamReadResponse:
-      type: object
-      properties:
-        events:
-          type: array
-          items:
-            $ref: "#/components/schemas/StreamEventResponse"
-        next_offset:
-          type: integer
-          format: int64
-        has_more:
-          type: boolean
     CommitOffsetRequest:
       type: object
       properties:
@@ -401,6 +390,38 @@ components:
           type: string
         message:
           type: string
+    ReadinessResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        hot_storage:
+          $ref: "#/components/schemas/ComponentHealth"
+        cold_storage:
+          $ref: "#/components/schemas/ComponentHealth"
+        backpressure:
+          $ref: "#/components/schemas/BackpressureHealth"
+    ComponentHealth:
+      type: object
+      properties:
+        status:
+          type: string
+        error:
+          type: string
+          nullable: true
+    BackpressureHealth:
+      type: object
+      properties:
+        status:
+          type: string
+        inflight_writes:
+          type: integer
+        inflight_bytes:
+          type: integer
+          format: int64
+        max_inflight_bytes:
+          type: integer
+          format: int64
     StatsResponse:
       type: object
       properties:

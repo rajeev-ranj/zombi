@@ -173,6 +173,10 @@ async fn flush_to_s3_and_read_back() {
 | INV-3 | Order preserved | `write([a,b,c]) → read() = [a,b,c]` |
 | INV-4 | Idempotency | `write(x, id) twice → count(x) = 1` |
 | INV-5 | Partition isolation | Events in partition P stay in P |
+| INV-6 | Compaction preserves all data | Compacted files contain every row |
+| INV-7 | Hot storage bounded | Delete after flush + retention window |
+| INV-8 | Watermarks survive restart | Persisted in RocksDB per (topic, partition) |
+| INV-9 | Topic names validated | `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$` at API boundary |
 
 **Tools:** `proptest`
 
@@ -380,6 +384,8 @@ fn read_during_write_sees_consistent_state() {
 | CP-2 | After RocksDB, before S3 flush |
 | CP-3 | During S3 multipart upload |
 | CP-4 | After S3, before watermark update |
+| CP-5 | After flush, before watermark persistence |
+| CP-6 | After watermark persistence, before hot deletion |
 
 **Technique:** Fault injection + process restart
 
@@ -459,115 +465,112 @@ async fn recover_after_crash_during_s3_upload() {
 }
 ```
 
+**Additional scenarios:**
+
+- **WAL recovery (default-on):** Write events with WAL enabled (new default). SIGKILL process. Restart. Verify all acknowledged events survive in RocksDB.
+- **Watermark persistence (CP-5):** Flush events. Kill before watermark is persisted. Restart. Verify flusher re-flushes without creating duplicates in Iceberg.
+- **Hot deletion (CP-6):** Flush events. Kill after watermark persistence but before hot deletion. Restart. Verify hot data is cleaned up on next cycle.
+
 **Runs:** Every PR, ~5 minutes.
+
+---
+
+## Level 4.5: Flush Pipeline Correctness Tests
+
+**Purpose:** Verify the flush pipeline produces correct Iceberg output under all boundary conditions.
+
+**Scenarios:**
+
+| Scenario | What It Verifies |
+|----------|-----------------|
+| Hour-boundary split | Events spanning an hour boundary produce separate Parquet segments per hour |
+| Watermark persistence | Restart resumes from persisted watermark, not offset 0 |
+| Hot deletion | RocksDB key count decreases after flush + retention window |
+| No restart duplicates | Restart after flush does not produce duplicate rows in Iceberg |
+| Snapshot batching | Low-throughput tables eventually commit snapshots (configurable threshold) |
+
+**Runs:** Every PR, ~3 minutes.
 
 ---
 
 ## Level 5: Load Tests
 
-**Purpose:** Find performance limits, memory leaks, degradation.
+**Purpose:** Find performance limits, memory leaks, degradation under sustained load.
 
-**Scenarios:**
+**Tools:** `zombi-load` (Python CLI), `criterion` (Rust micro-benchmarks), `hey`/`wrk` (peak throughput)
 
-| Scenario | Target | Duration |
-|----------|--------|----------|
-| Sustained writes | 10k events/sec | 1 hour |
-| Burst writes | 100k events/sec | 10 seconds |
-| Mixed read/write | 50%/50% | 30 minutes |
-| Large events | 1MB each, 100/sec | 10 minutes |
-| Many partitions | 1000 partitions | 30 minutes |
+### Implemented Scenarios
 
-**Tools:** `criterion`, `k6`
+| Scenario | What It Tests | Duration | S3 Required |
+|----------|---------------|----------|-------------|
+| `single-write` | Single event write throughput + latency percentiles | 60s | No |
+| `bulk-write` | Bulk API throughput | 60s | No |
+| `read-throughput` | Hot storage read performance | 60s | No |
+| `write-read-lag` | Write-to-read visibility latency | 60s | No |
+| `mixed-workload` | 70/30 write/read concurrent workload | 60s | No |
+| `backpressure` | Overload with 503 verification + recovery | 60s (2 phases) | No |
+| `cold-storage` | Iceberg flush + Parquet file verification in S3 | ~5 min | Yes |
+| `iceberg-read` | Cold storage read latency + throughput | ~5 min | Yes |
+| `peak-single` | Max single-write throughput (via `hey`/`wrk`) | Variable | No |
+| `peak-bulk` | Max bulk-write throughput (via `hey`/`wrk`) | Variable | No |
+| `consistency` | INV-2 (no data loss) + INV-3 (order preserved) | 60s | No |
 
-**Example (Rust benchmark):**
+### Profiles
 
-```rust
-// benches/write_throughput.rs
+| Profile | Duration | Scenarios | Use Case |
+|---------|----------|-----------|----------|
+| `quick` | ~3 min | single-write, read-throughput, consistency | CI/CD |
+| `full` | ~30 min | All 8 core scenarios | Release validation |
+| `stress` | ~2 hours | single-write, mixed, backpressure, consistency | Stability |
+| `peak` | ~10 min | peak-single, peak-bulk | Max throughput |
+| `iceberg` | ~5 min | cold-storage, iceberg-read | Iceberg path |
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-
-fn write_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let storage = rt.block_on(create_test_storage());
-    let event = Event::new(vec![0u8; 1024]); // 1KB event
-    
-    let mut group = c.benchmark_group("write");
-    group.throughput(Throughput::Elements(1));
-    group.sample_size(10000);
-    
-    group.bench_function("single_1kb", |b| {
-        b.iter(|| {
-            rt.block_on(storage.write("topic", 0, &event)).unwrap();
-        });
-    });
-    
-    group.finish();
-}
-
-criterion_group!(benches, write_throughput);
-criterion_main!(benches);
-```
-
-**Example (k6 HTTP load test):**
-
-```javascript
-// tests/load/write.js
-
-import http from 'k6/http';
-import { check } from 'k6';
-
-export const options = {
-    scenarios: {
-        sustained: {
-            executor: 'constant-arrival-rate',
-            rate: 10000,
-            timeUnit: '1s',
-            duration: '5m',
-            preAllocatedVUs: 100,
-        },
-    },
-};
-
-export default function () {
-    const payload = {
-        payload: 'x'.repeat(1024),
-    };
-    
-    const res = http.post('http://localhost:8080/events/test-topic', 
-        JSON.stringify(payload),
-        { headers: { 'Content-Type': 'application/json' } }
-    );
-    
-    check(res, {
-        'status is 202': (r) => r.status === 202,
-        'has offset': (r) => r.json().offset !== undefined,
-    });
-}
-```
-
-**Runs:** Nightly, ~2 hours.
-
-### Implementation: zombi-load CLI
-
-The load testing strategy is implemented via the `zombi-load` CLI tool:
+### Usage
 
 ```bash
-# Profiles map to testing levels:
-python tools/zombi_load.py run --profile quick      # CI smoke tests
-python tools/zombi_load.py run --profile full       # Release validation
-python tools/zombi_load.py run --profile stress     # Extended stability
+# Run a profile
+python tools/zombi_load.py run --profile quick --url http://localhost:8080
 
-# Compare runs for regression detection
+# Run a specific scenario
+python tools/zombi_load.py run --scenario consistency
+
+# Compare two runs for regression detection
 python tools/zombi_load.py compare results/baseline.json results/current.json
+
+# List available scenarios and profiles
+python tools/zombi_load.py list scenarios
+python tools/zombi_load.py list profiles
 ```
 
-**Available Profiles:**
-| Profile | Duration | Use Case |
-|---------|----------|----------|
-| `quick` | ~3 min | CI/CD pipelines |
-| `full` | ~30 min | Release validation |
-| `stress` | ~2 hours | Stability testing |
-| `peak` | ~10 min | Max throughput (requires hey) |
+### Scenario Implementations
+
+```
+tools/
+├── zombi_load.py              # Unified CLI entry point
+├── config.py                  # Profiles + scenario metadata
+└── scenarios/
+    ├── base.py                # BaseScenario abstract class
+    ├── backpressure.py        # Overload + recovery testing
+    ├── cold_storage.py        # Iceberg flush + Parquet verification
+    ├── consistency.py         # INV-2/INV-3 verification
+    ├── consumer.py            # Consumer offset tracking (deprecated)
+    ├── iceberg_read.py        # Cold storage read benchmarks
+    ├── mixed.py               # Concurrent read/write workload
+    └── producer.py            # Multi-producer throughput
+```
+
+### Rust Micro-Benchmarks
+
+`benches/write_throughput.rs` provides `criterion`-based micro-benchmarks for the write path.
+These complement the Python load tests: micro-benchmarks measure raw storage throughput,
+while `zombi-load` scenarios measure end-to-end HTTP throughput under realistic conditions.
+
+```bash
+cargo bench                    # Run all benchmarks
+cargo bench -- single_1kb     # Specific benchmark
+```
+
+**Runs:** Nightly (full), per-PR (quick profile).
 
 See `tools/README.md` for complete documentation.
 
@@ -642,45 +645,36 @@ fuzz_target!(|data: &[u8]| {
 
 ```
 tests/
-├── unit/                      # L0: Fast, pure functions
-│   ├── sequence_test.rs
-│   ├── partition_test.rs
+├── common/                    # Shared test utilities
+├── integration_tests.rs       # L1: API + storage integration
+├── property_tests.rs          # L2: Invariant verification (INV-1 through INV-9)
+├── concurrency_tests.rs       # L3: Race condition detection
+├── crash_recovery_tests.rs    # L4: Recovery scenarios (CP-1 through CP-6)
+├── flush/                     # L4.5: Flush pipeline correctness (planned)
+│   ├── hour_boundary_test.rs
 │   └── watermark_test.rs
-│
-├── integration/               # L1: Real I/O
-│   ├── storage_test.rs
-│   ├── api_test.rs
-│   └── consumer_test.rs
-│
-├── property/                  # L2: Invariants
-│   └── invariants.rs
-│
-├── concurrency/               # L3: Race conditions
-│   └── parallel_writes.rs
-│
-├── crash/                     # L4: Recovery
-│   └── recovery.rs
-│
-├── load/                      # L5: Performance (k6 scripts)
-│   ├── write.js
-│   └── mixed.js
-│
-├── adr/                       # ADR compliance
-│   ├── adr_001_storage.rs
-│   └── adr_004_ordering.rs
-│
-└── fixtures/
-    ├── mod.rs
-    └── test_helpers.rs
+└── iceberg/                   # Iceberg integration (planned)
+    ├── rest_catalog_test.rs
+    └── query_engine_test.rs
 
 fuzz/
 └── fuzz_targets/              # L6: Fuzzing
     ├── fuzz_write.rs
     └── fuzz_proto.rs
 
-benches/                       # Performance tracking
-├── write_throughput.rs
-└── read_latency.rs
+benches/
+└── write_throughput.rs        # Criterion micro-benchmarks
+
+tools/
+├── zombi_load.py              # L5: Load testing CLI
+├── config.py                  # Profiles + scenario metadata
+└── scenarios/                 # L5: Load test scenario implementations
+    ├── backpressure.py
+    ├── cold_storage.py
+    ├── consistency.py
+    ├── iceberg_read.py
+    ├── mixed.py
+    └── producer.py
 ```
 
 ---
