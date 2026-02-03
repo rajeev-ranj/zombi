@@ -18,6 +18,12 @@ All notable changes to Zombi are documented here.
   - Backpressure tracking (`zombi_backpressure_rejections_total`)
   - Grafana dashboard with pre-configured panels
 
+- **Write Combiner** (Issue #86)
+  - Batches concurrent single-event writes into RocksDB `WriteBatch` operations
+  - Configurable via `ZOMBI_WRITE_COMBINER_ENABLED` env var
+  - A/B tested on t3.micro: +4.3% throughput, −15.9% p99 latency at c=500
+  - No regression on bulk write path (bypasses combiner)
+
 - **Monitoring Infrastructure**
   - `docker-compose.monitoring.yml` - Full observability stack (Zombi + MinIO + Prometheus + Grafana)
   - Prometheus scrape configuration
