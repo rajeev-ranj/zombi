@@ -10,5 +10,5 @@ pub mod registry;
 pub use histogram::Histogram;
 pub use registry::{
     ConsumerMetrics, EnhancedApiMetrics, FlushMetrics, HotStorageMetrics, IcebergMetrics,
-    MetricsRegistry,
+    MetricsRegistry, WriteCombinerMetrics,
 };

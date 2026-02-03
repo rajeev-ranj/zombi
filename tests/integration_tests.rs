@@ -44,13 +44,18 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
 fn create_test_app_with_combiner(config: WriteCombinerConfig) -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let storage = Arc::new(RocksDbStorage::open(dir.path()).unwrap());
-    let combiner = Arc::new(WriteCombiner::new(Arc::clone(&storage), config));
+    let metrics_registry = Arc::new(MetricsRegistry::new());
+    let combiner = Arc::new(WriteCombiner::new(
+        Arc::clone(&storage),
+        config,
+        Arc::clone(&metrics_registry.combiner),
+    ));
     let state = Arc::new(
         AppState::new(
             storage,
             None::<Arc<NoopColdStorage>>,
             Arc::new(Metrics::new()),
-            Arc::new(MetricsRegistry::new()),
+            metrics_registry,
             BackpressureConfig::default(),
         )
         .with_write_combiner(Some(combiner)),
@@ -1448,4 +1453,38 @@ async fn test_combiner_byte_backpressure() {
         saw_overload,
         "Expected byte backpressure to trigger 503 when concurrent writes exceed 1KB limit"
     );
+}
+
+#[tokio::test]
+async fn test_combiner_metrics_in_prometheus_output() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 100,
+        window: std::time::Duration::from_secs(10),
+        shards: 2,
+        ..Default::default()
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+    // Per-shard gauges should be present (registered at combiner creation)
+    assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"0\"}"));
+    assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"1\"}"));
+    assert!(body_str.contains("zombi_write_combiner_queue_depth_total"));
 }

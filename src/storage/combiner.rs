@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Instant};
 
 use crate::contracts::{BulkWriteEvent, HotStorage, StorageError};
+use crate::metrics::WriteCombinerMetrics;
 
 /// Configuration for the write combiner.
 #[derive(Debug, Clone)]
@@ -99,6 +100,7 @@ pub struct WriteCombiner<H: HotStorage> {
     inflight_bytes: Arc<AtomicU64>,
     _storage: Arc<H>,
     config: WriteCombinerConfig,
+    metrics: Arc<WriteCombinerMetrics>,
 }
 
 struct WriteRequest {
@@ -115,20 +117,35 @@ fn shard_for_table(table: &str, num_shards: usize) -> usize {
 }
 
 impl<H: HotStorage> WriteCombiner<H> {
-    pub fn new(storage: Arc<H>, config: WriteCombinerConfig) -> Self
+    pub fn new(
+        storage: Arc<H>,
+        config: WriteCombinerConfig,
+        metrics: Arc<WriteCombinerMetrics>,
+    ) -> Self
     where
         H: 'static,
     {
         let inflight_bytes = Arc::new(AtomicU64::new(0));
         let mut senders = Vec::with_capacity(config.shards);
 
-        for _ in 0..config.shards {
+        for i in 0..config.shards {
             let (sender, receiver) = mpsc::channel(config.queue_capacity);
+            metrics.register_shard(i as u32);
             let worker_storage = Arc::clone(&storage);
             let worker_config = config.clone();
             let worker_bytes = Arc::clone(&inflight_bytes);
+            let worker_metrics = Arc::clone(&metrics);
+            let shard_id = i as u32;
             tokio::spawn(async move {
-                run_combiner(worker_storage, receiver, worker_config, worker_bytes).await;
+                run_combiner(
+                    worker_storage,
+                    receiver,
+                    worker_config,
+                    worker_bytes,
+                    worker_metrics,
+                    shard_id,
+                )
+                .await;
             });
             senders.push(sender);
         }
@@ -138,6 +155,7 @@ impl<H: HotStorage> WriteCombiner<H> {
             inflight_bytes,
             _storage: storage,
             config,
+            metrics,
         }
     }
 
@@ -196,6 +214,8 @@ impl<H: HotStorage> WriteCombiner<H> {
             });
         }
 
+        self.metrics.increment_depth(shard as u32);
+
         response_rx
             .await
             .map_err(|_| StorageError::Overloaded("Write combiner dropped response".into()))?
@@ -207,6 +227,8 @@ async fn run_combiner<H: HotStorage>(
     mut receiver: mpsc::Receiver<WriteRequest>,
     config: WriteCombinerConfig,
     inflight_bytes: Arc<AtomicU64>,
+    metrics: Arc<WriteCombinerMetrics>,
+    shard_id: u32,
 ) {
     let mut batches: HashMap<String, PendingBatch> = HashMap::new();
 
@@ -219,6 +241,7 @@ async fn run_combiner<H: HotStorage>(
                     maybe_req = receiver.recv() => {
                         match maybe_req {
                             Some(req) => {
+                                metrics.decrement_depth(shard_id);
                                 handle_request(&mut batches, req, &config, &storage, &inflight_bytes);
                             }
                             None => {
@@ -234,6 +257,7 @@ async fn run_combiner<H: HotStorage>(
             }
             None => match receiver.recv().await {
                 Some(req) => {
+                    metrics.decrement_depth(shard_id);
                     handle_request(&mut batches, req, &config, &storage, &inflight_bytes);
                 }
                 None => break,

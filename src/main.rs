@@ -224,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(Arc::new(WriteCombiner::new(
             Arc::clone(&storage),
             write_combiner_config,
+            Arc::clone(&metrics_registry.combiner),
         )))
     } else {
         None
