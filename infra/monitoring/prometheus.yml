@@ -6,6 +6,6 @@ scrape_configs:
   - job_name: "zombi"
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["54.169.76.184:8080"]
+      - targets: ["54.179.16.32:8080"]
         labels:
           instance: "ec2-t3micro"

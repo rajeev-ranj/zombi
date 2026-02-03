@@ -1,0 +1,121 @@
+{
+  "name": "peak-bulk",
+  "success": true,
+  "duration_secs": 2417.082211256027,
+  "metrics": {
+    "throughput": {
+      "events_per_sec": 94804.37,
+      "mb_per_sec": 6.960907083725633,
+      "bytes_total": 17642380000
+    },
+    "latency": {
+      "p50_ms": 207.5,
+      "p95_ms": 3409.6000000000004,
+      "p99_ms": 4794.900000000001,
+      "min_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "cpu": {
+      "avg_percent": 70.01792288989208,
+      "peak_percent": 70.5
+    },
+    "errors": 0,
+    "error_rate": 0.0,
+    "details": {
+      "tool": "hey",
+      "optimal_concurrency": 500,
+      "all_results": [
+        {
+          "total_requests": 494567,
+          "requests_per_sec": 823.4484,
+          "avg_latency_ms": 60.699999999999996,
+          "p50_ms": 23.900000000000002,
+          "p95_ms": 335.1,
+          "p99_ms": 724.3000000000001,
+          "max_latency_ms": 1594.6,
+          "errors": 0,
+          "concurrency": 50,
+          "events_per_sec": 82344.84,
+          "avg_cpu_percent": 72.23166840097072,
+          "peak_cpu_percent": 72.8
+        },
+        {
+          "total_requests": 170093,
+          "requests_per_sec": 283.4671,
+          "avg_latency_ms": 352.7,
+          "p50_ms": 47.6,
+          "p95_ms": 2252.8,
+          "p99_ms": 3358.9,
+          "max_latency_ms": 5226.7,
+          "errors": 0,
+          "concurrency": 100,
+          "events_per_sec": 28346.710000000003,
+          "avg_cpu_percent": 70.3505691617796,
+          "peak_cpu_percent": 71.7
+        },
+        {
+          "total_requests": 530480,
+          "requests_per_sec": 881.2697,
+          "avg_latency_ms": 226.6,
+          "p50_ms": 91.5,
+          "p95_ms": 1616.1000000000001,
+          "p99_ms": 2935.9,
+          "max_latency_ms": 5876.299999999999,
+          "errors": 0,
+          "concurrency": 200,
+          "events_per_sec": 88126.97,
+          "avg_cpu_percent": 69.33981994459776,
+          "peak_cpu_percent": 69.7
+        },
+        {
+          "total_requests": 569098,
+          "requests_per_sec": 948.0437,
+          "avg_latency_ms": 527.2,
+          "p50_ms": 207.5,
+          "p95_ms": 3409.6000000000004,
+          "p99_ms": 4794.900000000001,
+          "max_latency_ms": 7975.799999999999,
+          "errors": 0,
+          "concurrency": 500,
+          "events_per_sec": 94804.37,
+          "avg_cpu_percent": 70.01792288989208,
+          "peak_cpu_percent": 70.5
+        }
+      ],
+      "server_stats_before": {
+        "uptime_secs": 5290.662445327,
+        "writes": {
+          "total": 26573325,
+          "bytes_total": 2075661428,
+          "rate_per_sec": 5022.683884032519,
+          "avg_latency_us": 41.83096240308655
+        },
+        "reads": {
+          "total": 29054,
+          "records_total": 2543149,
+          "rate_per_sec": 5.491561841308185,
+          "avg_latency_us": 115221.52550423349
+        },
+        "errors_total": 0
+      },
+      "server_stats_after": {
+        "uptime_secs": 7707.746763458,
+        "writes": {
+          "total": 202997125,
+          "bytes_total": 6486256428,
+          "rate_per_sec": 26336.76627291365,
+          "avg_latency_us": 24.7080723877247
+        },
+        "reads": {
+          "total": 29054,
+          "records_total": 2543149,
+          "rate_per_sec": 3.7694544062790705,
+          "avg_latency_us": 115221.52550423349
+        },
+        "errors_total": 0
+      }
+    }
+  },
+  "timeline": [],
+  "error_messages": []
+}

@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "run_id": "20260128_095136",
+    "profile": null,
+    "scenarios_requested": [
+      "iceberg-read"
+    ],
+    "start_time": "2026-01-28T09:51:36.044923",
+    "end_time": "2026-01-28T09:51:36.044998",
+    "duration_secs": 7.5e-05,
+    "url": "http://localhost:8080",
+    "encoding": "proto",
+    "config_path": null
+  },
+  "summary": {
+    "passed": 0,
+    "failed": 0,
+    "skipped": 1,
+    "total": 1,
+    "peak_events_per_sec": 0.0,
+    "peak_mb_per_sec": 0.0
+  },
+  "scenarios": []
+}

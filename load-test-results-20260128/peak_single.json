@@ -1,0 +1,81 @@
+{
+  "url": "http://localhost:8080",
+  "timestamp": "2026-01-28T18:29:56.823362",
+  "tool": "hey",
+  "peak_throughput": 3222.8885,
+  "peak_mb_per_sec": 0.23051883458043845,
+  "optimal_concurrency": 50,
+  "results": [
+    {
+      "concurrency": 50,
+      "requests_per_sec": 3222.8885,
+      "mb_per_sec": 0.23051883458043845,
+      "total_requests": 193467,
+      "p50_ms": 15.4,
+      "p95_ms": 30.0,
+      "p99_ms": 41.9,
+      "max_latency_ms": 128.39999999999998,
+      "errors": 0,
+      "avg_cpu_percent": 26.536301369862976,
+      "peak_cpu_percent": 26.9
+    },
+    {
+      "concurrency": 100,
+      "requests_per_sec": 1796.7591,
+      "mb_per_sec": 0.12851429967406366,
+      "total_requests": 107910,
+      "p50_ms": 56.300000000000004,
+      "p95_ms": 82.60000000000001,
+      "p99_ms": 92.7,
+      "max_latency_ms": 193.3,
+      "errors": 0,
+      "avg_cpu_percent": 27.154607508532393,
+      "peak_cpu_percent": 27.3
+    },
+    {
+      "concurrency": 200,
+      "requests_per_sec": 1794.4558,
+      "mb_per_sec": 0.1283495825447868,
+      "total_requests": 107879,
+      "p50_ms": 107.2,
+      "p95_ms": 167.1,
+      "p99_ms": 180.5,
+      "max_latency_ms": 285.7,
+      "errors": 0,
+      "avg_cpu_percent": 27.584641638225246,
+      "peak_cpu_percent": 27.8
+    }
+  ],
+  "server_stats_before": {
+    "uptime_secs": 2327.57126954,
+    "writes": {
+      "total": 73065595,
+      "bytes_total": 3711578925,
+      "rate_per_sec": 31391.345973453273,
+      "avg_latency_us": 13.43629821942872
+    },
+    "reads": {
+      "total": 0,
+      "records_total": 0,
+      "rate_per_sec": 0.0,
+      "avg_latency_us": 0.0
+    },
+    "errors_total": 0
+  },
+  "server_stats_after": {
+    "uptime_secs": 2517.208422323,
+    "writes": {
+      "total": 73474851,
+      "bytes_total": 3742273125,
+      "rate_per_sec": 29189.021595674585,
+      "avg_latency_us": 16.981992940686602
+    },
+    "reads": {
+      "total": 0,
+      "records_total": 0,
+      "rate_per_sec": 0.0,
+      "avg_latency_us": 0.0
+    },
+    "errors_total": 0
+  }
+}

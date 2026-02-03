@@ -1,0 +1,55 @@
+{
+  "url": "http://localhost:8080",
+  "timestamp": "2026-01-28T18:18:41.281237",
+  "tool": "hey",
+  "peak_throughput": 13590.4724,
+  "peak_mb_per_sec": 0.972066489858177,
+  "optimal_concurrency": 50,
+  "results": [
+    {
+      "concurrency": 50,
+      "requests_per_sec": 13590.4724,
+      "mb_per_sec": 0.972066489858177,
+      "total_requests": 1000000,
+      "p50_ms": 3.3,
+      "p95_ms": 6.8999999999999995,
+      "p99_ms": 9.9,
+      "max_latency_ms": 58.8,
+      "errors": 0,
+      "avg_cpu_percent": 15.946167557932267,
+      "peak_cpu_percent": 18.9
+    }
+  ],
+  "server_stats_before": {
+    "uptime_secs": 1717.674280496,
+    "writes": {
+      "total": 40172800,
+      "bytes_total": 2651404800,
+      "rate_per_sec": 23387.903315638865,
+      "avg_latency_us": 4.340401963517604
+    },
+    "reads": {
+      "total": 0,
+      "records_total": 0,
+      "rate_per_sec": 0.0,
+      "avg_latency_us": 0.0
+    },
+    "errors_total": 0
+  },
+  "server_stats_after": {
+    "uptime_secs": 1841.666230838,
+    "writes": {
+      "total": 41803695,
+      "bytes_total": 2773721925,
+      "rate_per_sec": 22698.84428568708,
+      "avg_latency_us": 5.643240962312063
+    },
+    "reads": {
+      "total": 0,
+      "records_total": 0,
+      "rate_per_sec": 0.0,
+      "avg_latency_us": 0.0
+    },
+    "errors_total": 0
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "run_id": "20260128_083050",
+    "profile": null,
+    "scenarios_requested": [
+      "consistency"
+    ],
+    "start_time": "2026-01-28T08:30:50.641828",
+    "end_time": "2026-01-28T08:31:00.807723",
+    "duration_secs": 10.165895,
+    "url": "http://localhost:8080",
+    "encoding": "proto",
+    "config_path": null
+  },
+  "summary": {
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0,
+    "total": 1,
+    "peak_events_per_sec": 0.0,
+    "peak_mb_per_sec": 0.0
+  },
+  "scenarios": [
+    {
+      "name": "consistency",
+      "success": true,
+      "duration_secs": 10.161954641342163,
+      "metrics": {
+        "throughput": {
+          "events_per_sec": 0.0,
+          "mb_per_sec": 0.0,
+          "bytes_total": 0
+        },
+        "latency": {
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "min_ms": 0,
+          "max_ms": 0
+        },
+        "cpu": {
+          "avg_percent": 0.0,
+          "peak_percent": 0.0
+        },
+        "errors": 0,
+        "error_rate": 0,
+        "details": {
+          "test_id": "726d1e2c",
+          "write_phase": {
+            "total_acknowledged": 10000,
+            "errors": 0,
+            "p95_ms": 0.9990069997911633
+          },
+          "read_phase": {
+            "total_read": 10000,
+            "reads": 3,
+            "p95_ms": 97.72742199993445
+          },
+          "verification": {
+            "inv2_no_data_loss": {
+              "pass": true,
+              "total_acknowledged": 10000,
+              "total_found": 10000,
+              "total_missing": 0,
+              "errors": []
+            },
+            "inv3_order_preserved": {
+              "pass": true,
+              "total_violations": 0,
+              "errors": []
+            }
+          }
+        }
+      },
+      "timeline": [],
+      "error_messages": []
+    }
+  ]
+}

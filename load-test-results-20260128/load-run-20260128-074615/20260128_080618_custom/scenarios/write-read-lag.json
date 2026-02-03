@@ -1,0 +1,30 @@
+{
+  "name": "write-read-lag",
+  "success": true,
+  "duration_secs": 791.935530424118,
+  "metrics": {
+    "throughput": {
+      "events_per_sec": 0.0,
+      "mb_per_sec": 0.0,
+      "bytes_total": 0
+    },
+    "latency": {
+      "p50_ms": 14.686469500020394,
+      "p95_ms": 17.111638999722345,
+      "p99_ms": 17.111638999722345,
+      "min_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "cpu": {
+      "avg_percent": 0.0,
+      "peak_percent": 0.0
+    },
+    "errors": 0,
+    "error_rate": 0,
+    "details": {
+      "samples": 10
+    }
+  },
+  "timeline": [],
+  "error_messages": []
+}
