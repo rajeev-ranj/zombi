@@ -164,6 +164,61 @@ async fn test_write_record_with_combiner() {
 }
 
 #[tokio::test]
+async fn test_combiner_interleaved_writes() {
+    let config = WriteCombinerConfig {
+        enabled: true,
+        batch_size: 4,
+        window: std::time::Duration::from_micros(500),
+        queue_capacity: 100,
+    };
+    let (app, _dir) = create_test_app_with_combiner(config);
+
+    let requests = (0..20).map(|i| {
+        let app = app.clone();
+        let table = if i % 2 == 0 { "table_a" } else { "table_b" };
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tables/{}", table))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"payload\": \"hello {}\", \"partition\": 0}}",
+                        i
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let responses = join_all(requests).await;
+    let mut offsets_a = Vec::new();
+    let mut offsets_b = Vec::new();
+
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let table = json["table"].as_str().unwrap();
+        let offset = json["offset"].as_u64().unwrap();
+        match table {
+            "table_a" => offsets_a.push(offset),
+            "table_b" => offsets_b.push(offset),
+            other => panic!("unexpected table: {}", other),
+        }
+    }
+
+    offsets_a.sort_unstable();
+    offsets_b.sort_unstable();
+    assert_eq!(offsets_a, (1..=10).collect::<Vec<_>>());
+    assert_eq!(offsets_b, (1..=10).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn test_read_records() {
     let (app, _dir) = create_test_app();
 

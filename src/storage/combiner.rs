@@ -26,7 +26,7 @@ impl Default for WriteCombinerConfig {
             enabled: false,
             batch_size: 10,
             window: Duration::from_micros(100),
-            queue_capacity: 100,
+            queue_capacity: 10_000,
         }
     }
 }
@@ -38,6 +38,7 @@ impl WriteCombinerConfig {
     /// - `ZOMBI_WRITE_COMBINER_ENABLED`: Enable combiner (default: false)
     /// - `ZOMBI_WRITE_COMBINER_SIZE`: Batch size (default: 10)
     /// - `ZOMBI_WRITE_COMBINER_WINDOW_US`: Flush window in microseconds (default: 100)
+    /// - `ZOMBI_WRITE_COMBINER_QUEUE_CAPACITY`: Queue capacity (default: 10000)
     pub fn from_env() -> Self {
         let default = Self::default();
         let enabled = std::env::var("ZOMBI_WRITE_COMBINER_ENABLED")
@@ -54,8 +55,11 @@ impl WriteCombinerConfig {
             .filter(|v| *v > 0)
             .map(Duration::from_micros)
             .unwrap_or(default.window);
-
-        let queue_capacity = (batch_size * 10).max(1);
+        let queue_capacity = std::env::var("ZOMBI_WRITE_COMBINER_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default.queue_capacity);
 
         Self {
             enabled,
@@ -153,7 +157,6 @@ async fn run_combiner<H: HotStorage>(
                         match maybe_req {
                             Some(req) => {
                                 handle_request(&mut batches, req, &config, &storage);
-                                flush_expired_batches(&mut batches, &storage);
                             }
                             None => {
                                 flush_all_batches(&mut batches, &storage);
@@ -162,7 +165,7 @@ async fn run_combiner<H: HotStorage>(
                         }
                     }
                     _ = time::sleep_until(deadline) => {
-                        flush_expired_batches(&mut batches, &storage);
+                        flush_all_batches(&mut batches, &storage);
                     }
                 }
             }
@@ -202,27 +205,6 @@ fn handle_request<H: HotStorage>(
 
     if batch.events.len() >= config.batch_size {
         flush_batch(storage, req.table, batches);
-    }
-}
-
-fn flush_expired_batches<H: HotStorage>(
-    batches: &mut HashMap<String, PendingBatch>,
-    storage: &Arc<H>,
-) {
-    let now = Instant::now();
-    let expired_tables: Vec<String> = batches
-        .iter()
-        .filter_map(|(table, batch)| {
-            if batch.deadline <= now {
-                Some(table.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for table in expired_tables {
-        flush_batch(storage, table, batches);
     }
 }
 
