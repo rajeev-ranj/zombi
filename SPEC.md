@@ -394,6 +394,14 @@ Response 202:
 }
 ```
 
+Bulk write accepts both JSON and Protobuf payloads:
+
+- **application/json** — `BulkWriteRequest` with `records` entries. `partition` defaults to 0. `timestamp_ms` is optional (server time if omitted). `idempotency_key` is optional.
+- **application/x-protobuf** — `BulkWriteRequest` defined in `proto/event.proto`:
+  - `repeated BulkWriteRecord records`
+  - `BulkWriteRecord` fields: `bytes payload`, `uint32 partition`, `int64 timestamp_ms`, `string idempotency_key`
+  - Defaults: `partition=0`, `timestamp_ms=0` (server time used when 0), empty `idempotency_key` treated as unset.
+
 ### Write Events (Protobuf)
 
 Single writes also accept `Content-Type: application/x-protobuf`. Partition is specified via the `X-Partition` header (default 0).
@@ -424,10 +432,18 @@ message Event {
   string idempotency_key = 3;
   map<string, string> headers = 4;
 }
-```
 
-**Bulk protobuf writes** are planned. The `Event` message will gain a `uint32 partition = 5` field
-(non-breaking in proto3, defaults to 0) to support per-event partition routing in bulk requests.
+message BulkWriteRecord {
+  bytes payload = 1;
+  uint32 partition = 2;
+  int64 timestamp_ms = 3;
+  string idempotency_key = 4;
+}
+
+message BulkWriteRequest {
+  repeated BulkWriteRecord records = 1;
+}
+```
 
 ### Table Name Validation (Planned — P0)
 

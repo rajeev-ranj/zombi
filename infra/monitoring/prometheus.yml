@@ -2,10 +2,11 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Example configuration: replace <ZOMBI_HOST> with your Zombi host/IP.
 scrape_configs:
   - job_name: "zombi"
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["54.169.76.184:8080"]
+      - targets: ["<ZOMBI_HOST>:8080"] # replace <ZOMBI_HOST> with your Zombi host/IP
         labels:
           instance: "ec2-t3micro"

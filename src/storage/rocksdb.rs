@@ -6,6 +6,7 @@ use bloomfilter::Bloom;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rocksdb::{BlockBasedOptions, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use serde::{Deserialize, Serialize};
 
 use crate::contracts::{HotStorage, SequenceGenerator, StorageError, StoredEvent};
 use crate::storage::AtomicSequenceGenerator;
@@ -20,8 +21,16 @@ const HWM_PREFIX: &str = "hwm";
 const CONSUMER_PREFIX: &str = "consumer";
 /// Key prefix for timestamp index (for O(1) time-based queries)
 const TIMESTAMP_INDEX_PREFIX: &str = "ts";
+const EVENT_VALUE_MAGIC: &[u8; 4] = b"ZEV1";
 const KB: usize = 1024;
 const MB: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredEventValueV1 {
+    payload: Vec<u8>,
+    timestamp_ms: i64,
+    idempotency_key: Option<String>,
+}
 
 /// Configuration for Bloom filter-based idempotency key lookups.
 #[derive(Debug, Clone)]
@@ -386,9 +395,62 @@ impl RocksDbStorage {
         key_suffix.split(':').next()
     }
 
-    /// Serializes a stored event to bytes using bincode (fast binary format).
-    fn serialize_event(event: &StoredEvent) -> Result<Vec<u8>, StorageError> {
-        bincode::serialize(event).map_err(|e| StorageError::Serialization(e.to_string()))
+    /// Parses the sequence from a full event key using the known prefix length.
+    #[inline]
+    fn parse_sequence_from_key_bytes(prefix_len: usize, key: &[u8]) -> Option<u64> {
+        let seq_bytes = key.get(prefix_len..)?;
+        let seq_str = std::str::from_utf8(seq_bytes).ok()?;
+        u64::from_str_radix(seq_str, 16).ok()
+    }
+
+    /// Serializes a stored event value to bytes using the compact V1 format.
+    fn serialize_event_value(event: &StoredEvent) -> Result<Vec<u8>, StorageError> {
+        let value = StoredEventValueV1 {
+            payload: event.payload.clone(),
+            timestamp_ms: event.timestamp_ms,
+            idempotency_key: event.idempotency_key.clone(),
+        };
+        let encoded =
+            bincode::serialize(&value).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(EVENT_VALUE_MAGIC.len() + encoded.len());
+        bytes.extend_from_slice(EVENT_VALUE_MAGIC);
+        bytes.extend_from_slice(&encoded);
+        Ok(bytes)
+    }
+
+    /// Decodes a stored event value from either the compact V1 format or legacy StoredEvent.
+    fn decode_event_value(bytes: &[u8]) -> Result<StoredEventValueV1, StorageError> {
+        if bytes.len() >= EVENT_VALUE_MAGIC.len() && bytes.starts_with(EVENT_VALUE_MAGIC) {
+            let payload = &bytes[EVENT_VALUE_MAGIC.len()..];
+            if let Ok(value) = bincode::deserialize::<StoredEventValueV1>(payload) {
+                return Ok(value);
+            }
+        }
+
+        let legacy: StoredEvent =
+            bincode::deserialize(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        Ok(StoredEventValueV1 {
+            payload: legacy.payload,
+            timestamp_ms: legacy.timestamp_ms,
+            idempotency_key: legacy.idempotency_key,
+        })
+    }
+
+    /// Reconstructs a StoredEvent using the key context plus decoded value.
+    fn build_stored_event(
+        topic: &str,
+        partition: u32,
+        sequence: u64,
+        value: StoredEventValueV1,
+    ) -> StoredEvent {
+        StoredEvent {
+            sequence,
+            topic: topic.to_string(),
+            partition,
+            payload: value.payload,
+            timestamp_ms: value.timestamp_ms,
+            idempotency_key: value.idempotency_key,
+        }
     }
 
     /// Registers a partition in the cache (called on write).
@@ -527,11 +589,6 @@ impl RocksDbStorage {
         format!("{}:{}:{}:", EVENT_PREFIX, topic, partition).into_bytes()
     }
 
-    /// Deserializes bytes to a stored event using bincode.
-    fn deserialize_event(bytes: &[u8]) -> Result<StoredEvent, StorageError> {
-        bincode::deserialize(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
-    }
-
     /// Parses a u64 from big-endian bytes.
     #[inline]
     fn parse_u64_be(bytes: &[u8]) -> Result<u64, StorageError> {
@@ -589,7 +646,7 @@ impl HotStorage for RocksDbStorage {
         };
 
         // Serialize
-        let event_bytes = Self::serialize_event(&event)?;
+        let event_bytes = Self::serialize_event_value(&event)?;
 
         // Use WriteBatch for atomic multi-key write (single disk operation)
         let mut batch = WriteBatch::default();
@@ -676,7 +733,7 @@ impl HotStorage for RocksDbStorage {
             };
 
             // Serialize and add to batch
-            let event_bytes = Self::serialize_event(&stored_event)?;
+            let event_bytes = Self::serialize_event_value(&stored_event)?;
             let event_key = Self::event_key(topic, event.partition, sequence);
             batch.put(event_key.as_bytes(), &event_bytes);
 
@@ -742,6 +799,7 @@ impl HotStorage for RocksDbStorage {
             rocksdb::IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
             read_opts,
         );
+        let prefix_len = prefix_bytes.len();
 
         for item in iter {
             if events.len() >= limit {
@@ -755,8 +813,12 @@ impl HotStorage for RocksDbStorage {
                 break;
             }
 
-            let event = Self::deserialize_event(&value)?;
-            events.push(event);
+            let sequence = Self::parse_sequence_from_key_bytes(prefix_len, &key)
+                .ok_or_else(|| StorageError::Serialization("Invalid event key sequence".into()))?;
+            let decoded = Self::decode_event_value(&value)?;
+            events.push(Self::build_stored_event(
+                topic, partition, sequence, decoded,
+            ));
         }
 
         Ok(events)
@@ -1024,8 +1086,8 @@ impl HotStorage for RocksDbStorage {
                 .get(event_key.as_bytes())
                 .map_err(|e| StorageError::RocksDb(e.to_string()))?
             {
-                let event = Self::deserialize_event(&bytes)?;
-                events.push(event);
+                let decoded = Self::decode_event_value(&bytes)?;
+                events.push(Self::build_stored_event(topic, partition, seq, decoded));
             }
         }
 
@@ -1134,6 +1196,63 @@ mod tests {
         assert_eq!(config.block_size_bytes, 16 * KB);
 
         clear_rocksdb_env();
+    }
+
+    #[test]
+    fn event_value_v1_round_trip() {
+        let event = StoredEvent {
+            sequence: 42,
+            topic: "events".into(),
+            partition: 1,
+            payload: vec![1, 2, 3],
+            timestamp_ms: 123456789,
+            idempotency_key: Some("idem-1".into()),
+        };
+
+        let bytes = RocksDbStorage::serialize_event_value(&event).unwrap();
+        assert!(bytes.starts_with(EVENT_VALUE_MAGIC));
+
+        let decoded = RocksDbStorage::decode_event_value(&bytes).unwrap();
+        let rebuilt = RocksDbStorage::build_stored_event("events", 1, event.sequence, decoded);
+
+        assert_eq!(rebuilt.sequence, event.sequence);
+        assert_eq!(rebuilt.topic, event.topic);
+        assert_eq!(rebuilt.partition, event.partition);
+        assert_eq!(rebuilt.payload, event.payload);
+        assert_eq!(rebuilt.timestamp_ms, event.timestamp_ms);
+        assert_eq!(rebuilt.idempotency_key, event.idempotency_key);
+    }
+
+    #[test]
+    fn event_value_decodes_legacy_payload() {
+        let legacy = StoredEvent {
+            sequence: 7,
+            topic: "legacy".into(),
+            partition: 9,
+            payload: vec![4, 5],
+            timestamp_ms: 55,
+            idempotency_key: None,
+        };
+
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let decoded = RocksDbStorage::decode_event_value(&bytes).unwrap();
+        let rebuilt = RocksDbStorage::build_stored_event("override", 2, 99, decoded);
+
+        assert_eq!(rebuilt.sequence, 99);
+        assert_eq!(rebuilt.topic, "override");
+        assert_eq!(rebuilt.partition, 2);
+        assert_eq!(rebuilt.payload, legacy.payload);
+        assert_eq!(rebuilt.timestamp_ms, legacy.timestamp_ms);
+        assert_eq!(rebuilt.idempotency_key, legacy.idempotency_key);
+    }
+
+    #[test]
+    fn parse_sequence_from_key_bytes() {
+        let key = RocksDbStorage::event_key("topic", 3, 0x1a2b);
+        let prefix = RocksDbStorage::event_prefix_bytes("topic", 3);
+        let seq = RocksDbStorage::parse_sequence_from_key_bytes(prefix.len(), key.as_bytes())
+            .expect("sequence should parse");
+        assert_eq!(seq, 0x1a2b);
     }
 
     #[test]

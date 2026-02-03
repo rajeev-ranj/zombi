@@ -24,6 +24,9 @@ All notable changes to Zombi are documented here.
   - A/B tested on t3.micro: +4.3% throughput, −15.9% p99 latency at c=500
   - No regression on bulk write path (bypasses combiner)
 
+- **Bulk Protobuf Support** (Issue #85)
+  - `POST /tables/{table}/bulk` accepts `application/x-protobuf`
+
 - **Monitoring Infrastructure**
   - `docker-compose.monitoring.yml` - Full observability stack (Zombi + MinIO + Prometheus + Grafana)
   - Prometheus scrape configuration
@@ -38,6 +41,11 @@ All notable changes to Zombi are documented here.
 - **Column Statistics** - Iceberg `lower_bounds`/`upper_bounds` populated in DataFile manifests
   - Enables query engines (Spark, Trino, DuckDB) to skip files during planning
   - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
+
+### Changed
+- RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
+  - New binaries can read legacy values.
+  - Older binaries cannot read newly written values.
 
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
