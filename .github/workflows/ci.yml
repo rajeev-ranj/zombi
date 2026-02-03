@@ -315,14 +315,46 @@ jobs:
 
           echo "✅ PR description check complete"
 
-  # Benchmark regression check - opt-in via label or keyword
-  # To trigger: add 'performance' label OR include '[benchmark]' in PR title/body
+  # Detect performance-sensitive changes (used to gate benchmark regression checks)
+  perf-changes:
+    name: Perf Change Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      perf: ${{ steps.filter.outputs.perf }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect performance-sensitive changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            perf:
+              - 'src/api/**'
+              - 'src/storage/**'
+              - 'src/flusher/**'
+              - 'src/metrics/**'
+              - 'src/contracts/**'
+              - 'src/main.rs'
+              - 'benches/**'
+              - 'proto/**'
+              - 'build.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  # Benchmark regression check - auto for perf-sensitive changes, or opt-in via label/keyword
+  # To trigger manually: add 'performance' label OR include '[benchmark]' in PR title/body
   bench-regression:
     name: Benchmark Regression Check
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: perf-changes
     if: |
       github.event_name == 'pull_request' && (
+        needs.perf-changes.outputs.perf == 'true' ||
         contains(github.event.pull_request.labels.*.name, 'performance') ||
         contains(github.event.pull_request.title, '[benchmark]') ||
         contains(github.event.pull_request.body, '[benchmark]')
