@@ -39,6 +39,11 @@ All notable changes to Zombi are documented here.
   - Enables query engines (Spark, Trino, DuckDB) to skip files during planning
   - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
 
+### Changed
+- RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
+  - New binaries can read legacy values.
+  - Older binaries cannot read newly written values.
+
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 
