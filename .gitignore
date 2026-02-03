@@ -91,6 +91,7 @@ results/
 
 # Research/draft docs
 docs/spectre/
+docs/architecture-review.md
 
 # Logs and debug
 debug/
