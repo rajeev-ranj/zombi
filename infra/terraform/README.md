@@ -18,6 +18,12 @@ terraform apply \
 
 Outputs include the EC2 public IP and S3 bucket name.
 
+## Storage and Sizing
+
+For gp2 → gp3 migration steps and instance sizing recommendations, see:
+
+- `docs/aws/GP2_TO_GP3_MIGRATION.md`
+
 ## Test
 
 ```bash
