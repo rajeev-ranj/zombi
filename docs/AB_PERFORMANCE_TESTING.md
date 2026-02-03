@@ -17,7 +17,7 @@
 6. [Collecting & Comparing Results](#6-collecting--comparing-results)
 7. [Lessons Learned / Pitfalls](#7-lessons-learned--pitfalls)
 8. [Results Template](#8-results-template)
-9. [Reference: Write Combiner A/B Results (January 2026)](#9-reference-write-combiner-ab-results-january-2026)
+9. [Reference: Write Combiner A/B Results — January 2026](#9-reference-write-combiner-ab-results--january-2026)
 
 ---
 
@@ -571,7 +571,7 @@ Copy this template for recording A/B test results:
 
 ---
 
-## 9. Reference: Write Combiner A/B Results (January 2026)
+## 9. Reference: Write Combiner A/B Results — January 2026
 
 This section documents the actual A/B test results from the write combiner
 feature (Issue #86, PR #94) as a worked example of this methodology.
