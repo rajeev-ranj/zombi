@@ -50,12 +50,14 @@ All notable changes to Zombi are documented here.
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 
+### Changed
+- **WAL enabled by default** — `ZOMBI_ROCKSDB_WAL_ENABLED` now defaults to `true` for crash-safe durability (set `false` to opt out)
+
 ### Planned
 - **P0 Correctness Hardening**
   - Hour-boundary flush splitting
   - Persist flush watermarks (restart-safe)
   - Delete hot data after Iceberg commit (bounded hot buffer)
-  - Enable WAL by default (explicit performance opt-out)
   - Table name validation for safe keys/S3 paths
 - **P1 Iceberg-Native Interfaces**
   - Iceberg REST Catalog API (server-side)

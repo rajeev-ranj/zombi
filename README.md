@@ -187,11 +187,8 @@ See [tools/README.md](tools/README.md) for more options.
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | `300` | Flush interval in seconds |
 | `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | `10000` | Min events before flushing |
 | `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | `128` | Target Parquet file size |
-| `ZOMBI_ROCKSDB_WAL_ENABLED` | `false` | `false` | Enable WAL for durability (recommended `true` in production) |
+| `ZOMBI_ROCKSDB_WAL_ENABLED` | `true` | `true` | Enable WAL for durability (set `false` for max throughput at risk of data loss on crash) |
 | `RUST_LOG` | `zombi=info` | `zombi=info` | Log level |
-
-**Durability note:** production deployments should enable WAL explicitly today (`ZOMBI_ROCKSDB_WAL_ENABLED=true`).
-The default will be flipped to `true` as part of the P0 durability hardening.
 
 ## Documentation
 

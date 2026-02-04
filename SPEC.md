@@ -269,8 +269,8 @@ See API section for full parameter reference.
 - `ZOMBI_FLUSH_BATCH_SIZE` is advisory only and currently unused in flush logic.
   Use `ZOMBI_FLUSH_MAX_SEGMENT` or `ZOMBI_TARGET_FILE_SIZE_MB` to control batching.
 - `ZOMBI_ROCKSDB_WAL_ENABLED` controls WAL usage for event writes and consumer offset commits.
-- WAL is recommended for durability. Disabling WAL (current default) is a performance mode
-  with potential data loss on crash. The default will flip to `true` as part of P0 hardening.
+- WAL is enabled by default for durability. Disabling WAL (`ZOMBI_ROCKSDB_WAL_ENABLED=false`) is a
+  performance mode with potential data loss on crash.
 - **(Planned — P0)** Flush watermarks will be persisted in RocksDB per (topic, partition) to prevent duplicate Iceberg writes on restart.
 - **(Planned — P0)** Hot data will be deleted after successful Iceberg commit, with an optional retention window for in-flight reads.
 - RocksDB tuning env vars (defaults in parentheses): `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` (64),
@@ -674,7 +674,7 @@ and **not** required for v1 of the ingestion-gateway identity.
 | `ZOMBI_MAX_CONCURRENT_S3_UPLOADS` | `4` | Max concurrent S3 uploads |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `300` | Flush interval (Iceberg mode) |
 | `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per flush segment |
-| `ZOMBI_ROCKSDB_WAL_ENABLED` | `false` | Enable WAL for durability (P0: default will flip to `true`) |
+| `ZOMBI_ROCKSDB_WAL_ENABLED` | `true` | Enable WAL for durability (set `false` for max throughput) |
 | **Catalog** |
 | `ZOMBI_CATALOG_URL` | - | REST catalog URL |
 | `ZOMBI_CATALOG_NAMESPACE` | `zombi` | Iceberg namespace |
