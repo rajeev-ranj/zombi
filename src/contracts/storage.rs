@@ -129,6 +129,19 @@ pub trait HotStorage: Send + Sync {
             .take(limit)
             .collect())
     }
+
+    /// Saves the flush watermark for a topic/partition.
+    /// The flush watermark tracks the last sequence number successfully flushed to cold storage.
+    fn save_flush_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        watermark: u64,
+    ) -> Result<(), StorageError>;
+
+    /// Loads the flush watermark for a topic/partition.
+    /// Returns 0 if no watermark has been persisted.
+    fn load_flush_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError>;
 }
 
 /// Specifies which columns to read from cold storage.

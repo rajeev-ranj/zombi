@@ -8,10 +8,10 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::contracts::{
-    ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError,
+    ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError, StoredEvent,
 };
 use crate::metrics::{FlushMetrics, IcebergMetrics};
-use crate::storage::CatalogClient;
+use crate::storage::{derive_partition_columns, CatalogClient};
 
 /// Configuration for the background flusher.
 #[derive(Debug, Clone)]
@@ -119,6 +119,9 @@ where
     C: ColdStorage + 'static,
 {
     /// Creates a new background flusher.
+    ///
+    /// Loads persisted flush watermarks from hot storage so the flusher
+    /// resumes from the last committed position after a restart.
     pub fn new(
         hot_storage: Arc<H>,
         cold_storage: Arc<C>,
@@ -126,11 +129,49 @@ where
         flush_metrics: Arc<FlushMetrics>,
         iceberg_metrics: Arc<IcebergMetrics>,
     ) -> Self {
+        // Load persisted flush watermarks from hot storage
+        let watermarks = {
+            let mut wm = HashMap::new();
+            match Self::list_topic_partitions(hot_storage.as_ref()) {
+                Ok(topics) => {
+                    for (topic, partition) in topics {
+                        match hot_storage.load_flush_watermark(&topic, partition) {
+                            Ok(watermark) if watermark > 0 => {
+                                tracing::info!(
+                                    topic = %topic,
+                                    partition = partition,
+                                    watermark = watermark,
+                                    "Restored flush watermark from storage"
+                                );
+                                wm.insert((topic, partition), watermark);
+                            }
+                            Ok(_) => {} // No persisted watermark (new partition)
+                            Err(e) => {
+                                tracing::warn!(
+                                    topic = %topic,
+                                    partition = partition,
+                                    error = %e,
+                                    "Failed to load flush watermark, starting from 0"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to list topics for watermark restoration, starting fresh"
+                    );
+                }
+            }
+            Arc::new(RwLock::new(wm))
+        };
+
         Self {
             hot_storage,
             cold_storage,
             config,
-            watermarks: Arc::new(RwLock::new(HashMap::new())),
+            watermarks,
             shutdown: Arc::new(AtomicBool::new(false)),
             flush_notify: Arc::new(Notify::new()),
             task_handle: RwLock::new(None),
@@ -242,28 +283,53 @@ where
             return Ok((0, watermark, 0));
         }
 
-        let events_count = events.len();
-        let new_watermark = events.last().map(|e| e.sequence).unwrap_or(watermark);
+        // Group events by (event_date, event_hour) for correct Iceberg partitioning.
+        // BTreeMap iterates in (date, hour) order, ensuring chronological segment writes.
+        let mut hour_groups: std::collections::BTreeMap<(i32, i32), Vec<StoredEvent>> =
+            std::collections::BTreeMap::new();
 
-        // Calculate bytes flushed (payload + metadata overhead)
-        let bytes_flushed: usize = events.iter().map(|e| e.payload.len() + 64).sum();
+        for event in events {
+            let key = if iceberg_enabled {
+                derive_partition_columns(event.timestamp_ms)
+            } else {
+                (0, 0) // Non-Iceberg: single group, no splitting
+            };
+            hour_groups.entry(key).or_default().push(event);
+        }
 
-        // Write to cold storage
-        cold_storage
-            .write_segment(topic, partition, &events)
-            .await?;
+        let mut total_events_count = 0usize;
+        let mut total_bytes_flushed = 0usize;
+        let mut max_watermark = watermark;
+        let num_segments = hour_groups.len();
+
+        for ((_date, _hour), group_events) in &hour_groups {
+            let group_count = group_events.len();
+            let group_bytes: usize = group_events.iter().map(|e| e.payload.len() + 64).sum();
+            let group_max_seq = group_events.last().map(|e| e.sequence).unwrap_or(watermark);
+
+            cold_storage
+                .write_segment(topic, partition, group_events)
+                .await?;
+
+            total_events_count += group_count;
+            total_bytes_flushed += group_bytes;
+            if group_max_seq > max_watermark {
+                max_watermark = group_max_seq;
+            }
+        }
 
         tracing::info!(
             topic = topic,
             partition = partition,
-            events = events_count,
-            bytes = bytes_flushed,
-            new_watermark = new_watermark,
+            events = total_events_count,
+            bytes = total_bytes_flushed,
+            segments = num_segments,
+            new_watermark = max_watermark,
             iceberg_enabled = iceberg_enabled,
             "Flushed events to cold storage"
         );
 
-        Ok((events_count, new_watermark, bytes_flushed))
+        Ok((total_events_count, max_watermark, total_bytes_flushed))
     }
 }
 
@@ -322,6 +388,9 @@ where
 
                 // Collect unique topics for snapshot commit
                 let mut flushed_topics = std::collections::HashSet::new();
+                // Track watermark updates pending persistence (deferred until snapshot commit)
+                let mut pending_watermark_persists: HashMap<String, Vec<(u32, u64)>> =
+                    HashMap::new();
 
                 // Use FuturesUnordered for pipelined S3 uploads
                 let mut flush_futures: FuturesUnordered<_> = FuturesUnordered::new();
@@ -384,6 +453,29 @@ where
                                         if let Ok(mut w) = watermarks.write() {
                                             w.insert((topic.clone(), partition), new_watermark);
                                         }
+
+                                        if iceberg_enabled {
+                                            // Defer persistence until after snapshot commit
+                                            pending_watermark_persists
+                                                .entry(topic.clone())
+                                                .or_default()
+                                                .push((partition, new_watermark));
+                                        } else {
+                                            // Non-Iceberg: persist immediately
+                                            if let Err(e) = hot_storage.save_flush_watermark(
+                                                &topic,
+                                                partition,
+                                                new_watermark,
+                                            ) {
+                                                tracing::error!(
+                                                    topic = %topic,
+                                                    partition = partition,
+                                                    error = %e,
+                                                    "Failed to persist flush watermark"
+                                                );
+                                            }
+                                        }
+
                                         flushed_topics.insert(topic);
                                     }
                                 }
@@ -419,6 +511,25 @@ where
                                 if let Ok(mut w) = watermarks.write() {
                                     w.insert((topic.clone(), partition), new_watermark);
                                 }
+
+                                if iceberg_enabled {
+                                    pending_watermark_persists
+                                        .entry(topic.clone())
+                                        .or_default()
+                                        .push((partition, new_watermark));
+                                } else if let Err(e) = hot_storage.save_flush_watermark(
+                                    &topic,
+                                    partition,
+                                    new_watermark,
+                                ) {
+                                    tracing::error!(
+                                        topic = %topic,
+                                        partition = partition,
+                                        error = %e,
+                                        "Failed to persist flush watermark"
+                                    );
+                                }
+
                                 flushed_topics.insert(topic);
                             }
                         }
@@ -517,6 +628,24 @@ where
                                             }
                                         }
                                     }
+
+                                    // Persist flush watermarks now that the snapshot is committed
+                                    if let Some(partitions) =
+                                        pending_watermark_persists.remove(&topic)
+                                    {
+                                        for (partition, wm) in partitions {
+                                            if let Err(e) = hot_storage
+                                                .save_flush_watermark(&topic, partition, wm)
+                                            {
+                                                tracing::error!(
+                                                    topic = %topic,
+                                                    partition = partition,
+                                                    error = %e,
+                                                    "Failed to persist flush watermark after snapshot"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                                 Ok(None) => {
                                     tracing::debug!(
@@ -581,6 +710,7 @@ where
         let mut total_segments = 0;
         let mut max_watermark = 0u64;
         let mut flushed_topics = std::collections::HashSet::new();
+        let mut pending_watermark_persists: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
 
         for (topic, partition) in topics_to_flush {
             let current_watermark = self
@@ -623,7 +753,27 @@ where
                 self.watermarks
                     .write()
                     .map_lock_err()?
-                    .insert((topic, partition), new_watermark);
+                    .insert((topic.clone(), partition), new_watermark);
+
+                if self.config.iceberg_enabled {
+                    pending_watermark_persists
+                        .entry(topic)
+                        .or_default()
+                        .push((partition, new_watermark));
+                } else {
+                    // Non-Iceberg: persist immediately
+                    if let Err(e) =
+                        self.hot_storage
+                            .save_flush_watermark(&topic, partition, new_watermark)
+                    {
+                        tracing::error!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Failed to persist flush watermark"
+                        );
+                    }
+                }
 
                 if new_watermark > max_watermark {
                     max_watermark = new_watermark;
@@ -647,6 +797,22 @@ where
                                 bytes = stats.total_bytes,
                                 "Force-committed Iceberg snapshot on flush_now"
                             );
+
+                            // Persist flush watermarks after successful snapshot
+                            if let Some(partitions) = pending_watermark_persists.remove(&topic) {
+                                for (partition, wm) in partitions {
+                                    if let Err(e) =
+                                        self.hot_storage.save_flush_watermark(&topic, partition, wm)
+                                    {
+                                        tracing::error!(
+                                            topic = %topic,
+                                            partition = partition,
+                                            error = %e,
+                                            "Failed to persist flush watermark after snapshot"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -713,6 +879,7 @@ mod tests {
     #[derive(Default)]
     struct TestHotStorage {
         events: HashMap<(String, u32), Vec<StoredEvent>>,
+        flush_watermarks: Mutex<HashMap<(String, u32), u64>>,
     }
 
     impl TestHotStorage {
@@ -848,11 +1015,38 @@ mod tests {
         ) -> Result<Vec<StoredEvent>, StorageError> {
             Ok(Vec::new())
         }
+
+        fn save_flush_watermark(
+            &self,
+            topic: &str,
+            partition: u32,
+            watermark: u64,
+        ) -> Result<(), StorageError> {
+            let mut wm = self
+                .flush_watermarks
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            wm.insert((topic.to_string(), partition), watermark);
+            Ok(())
+        }
+
+        fn load_flush_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+            let wm = self
+                .flush_watermarks
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            Ok(wm
+                .get(&(topic.to_string(), partition))
+                .copied()
+                .unwrap_or(0))
+        }
     }
 
     #[derive(Default)]
     struct TestColdStorage {
-        writes: Mutex<Vec<(String, u32, usize)>>,
+        writes: Mutex<Vec<(String, u32, Vec<StoredEvent>)>>,
+        /// If set, the Nth write_segment call (0-indexed) will fail.
+        fail_on_call: Mutex<Option<usize>>,
     }
 
     impl ColdStorage for TestColdStorage {
@@ -866,8 +1060,16 @@ mod tests {
                 .writes
                 .lock()
                 .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
-            writes.push((topic.to_string(), partition, events.len()));
-            Ok("segment-1".to_string())
+            let call_index = writes.len();
+            let fail_on = self
+                .fail_on_call
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            if *fail_on == Some(call_index) {
+                return Err(StorageError::S3("injected failure".into()));
+            }
+            writes.push((topic.to_string(), partition, events.to_vec()));
+            Ok(format!("segment-{}", call_index))
         }
 
         async fn read_events(
@@ -951,6 +1153,371 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, "events");
         assert_eq!(writes[0].1, 0);
-        assert_eq!(writes[0].2, 2);
+        assert_eq!(writes[0].2.len(), 2);
+    }
+
+    // --- Hour-boundary splitting tests (Issue #98) ---
+
+    // 2024-01-15 00:00:00 UTC
+    const TS_HOUR_0_START: i64 = 1705276800000;
+    // 2024-01-15 00:30:00 UTC
+    const TS_HOUR_0_MID: i64 = 1705278600000;
+    // 2024-01-15 00:59:59.999 UTC
+    const TS_HOUR_0_END: i64 = 1705280399999;
+    // 2024-01-15 01:00:00 UTC
+    const TS_HOUR_1_START: i64 = 1705280400000;
+    // 2024-01-15 01:30:00 UTC
+    const TS_HOUR_1_MID: i64 = 1705282200000;
+    // 2024-01-15 02:00:00 UTC
+    const TS_HOUR_2_START: i64 = 1705284000000;
+
+    fn make_event(seq: u64, ts: i64) -> StoredEvent {
+        StoredEvent {
+            sequence: seq,
+            topic: "events".into(),
+            partition: 0,
+            payload: vec![seq as u8],
+            timestamp_ms: ts,
+            idempotency_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_splits_events_at_hour_boundary() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_0_MID),
+                make_event(3, TS_HOUR_1_START),
+                make_event(4, TS_HOUR_1_MID),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 4);
+        assert_eq!(result.new_watermark, 4);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2, "Expected 2 segments (one per hour)");
+        assert_eq!(writes[0].2.len(), 2, "Hour 0 should have 2 events");
+        assert_eq!(writes[1].2.len(), 2, "Hour 1 should have 2 events");
+    }
+
+    #[tokio::test]
+    async fn flush_single_hour_no_split() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_0_MID),
+                make_event(3, TS_HOUR_0_END),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 3);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "All events in same hour, no split");
+        assert_eq!(writes[0].2.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn flush_exact_boundary_goes_to_new_hour() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_END),   // 00:59:59.999 → hour 0
+                make_event(2, TS_HOUR_1_START), // 01:00:00.000 → hour 1
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 2);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2, "Exact boundary splits into 2 segments");
+        assert_eq!(writes[0].2[0].timestamp_ms, TS_HOUR_0_END);
+        assert_eq!(writes[1].2[0].timestamp_ms, TS_HOUR_1_START);
+    }
+
+    #[tokio::test]
+    async fn flush_preserves_sequence_order_within_hour() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_0_MID),
+                make_event(3, TS_HOUR_0_END),
+                make_event(4, TS_HOUR_1_START),
+                make_event(5, TS_HOUR_1_MID),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.flush_now().await.unwrap();
+
+        let writes = cold.writes.lock().unwrap();
+        // Verify sequence order within each hour group
+        for write in writes.iter() {
+            for window in write.2.windows(2) {
+                assert!(
+                    window[0].sequence < window[1].sequence,
+                    "Sequences must be strictly ascending within an hour group"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_hour_split_fails_fast_on_segment_error() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        *cold.fail_on_call.lock().unwrap() = Some(1); // Fail on second write
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await;
+        assert!(result.is_err(), "Should fail when a segment write fails");
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "Only the first segment should have been written"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_non_iceberg_does_not_split() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+                make_event(3, TS_HOUR_2_START),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig::default(); // iceberg_enabled = false
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 3);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "Non-Iceberg mode should not split by hour");
+        assert_eq!(writes[0].2.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn flush_three_hours_produces_three_segments() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+                make_event(3, TS_HOUR_2_START),
+            ],
+        );
+
+        let cold = Arc::new(TestColdStorage::default());
+        let mut config = FlusherConfig::default();
+        config.iceberg_enabled = true;
+        let flusher = BackgroundFlusher::new(
+            Arc::new(hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 3);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 3, "3 hours should produce 3 segments");
+        for write in writes.iter() {
+            assert_eq!(write.2.len(), 1, "Each hour has 1 event");
+        }
+    }
+
+    // --- Watermark persistence tests (Issue #99) ---
+
+    #[tokio::test]
+    async fn flush_watermark_persisted_in_non_iceberg_mode() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![make_event(1, TS_HOUR_0_START), make_event(2, TS_HOUR_0_MID)],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig::default(); // iceberg_enabled = false
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 2);
+        assert_eq!(result.new_watermark, 2);
+
+        // Watermark should be persisted in hot storage
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_watermark_restored_on_new_flusher() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_0_MID),
+                make_event(3, TS_HOUR_0_END),
+            ],
+        );
+        // Simulate a previously persisted watermark at sequence 1
+        hot.save_flush_watermark("events", 0, 1).unwrap();
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig::default();
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        // Flusher should resume from watermark 1, only flushing events 2 and 3
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 2);
+        assert_eq!(result.new_watermark, 3);
+
+        let writes = cold.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].2.len(),
+            2,
+            "Should only flush events after watermark"
+        );
+        assert_eq!(writes[0].2[0].sequence, 2);
+        assert_eq!(writes[0].2[1].sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn flush_watermark_not_advanced_on_error() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![make_event(1, TS_HOUR_0_START), make_event(2, TS_HOUR_0_MID)],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        *cold.fail_on_call.lock().unwrap() = Some(0); // Fail on first write
+        let config = FlusherConfig::default();
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await;
+        assert!(result.is_err());
+
+        // Watermark should NOT be persisted (remained at 0)
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 0);
     }
 }

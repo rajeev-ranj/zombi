@@ -21,6 +21,8 @@ const HWM_PREFIX: &str = "hwm";
 const CONSUMER_PREFIX: &str = "consumer";
 /// Key prefix for timestamp index (for O(1) time-based queries)
 const TIMESTAMP_INDEX_PREFIX: &str = "ts";
+/// Key prefix for flush watermarks (flusher progress tracking)
+const FLUSH_WM_PREFIX: &str = "flush_wm";
 const EVENT_VALUE_MAGIC: &[u8; 4] = b"ZEV1";
 const KB: usize = 1024;
 const MB: usize = 1024 * 1024;
@@ -1105,6 +1107,27 @@ impl HotStorage for RocksDbStorage {
 
         Ok(events)
     }
+
+    fn save_flush_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        watermark: u64,
+    ) -> Result<(), StorageError> {
+        let key = format!("{}:{}:{}", FLUSH_WM_PREFIX, topic, partition);
+        self.db
+            .put_opt(
+                key.as_bytes(),
+                watermark.to_be_bytes(),
+                &self.write_options(),
+            )
+            .map_err(|e| StorageError::RocksDb(e.to_string()))
+    }
+
+    fn load_flush_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+        let key = format!("{}:{}:{}", FLUSH_WM_PREFIX, topic, partition);
+        Ok(self.get_u64(&key)?.unwrap_or(0))
+    }
 }
 
 impl RocksDbStorage {
@@ -1776,5 +1799,42 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(dir.path()).unwrap();
         assert!(storage.wal_enabled);
+    }
+
+    mod flush_watermark_tests {
+        use super::*;
+
+        #[test]
+        fn save_and_load_flush_watermark() {
+            let (storage, _dir) = create_test_storage();
+            // Initially 0
+            assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 0);
+            // Save
+            storage.save_flush_watermark("events", 0, 42).unwrap();
+            assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 42);
+            // Update
+            storage.save_flush_watermark("events", 0, 100).unwrap();
+            assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 100);
+            // Different partition is isolated
+            assert_eq!(storage.load_flush_watermark("events", 1).unwrap(), 0);
+            // Different topic is isolated
+            assert_eq!(storage.load_flush_watermark("other", 0).unwrap(), 0);
+        }
+
+        #[test]
+        fn flush_watermark_survives_reopen() {
+            let dir = TempDir::new().unwrap();
+            {
+                let storage = RocksDbStorage::open(dir.path()).unwrap();
+                storage.save_flush_watermark("events", 0, 55).unwrap();
+                storage.save_flush_watermark("events", 1, 77).unwrap();
+            }
+            {
+                let storage = RocksDbStorage::open(dir.path()).unwrap();
+                assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 55);
+                assert_eq!(storage.load_flush_watermark("events", 1).unwrap(), 77);
+            }
+        }
+    }
     }
 }

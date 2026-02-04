@@ -989,15 +989,11 @@ async fn mixed_hot_cold_recovery() {
     }
 }
 
-/// Test that flush watermark resets to zero after restart.
+/// Test that flush watermark survives restart (persisted in RocksDB).
 ///
-/// This test documents the EXPECTED behavior that flush watermarks are
-/// volatile (in-memory HashMap). On restart, watermarks reset to 0.
-/// This is a known limitation, not a bug.
-///
-/// Implication: After restart, the flusher may re-flush events that were
-/// already flushed. This is safe (idempotent) but may cause duplicate
-/// segments in cold storage.
+/// This verifies INV-8: Flush watermarks survive restart. In non-Iceberg mode,
+/// watermarks are persisted immediately after successful flush. On restart,
+/// the flusher resumes from the persisted watermark, avoiding duplicate flushes.
 #[tokio::test]
 async fn flush_watermark_starts_at_zero_after_restart() {
     let hot_dir = TempDir::new().unwrap();
@@ -1060,14 +1056,18 @@ async fn flush_watermark_starts_at_zero_after_restart() {
             .await
             .expect("watermark should be readable");
 
-        // This documents EXPECTED behavior: watermark is volatile
+        // INV-8: Flush watermarks persist across restarts
         assert_eq!(
-            watermark_after, 0,
-            "Flush watermark should reset to 0 after restart (watermark is volatile)"
+            watermark_after, watermark_before,
+            "Flush watermark should survive restart (persisted in RocksDB)"
         );
 
-        // Consequence: flushing again would re-flush all events
-        // This is safe due to idempotent segment naming in S3/Iceberg
+        // Consequence: flushing again should not re-flush already-flushed events
+        let result = flusher.flush_now().await.expect("flush should succeed");
+        assert_eq!(
+            result.events_flushed, 0,
+            "No events should be re-flushed after restart"
+        );
     }
 }
 
