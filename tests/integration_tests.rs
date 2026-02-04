@@ -1587,3 +1587,51 @@ async fn test_combiner_metrics_in_prometheus_output() {
     assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"1\"}"));
     assert!(body_str.contains("zombi_write_combiner_queue_depth_total"));
 }
+
+// ============================================================================
+// Hot-Only Read Tests (#102)
+// ============================================================================
+
+#[tokio::test]
+async fn test_read_with_cold_storage_returns_only_hot_data() {
+    let (app, _dir) = create_test_app_with_cold_storage();
+
+    // Write one event to hot storage
+    let app_clone = app.clone();
+    let write_resp = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "hot-only-event", "partition": 0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write_resp.status(), StatusCode::ACCEPTED);
+
+    // Read back — should only contain the hot event (NoopColdStorage returns nothing,
+    // but the handler no longer queries cold storage at all)
+    let read_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tables/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(read_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["records"][0]["payload"], "hot-only-event");
+}
