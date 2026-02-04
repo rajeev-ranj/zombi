@@ -13,3 +13,10 @@ scrape_configs:
         labels:
           service: 'zombi'
           environment: 'docker'
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node'
+          environment: 'docker'

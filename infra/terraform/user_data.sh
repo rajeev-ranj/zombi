@@ -48,6 +48,59 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
+########################################
+# Monitoring Stack: Prometheus + node_exporter
+# (Grafana runs locally on the developer's machine)
+########################################
+echo "Setting up monitoring stack..."
+
+# Create monitoring directory
+mkdir -p /opt/monitoring
+
+# Write Prometheus config (scrapes Zombi + node_exporter on localhost)
+cat > /opt/monitoring/prometheus.yml << 'PROMCFG'
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'zombi'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['localhost:8080']
+        labels:
+          service: 'zombi'
+          environment: 'ec2'
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+        labels:
+          service: 'node'
+          environment: 'ec2'
+PROMCFG
+
+# Start node_exporter (host metrics)
+echo "Starting node_exporter..."
+/usr/bin/docker run -d --name node-exporter \
+  --restart always \
+  --network host \
+  --pid host \
+  -v /:/host:ro,rslave \
+  prom/node-exporter:v1.7.0 \
+  --path.rootfs=/host
+
+# Start Prometheus
+echo "Starting Prometheus..."
+/usr/bin/docker run -d --name prometheus \
+  --restart always \
+  --network host \
+  -v /opt/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+  prom/prometheus:v2.47.0 \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.retention.time=2d \
+  --web.listen-address=:9090
+
 # Create benchmark script
 cat > /opt/run_benchmark.sh << 'BENCHMARK'
 #!/bin/bash

@@ -17,6 +17,7 @@
 #   bandwidth-sweep - Full bandwidth sweep across configurations (~45 min)
 #   sustained    - 10-minute sustained peak test with resource monitoring (~12 min)
 #   sustained-20 - 20-minute sustained peak test with resource monitoring (~22 min)
+#   baseline     - Full baseline: peak + sustained + scenarios from separate load gen (~75 min)
 #
 # Instance Types (for bandwidth testing, use larger instances):
 #   t3.micro   - 2 vCPU, 1GB RAM, up to 5 Gbps (default, free tier)
@@ -40,7 +41,11 @@ MODE="${1:-quick}"
 CLEANUP="${2:-yes}"
 INSTANCE_TYPE="${3:-t3.micro}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="$SCRIPT_DIR/results/aws_${MODE}_${INSTANCE_TYPE}_$TIMESTAMP"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BRANCH=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '~')
+COMMIT=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GIT_DIRTY=$(git -C "$REPO_ROOT" diff --quiet 2>/dev/null && echo "false" || echo "true")
+RESULTS_DIR="$SCRIPT_DIR/results/${BRANCH}/${TIMESTAMP}"
 
 # Get instance specs for display
 get_instance_spec() {
@@ -56,13 +61,71 @@ get_instance_spec() {
 }
 
 SPEC=$(get_instance_spec "$INSTANCE_TYPE")
+TUNNEL_PID_FILE="/tmp/zombi-prometheus-tunnel.pid"
+
+# Start local Grafana with SSH-tunneled Prometheus from EC2
+start_local_grafana() {
+    local server_ip="$1"
+    local ssh_key="$2"
+
+    echo ""
+    echo "=========================================="
+    echo "Starting local Grafana..."
+    echo "=========================================="
+
+    # Kill any existing tunnel/grafana from previous runs
+    stop_local_grafana 2>/dev/null || true
+
+    # Open SSH tunnel for Prometheus (background, no shell)
+    echo "Opening SSH tunnel for Prometheus (localhost:9090 -> EC2:9090)..."
+    ssh -i "$ssh_key" -o StrictHostKeyChecking=no \
+        -L 9090:localhost:9090 -f -N ubuntu@"$server_ip"
+    # Find the tunnel PID
+    pgrep -f "ssh.*-L 9090:localhost:9090.*$server_ip" > "$TUNNEL_PID_FILE" 2>/dev/null
+
+    # Start local Grafana container with AWS datasource + dashboards
+    echo "Starting Grafana container..."
+    docker run -d --name zombi-grafana -p 3000:3000 \
+        -e GF_AUTH_ANONYMOUS_ENABLED=true \
+        -e GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer \
+        -v "$REPO_ROOT/infra/monitoring/grafana/provisioning/datasources/aws.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro" \
+        -v "$REPO_ROOT/infra/monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro" \
+        grafana/grafana:10.2.0
+
+    # Wait for Grafana health
+    echo "Waiting for Grafana..."
+    for i in $(seq 1 30); do
+        if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+            echo "Grafana is ready at http://localhost:3000"
+            break
+        fi
+        sleep 2
+    done
+}
+
+# Stop local Grafana and SSH tunnel
+stop_local_grafana() {
+    echo "Stopping local Grafana..."
+    docker rm -f zombi-grafana 2>/dev/null || true
+
+    if [ -f "$TUNNEL_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$TUNNEL_PID_FILE")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$TUNNEL_PID_FILE"
+    fi
+    # Also kill any orphaned tunnels
+    pkill -f "ssh.*-L 9090:localhost:9090" 2>/dev/null || true
+}
 
 echo "=========================================="
 echo "Zombi AWS Performance Test"
 echo "=========================================="
 echo "Mode: $MODE"
 echo "Instance type: $INSTANCE_TYPE ($SPEC)"
+echo "Branch: $BRANCH (${COMMIT}${GIT_DIRTY:+, dirty})"
 echo "Cleanup: $CLEANUP"
+echo "Results: $RESULTS_DIR"
 echo ""
 
 # Warn about cost for larger instances
@@ -79,15 +142,32 @@ mkdir -p "$RESULTS_DIR"
 echo "Deploying infrastructure..."
 cd "$TF_DIR"
 terraform init -upgrade > /dev/null 2>&1
-terraform apply -auto-approve -var="instance_type=$INSTANCE_TYPE"
+
+if [ "$MODE" = "baseline" ]; then
+    terraform apply -auto-approve \
+      -var="instance_type=$INSTANCE_TYPE" \
+      -var="enable_loadgen=true" \
+      -var="loadgen_instance_type=t3.micro"
+else
+    terraform apply -auto-approve -var="instance_type=$INSTANCE_TYPE"
+fi
 
 # Get outputs
 IP=$(terraform output -raw instance_public_ip)
 S3_BUCKET=$(terraform output -raw s3_bucket)
 SSH_KEY="${SSH_KEY_PATH:-$HOME/.ssh/id_ed25519}"
 
-echo ""
-echo "EC2 Instance: $IP"
+if [ "$MODE" = "baseline" ]; then
+    LOADGEN_IP=$(terraform output -raw loadgen_public_ip)
+    SERVER_PRIV_IP=$(terraform output -raw server_private_ip)
+    echo ""
+    echo "EC2 Server: $IP"
+    echo "Load Generator: $LOADGEN_IP"
+    echo "Server Private IP: $SERVER_PRIV_IP"
+else
+    echo ""
+    echo "EC2 Instance: $IP"
+fi
 echo "S3 Bucket: $S3_BUCKET"
 echo "SSH Key: $SSH_KEY"
 
@@ -118,6 +198,9 @@ if [ "$HEALTHY" != "true" ]; then
     echo "Check EC2 logs: ssh -i $SSH_KEY ubuntu@$IP 'sudo journalctl -u docker'"
     exit 1
 fi
+
+# Start local Grafana with live metrics
+start_local_grafana "$IP" "$SSH_KEY"
 
 # Get initial stats
 echo ""
@@ -184,6 +267,30 @@ echo ""
 /opt/run_sustained_test.sh /opt/results 1200 bulk
 REMOTE
         ;;
+    baseline)
+        # Wait for load generator to be ready
+        echo ""
+        echo "Waiting for load generator to be ready..."
+        for i in $(seq 1 60); do
+            if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=5 ubuntu@"$LOADGEN_IP" \
+                "test -f /opt/run_baseline.sh" 2>/dev/null; then
+                echo "Load generator is ready!"
+                break
+            fi
+            echo -n "."
+            sleep 5
+        done
+
+        # Run baseline from load generator
+        echo ""
+        echo "Running BASELINE test from load generator ($LOADGEN_IP)..."
+        echo "This will take approximately 75 minutes."
+        echo ""
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+            ubuntu@"$LOADGEN_IP" \
+            "source /opt/zombi_env.sh && export ZOMBI_S3_BUCKET='$S3_BUCKET' && /opt/run_baseline.sh"
+        ;;
     *)
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@"$IP" << REMOTE
 set -e
@@ -198,7 +305,11 @@ esac
 # Copy results back
 echo ""
 echo "Copying results from EC2..."
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -r ubuntu@"$IP":/opt/results/* "$RESULTS_DIR/" 2>/dev/null || true
+if [ "$MODE" = "baseline" ]; then
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -r ubuntu@"$LOADGEN_IP":/opt/results/* "$RESULTS_DIR/" 2>/dev/null || true
+else
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -r ubuntu@"$IP":/opt/results/* "$RESULTS_DIR/" 2>/dev/null || true
+fi
 
 # Display summary
 echo ""
@@ -207,7 +318,51 @@ echo "Results Summary"
 echo "=========================================="
 echo ""
 
-if [ "$MODE" = "comprehensive" ] && [ -f "$RESULTS_DIR/comprehensive_results.json" ]; then
+if [ "$MODE" = "baseline" ] && [ -f "$RESULTS_DIR/baseline_report.json" ]; then
+    # Display baseline results
+    python3 -c "
+import json
+with open('$RESULTS_DIR/baseline_report.json') as f:
+    d = json.load(f)
+
+print('BASELINE PERFORMANCE REPORT')
+print('=' * 50)
+
+# PERF checks
+for check_id in sorted(d.get('perf_checks', {}).keys()):
+    check = d['perf_checks'][check_id]
+    status = 'PASS' if check.get('pass') else 'FAIL'
+    print(f'  {check_id}: {status} - {check[\"metric\"]}: {check[\"actual\"]} {check[\"unit\"]} (baseline: {check[\"baseline\"]} {check[\"unit\"]})')
+
+# Burst-to-steady
+bts = d.get('burst_to_steady', {})
+if bts:
+    print()
+    print(f'Burst-to-Steady Degradation: {bts.get(\"degradation_pct\", 0):.1f}%')
+    print(f'  Burst avg: {bts.get(\"burst_phase_avg_req_per_sec\", 0):,.0f} req/s')
+    print(f'  Steady avg: {bts.get(\"steady_phase_avg_req_per_sec\", 0):,.0f} req/s')
+
+# Summary
+summary = d.get('summary', {})
+print()
+print(f'Overall: {summary.get(\"checks_passed\", 0)}/{summary.get(\"checks_total\", 0)} checks passed')
+
+# Phase results
+phases = d.get('phases', {})
+if 'phase1_peak_single' in phases:
+    ps = phases['phase1_peak_single']
+    print()
+    print(f'Peak Single Write: {ps.get(\"peak_throughput\", 0):,.0f} req/s, {ps.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
+if 'phase1_peak_bulk' in phases:
+    pb = phases['phase1_peak_bulk']
+    print(f'Peak Bulk Write: {pb.get(\"peak_events_per_sec\", 0):,.0f} ev/s, {pb.get(\"peak_mb_per_sec\", 0):.1f} MB/s')
+if 'phase2_sustained' in phases:
+    sus = phases['phase2_sustained']
+    perf = sus.get('performance', {})
+    print(f'Sustained: {perf.get(\"avg_events_per_sec\", 0):,.0f} ev/s avg over {sus.get(\"config\", {}).get(\"duration_secs\", 0)/60:.0f} min')
+" 2>/dev/null || echo "  (baseline results not found)"
+
+elif [ "$MODE" = "comprehensive" ] && [ -f "$RESULTS_DIR/comprehensive_results.json" ]; then
     # Display comprehensive results
     python3 -c "
 import json
@@ -451,25 +606,172 @@ else
     echo "  (stats file not found)"
 fi
 
+# Save git metadata to results
+python3 -c "
+import json, os
+meta = {
+    'git': {
+        'branch': '$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)',
+        'commit': '$COMMIT',
+        'dirty': $GIT_DIRTY
+    },
+    'instance_type': '$INSTANCE_TYPE',
+    'mode': '$MODE',
+    'timestamp': '$TIMESTAMP'
+}
+meta_path = os.path.join('$RESULTS_DIR', 'run_metadata.json')
+with open(meta_path, 'w') as f:
+    json.dump(meta, f, indent=2)
+" 2>/dev/null || true
+
+# Inject git metadata into baseline_report.json if it exists
+if [ -f "$RESULTS_DIR/baseline_report.json" ]; then
+    python3 -c "
+import json
+with open('$RESULTS_DIR/baseline_report.json') as f:
+    d = json.load(f)
+d['git'] = {
+    'branch': '$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)',
+    'commit': '$COMMIT',
+    'dirty': $GIT_DIRTY
+}
+d['instance_type'] = '$INSTANCE_TYPE'
+with open('$RESULTS_DIR/baseline_report.json', 'w') as f:
+    json.dump(d, f, indent=2)
+" 2>/dev/null || true
+fi
+
+# Compare results across branches
+compare_results() {
+    echo ""
+    echo "=========================================="
+    echo "Branch Comparison"
+    echo "=========================================="
+    python3 << 'COMPARE'
+import json, os, glob
+
+results_root = os.path.join(os.environ.get('SCRIPT_DIR', '.'), 'results')
+branches = {}
+
+# Find latest baseline_report.json per branch
+for branch_dir in sorted(glob.glob(os.path.join(results_root, '*'))):
+    if not os.path.isdir(branch_dir):
+        continue
+    branch_name = os.path.basename(branch_dir)
+    # Find latest timestamp directory with a baseline_report.json
+    for ts_dir in sorted(glob.glob(os.path.join(branch_dir, '*')), reverse=True):
+        report = os.path.join(ts_dir, 'baseline_report.json')
+        if os.path.isfile(report):
+            try:
+                with open(report) as f:
+                    branches[branch_name] = json.load(f)
+                break
+            except:
+                pass
+
+if len(branches) < 1:
+    print("  No baseline results found for comparison.")
+    exit(0)
+
+# Extract metrics
+metrics = []
+for name, data in branches.items():
+    checks = data.get('perf_checks', {})
+    phases = data.get('phases', {})
+    sus = phases.get('phase2_sustained', {}).get('performance', {})
+    m = {'branch': name}
+    for cid, c in checks.items():
+        m[cid] = c.get('actual', 'N/A')
+    m['sustained_evs'] = sus.get('avg_events_per_sec', 'N/A')
+    m['sustained_mbs'] = sus.get('avg_mb_per_sec', 'N/A')
+    metrics.append(m)
+
+# Print table
+branch_names = [m['branch'] for m in metrics]
+col_width = max(20, max(len(b) for b in branch_names) + 2)
+header = f"{'Metric':<30}" + "".join(f"{b:>{col_width}}" for b in branch_names)
+print(header)
+print("=" * len(header))
+
+rows = [
+    ('PERF-1 Single (req/s)', 'PERF-1'),
+    ('PERF-2 Bulk (ev/s)', 'PERF-2'),
+    ('PERF-3 Latency (us)', 'PERF-3'),
+    ('PERF-5 Click (ev/s)', 'PERF-5'),
+    ('Sustained avg (ev/s)', 'sustained_evs'),
+    ('Sustained MB/s', 'sustained_mbs'),
+]
+
+for label, key in rows:
+    vals = []
+    for m in metrics:
+        v = m.get(key, 'N/A')
+        if isinstance(v, (int, float)):
+            if 'Latency' in label or 'MB/s' in label:
+                vals.append(f"{v:.1f}")
+            else:
+                vals.append(f"{v:,.0f}")
+        else:
+            vals.append(str(v))
+    print(f"{label:<30}" + "".join(f"{v:>{col_width}}" for v in vals))
+
+# Save comparison to markdown
+md_path = os.path.join(results_root, 'comparison.md')
+with open(md_path, 'w') as f:
+    f.write("# Branch Performance Comparison\n\n")
+    f.write(f"| Metric | " + " | ".join(branch_names) + " |\n")
+    f.write("|--------|" + "|".join(["--------" for _ in branch_names]) + "|\n")
+    for label, key in rows:
+        vals = []
+        for m in metrics:
+            v = m.get(key, 'N/A')
+            if isinstance(v, (int, float)):
+                if 'Latency' in label or 'MB/s' in label:
+                    vals.append(f"{v:.1f}")
+                else:
+                    vals.append(f"{v:,.0f}")
+            else:
+                vals.append(str(v))
+        f.write(f"| {label} | " + " | ".join(vals) + " |\n")
+    f.write(f"\n_Generated at: {os.popen('date -u').read().strip()}_\n")
+
+print(f"\nComparison saved to: {md_path}")
+COMPARE
+}
+export SCRIPT_DIR="$SCRIPT_DIR"
+compare_results
+
 # Cleanup
 if [ "$CLEANUP" = "yes" ]; then
     echo ""
     echo "=========================================="
-    echo "Cleaning up infrastructure..."
+    echo "Cleaning up..."
     echo "=========================================="
-    cd "$TF_DIR" && terraform destroy -auto-approve
+    stop_local_grafana
+    cd "$TF_DIR"
+    if [ "$MODE" = "baseline" ]; then
+        terraform destroy -auto-approve \
+          -var="enable_loadgen=true" \
+          -var="loadgen_instance_type=t3.micro"
+    else
+        terraform destroy -auto-approve
+    fi
     echo "Infrastructure destroyed."
 else
     echo ""
     echo "=========================================="
     echo "Infrastructure left running"
     echo "=========================================="
-    echo "SSH: ssh -i $SSH_KEY ubuntu@$IP"
+    echo "Grafana: http://localhost:3000"
+    echo "SSH (server): ssh -i $SSH_KEY ubuntu@$IP"
     echo "Health: curl http://$IP:8080/health"
     echo "Stats: curl http://$IP:8080/stats"
+    if [ "$MODE" = "baseline" ]; then
+        echo "SSH (loadgen): ssh -i $SSH_KEY ubuntu@$LOADGEN_IP"
+    fi
     echo ""
     echo "To destroy manually:"
-    echo "  cd $TF_DIR && terraform destroy"
+    echo "  stop_local_grafana && cd $TF_DIR && terraform destroy"
 fi
 
 echo ""

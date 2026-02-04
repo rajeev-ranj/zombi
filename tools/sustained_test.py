@@ -237,6 +237,7 @@ def run_sustained_test(
     batch_size: int = 100,
     payload_size: int = 1024,
     verbose: bool = True,
+    skip_docker_stats: bool = False,
 ) -> SustainedTestResult:
     """Run sustained performance test with resource monitoring."""
 
@@ -274,18 +275,20 @@ def run_sustained_test(
     perf_samples: List[PerformanceSample] = []
     stop_event = threading.Event()
 
-    resource_thread = threading.Thread(
-        target=resource_monitor,
-        args=(stop_event, resource_samples, 2.0),
-        daemon=True
-    )
+    resource_thread = None
+    if not skip_docker_stats:
+        resource_thread = threading.Thread(
+            target=resource_monitor,
+            args=(stop_event, resource_samples, 2.0),
+            daemon=True
+        )
+        resource_thread.start()
+
     perf_thread = threading.Thread(
         target=performance_monitor,
         args=(url, stop_event, perf_samples, 5.0),
         daemon=True
     )
-
-    resource_thread.start()
     perf_thread.start()
 
     # Write payload to temp file for hey
@@ -339,7 +342,8 @@ def run_sustained_test(
     finally:
         os.unlink(payload_file)
         stop_event.set()
-        resource_thread.join(timeout=2)
+        if resource_thread is not None:
+            resource_thread.join(timeout=2)
         perf_thread.join(timeout=2)
 
     # Get final stats
@@ -512,6 +516,8 @@ def main():
     parser.add_argument("--payload-size", type=int, default=1024,
                         help="Payload size in bytes (default: 1024)")
     parser.add_argument("--output", help="Output file for JSON results")
+    parser.add_argument("--skip-docker-stats", action="store_true",
+                        help="Skip Docker resource monitoring (for remote execution)")
     parser.add_argument("--quiet", action="store_true", help="Reduce output")
 
     args = parser.parse_args()
@@ -536,6 +542,7 @@ def main():
         batch_size=args.batch_size,
         payload_size=args.payload_size,
         verbose=not args.quiet,
+        skip_docker_stats=args.skip_docker_stats,
     )
 
     print_result(result)
