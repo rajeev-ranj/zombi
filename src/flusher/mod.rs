@@ -1233,7 +1233,10 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let config = FlusherConfig { iceberg_enabled: true, ..Default::default() };
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
         let flusher = BackgroundFlusher::new(
             Arc::new(hot),
             Arc::clone(&cold),
@@ -1263,7 +1266,10 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let config = FlusherConfig { iceberg_enabled: true, ..Default::default() };
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
         let flusher = BackgroundFlusher::new(
             Arc::new(hot),
             Arc::clone(&cold),
@@ -1297,7 +1303,10 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let config = FlusherConfig { iceberg_enabled: true, ..Default::default() };
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
         let flusher = BackgroundFlusher::new(
             Arc::new(hot),
             Arc::clone(&cold),
@@ -1334,7 +1343,10 @@ mod tests {
 
         let cold = Arc::new(TestColdStorage::default());
         *cold.fail_on_call.lock().unwrap() = Some(1); // Fail on second write
-        let config = FlusherConfig { iceberg_enabled: true, ..Default::default() };
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
         let flusher = BackgroundFlusher::new(
             Arc::new(hot),
             Arc::clone(&cold),
@@ -1399,7 +1411,10 @@ mod tests {
         );
 
         let cold = Arc::new(TestColdStorage::default());
-        let config = FlusherConfig { iceberg_enabled: true, ..Default::default() };
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
         let flusher = BackgroundFlusher::new(
             Arc::new(hot),
             Arc::clone(&cold),
