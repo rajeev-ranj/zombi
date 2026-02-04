@@ -42,6 +42,8 @@ All notable changes to Zombi are documented here.
   - Enables query engines (Spark, Trino, DuckDB) to skip files during planning
   - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
 
+- **Table Name Validation** (Issue #101) — API rejects invalid table names at boundary (must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$`)
+
 ### Changed
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
   - New binaries can read legacy values.
@@ -56,7 +58,6 @@ All notable changes to Zombi are documented here.
   - Persist flush watermarks (restart-safe)
   - Delete hot data after Iceberg commit (bounded hot buffer)
   - Enable WAL by default (explicit performance opt-out)
-  - Table name validation for safe keys/S3 paths
 - **P1 Iceberg-Native Interfaces**
   - Iceberg REST Catalog API (server-side)
   - Arrow IPC content negotiation on read endpoint (`Accept` header)

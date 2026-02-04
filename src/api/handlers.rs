@@ -380,8 +380,8 @@ impl From<StorageError> for ApiError {
 
 /// Validates that a table name is safe for use in RocksDB keys and S3 paths.
 ///
-/// Must start with an ASCII letter, contain only `[a-zA-Z0-9_-]`, and be at most 128 characters.
-fn validate_table_name(table: &str) -> Result<(), ApiError> {
+/// Must start with an ASCII letter, contain only `[a-zA-Z0-9_-]`, and be at most 128 ASCII characters.
+pub(crate) fn validate_table_name(table: &str) -> Result<(), ApiError> {
     if table.is_empty()
         || table.len() > 128
         || !table.as_bytes()[0].is_ascii_alphabetic()
@@ -389,10 +389,9 @@ fn validate_table_name(table: &str) -> Result<(), ApiError> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid table name '{}': must match ^[a-zA-Z][a-zA-Z0-9_-]{{0,127}}$",
-            table
-        )));
+        return Err(ApiError::BadRequest(
+            "Invalid table name: must match ^[a-zA-Z][a-zA-Z0-9_-]{0,127}$".into(),
+        ));
     }
     Ok(())
 }
@@ -1386,5 +1385,59 @@ fn refresh_hot_storage_metrics<H: HotStorage, C: ColdStorage>(state: &AppState<H
                 .hot
                 .update(&topic, partition, low, high);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_single_letter() {
+        assert!(validate_table_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_hyphens_underscores() {
+        assert!(validate_table_name("my_events-v2").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_max_length_128() {
+        let name = "a".to_string() + &"b".repeat(127);
+        assert_eq!(name.len(), 128);
+        assert!(validate_table_name(&name).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_length_129() {
+        let name = "a".to_string() + &"b".repeat(128);
+        assert_eq!(name.len(), 129);
+        assert!(validate_table_name(&name).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert!(validate_table_name("").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_starts_with_digit() {
+        assert!(validate_table_name("9table").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_special_chars() {
+        assert!(validate_table_name("bad!name").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        assert!(validate_table_name("../etc").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unicode() {
+        assert!(validate_table_name("caf\u{e9}").is_err());
     }
 }

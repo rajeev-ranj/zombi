@@ -1658,3 +1658,20 @@ async fn test_write_accepts_valid_table_with_hyphens_and_underscores() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 }
+
+#[tokio::test]
+async fn test_bulk_write_rejects_invalid_table_name() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/123bad/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"events": [{"payload": "test"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
