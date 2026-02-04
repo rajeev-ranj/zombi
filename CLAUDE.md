@@ -6,7 +6,7 @@
 
 ## Project Overview
 
-Zombi is an Iceberg-first event streaming system written in Rust. It provides the lowest-cost path from events to Iceberg, with optional streaming support via RocksDB buffering.
+Zombi is an Iceberg-native event ingestion gateway written in Rust. It provides the lowest-cost path from events to Iceberg tables, with optional real-time reads via an Iceberg-compatible plugin (planned).
 
 **Current Version:** See `Cargo.toml`
 
@@ -208,6 +208,8 @@ Closes #38
 2. Register route in `src/api/mod.rs`
 3. Add integration test in `tests/integration_tests.rs`
 4. Update `SPEC.md` with new endpoint
+5. Write endpoints accept both JSON and Protobuf via Content-Type negotiation
+6. For Iceberg REST Catalog endpoints, follow the [Iceberg REST spec](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml)
 
 ### Adding a New Storage Operation
 
@@ -236,6 +238,7 @@ Closes #38
 - Change invariant behavior without discussion
 - Add dependencies without justification
 - Mix refactoring with feature changes in one PR
+- Serve cold storage data from HTTP read endpoints (cold reads go through Iceberg engines)
 
 ---
 
@@ -247,22 +250,22 @@ Zombi's mission is to provide the **lowest-cost, lowest-operational-overhead pat
 
 1. **Low Cost**: Fully utilize server resources — performance regressions are critical bugs
 2. **Low Ops**: Minimal configuration, auto-registration, self-healing
-3. **Data Freshness**: Close the gap between production and analytics
+3. **Iceberg Correctness**: Iceberg is the source of truth; hot data is bounded and watermarks are durable
 
 ### Architecture Layers
 
 | Layer | Purpose | Technology |
 |-------|---------|------------|
-| Hot Storage | Sub-second reads of recent events | RocksDB |
+| Hot Buffer | Absorb write bursts; optional low-latency reads | RocksDB |
 | Cold Storage | Durable analytics-ready data | Iceberg on S3 |
-| Unified API | Abstracts hot/cold for consumers | Zombi read endpoint |
+| Optional Real-Time Plugin | Iceberg-compatible hot+cold reads | Iceberg catalog plugin (planned) |
 
 ### Roadmap
 
-- **Phase 1 (Current)**: Event ingestion (clickstream, application events)
-- **Phase 2**: Unified consumer API (data available before S3 via streaming endpoint OR unified Iceberg view)
-- **Phase 3**: Binlog ingestion (MySQL CDC, Postgres logical replication)
-- **Phase 4**: Third-party connectors (Kafka, Kinesis, webhooks)
+- **v0.1–v0.2 (Done)**: Core storage + API, Iceberg integration
+- **v0.3 (Next)**: Correctness hardening (hour split, persisted watermarks, bounded hot buffer, WAL default)
+- **v0.4**: Iceberg-native interfaces + optional real-time plugin (REST catalog, ZombiCatalog)
+- **v1.0**: Production hardening, connectors (CDC, Kafka/Kinesis/webhooks)
 
 ---
 

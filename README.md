@@ -7,29 +7,33 @@
 [![Build](https://github.com/rajeev-ranj/zombi/actions/workflows/ci.yml/badge.svg)](https://github.com/rajeev-ranj/zombi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-The lowest-cost path from events to Iceberg, with optional streaming support.
+Iceberg-native event ingestion gateway — the lowest-cost path from events to queryable Iceberg tables.
 
 ## Features
 
 - **Simple** — Single binary, no ZooKeeper, no broker cluster
 - **Iceberg-native** — Events land directly in Iceberg tables, queryable by Spark/Trino/DuckDB
-- **Cost efficient** — Data stored on S3 with automatic compaction
+- **Cost efficient** — Data stored on S3 with Iceberg metadata
 - **Fast writes** — Buffered in RocksDB, durable in Iceberg
 - **Dual format** — Supports both JSON and Protobuf writes
-- **Compaction** — Automatic merging of small files for query performance
+- **Optional real-time reads** — Planned Iceberg catalog plugin for hot+cold reads
+- **Bounded hot buffer** — Hot data evicted after successful Iceberg commit (planned)
+- **Compaction tooling** — Small-file rewrite; Iceberg snapshot integration planned
 
 ## Architecture
 
 ```
-Producer → Zombi → Iceberg (S3)
-              ↓           ↓
-          RocksDB    Spark/Trino/DuckDB
-         (buffer)    (analytics queries)
+Producers → Zombi → Iceberg (S3) ──▶ Spark/Trino/DuckDB/Athena
+              │
+              ▼
+           RocksDB (hot buffer)
 ```
 
-- **RocksDB** — Write buffer for fast ingestion (ephemeral)
-- **Iceberg** — Source of truth, queryable by any SQL engine
+- **RocksDB** — Write buffer for fast ingestion (bounded, ephemeral)
+- **Iceberg** — Source of truth and primary read interface
 - **Background flusher** — Batches events into Parquet files with Iceberg metadata
+
+Optional: an Iceberg catalog plugin can merge hot + cold data for real-time reads without bypassing Iceberg semantics.
 
 ## Prerequisites
 
@@ -67,6 +71,7 @@ AWS_SECRET_ACCESS_KEY=minioadmin \
 ZOMBI_S3_BUCKET=zombi-events \
 ZOMBI_S3_ENDPOINT=http://localhost:9000 \
 ZOMBI_ICEBERG_ENABLED=true \
+ZOMBI_FLUSH_INTERVAL_SECS=5 \
 ./target/release/zombi
 
 # 6. Test it works (in a new terminal)
@@ -74,7 +79,11 @@ curl -X POST http://localhost:8080/tables/events \
   -H "Content-Type: application/json" \
   -d '{"payload": "hello world"}'
 
+# Read from hot buffer (not Iceberg semantics — use Iceberg engines for production reads)
 curl "http://localhost:8080/tables/events?limit=10"
+
+# Query via Iceberg (preferred; requires DuckDB with the iceberg extension)
+duckdb -c "SELECT * FROM iceberg_scan('s3://zombi-events/tables/events') LIMIT 10"
 ```
 
 ### Local Only (No Persistence)
@@ -121,11 +130,14 @@ curl -X POST http://localhost:8080/tables/events \
 # Response: {"offset": 1, "partition": 0, "table": "events"}
 ```
 
-### Read events
+### Read events (hot buffer)
 
 ```bash
-curl "http://localhost:8080/tables/events?limit=100"
+curl "http://localhost:8080/tables/events?partition=0&offset=0&limit=100"
 ```
+
+Reads from the RocksDB hot buffer only. Does **not** provide Iceberg-consistent semantics.
+For production analytics, query Iceberg tables directly via Spark/Trino/DuckDB.
 
 ### Health check
 
@@ -175,7 +187,11 @@ See [tools/README.md](tools/README.md) for more options.
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `5` | `300` | Flush interval in seconds |
 | `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | `10000` | Min events before flushing |
 | `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | `128` | Target Parquet file size |
+| `ZOMBI_ROCKSDB_WAL_ENABLED` | `false` | `false` | Enable WAL for durability (recommended `true` in production) |
 | `RUST_LOG` | `zombi=info` | `zombi=info` | Log level |
+
+**Durability note:** production deployments should enable WAL explicitly today (`ZOMBI_ROCKSDB_WAL_ENABLED=true`).
+The default will be flipped to `true` as part of the P0 durability hardening.
 
 ## Documentation
 
