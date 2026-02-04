@@ -355,7 +355,7 @@ mod tests {
             prop_assert_eq!(total, timestamps.len());
 
             // No empty groups
-            for (_key, group) in &groups {
+            for group in groups.values() {
                 prop_assert!(!group.is_empty());
             }
         }
