@@ -43,15 +43,13 @@ All notable changes to Zombi are documented here.
   - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
 
 ### Changed
+- **WAL enabled by default** — `ZOMBI_ROCKSDB_WAL_ENABLED` now defaults to `true` for crash-safe durability (set `false` to opt out)
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
   - New binaries can read legacy values.
   - Older binaries cannot read newly written values.
 
 ### Fixed
 - Iceberg metadata files now created after flush (snapshots + version metadata)
-
-### Changed
-- **WAL enabled by default** — `ZOMBI_ROCKSDB_WAL_ENABLED` now defaults to `true` for crash-safe durability (set `false` to opt out)
 
 ### Planned
 - **P0 Correctness Hardening**

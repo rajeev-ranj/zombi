@@ -779,6 +779,6 @@ Zombi is an ingestion gateway to Iceberg, **not** a Kafka replacement.
 |---------|--------|--------------|
 | v0.1 | ✅ Done | RocksDB + S3 JSON |
 | v0.2 | ✅ Done | Iceberg/Parquet output |
-| v0.3 | 🚧 Next | Correctness hardening (watermarks, bounded hot buffer, WAL default) |
+| v0.3 | 🚧 Next | Correctness hardening (watermarks, bounded hot buffer) |
 | v0.4 | Planned | Iceberg catalog API + real-time plugin (optional) |
 | v1.0 | Planned | Production ready |

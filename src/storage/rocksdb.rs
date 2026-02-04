@@ -265,9 +265,18 @@ impl RocksDbStorage {
 
         let bloom_filters = DashMap::new();
 
-        let wal_enabled = std::env::var("ZOMBI_ROCKSDB_WAL_ENABLED")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let wal_enabled = match std::env::var("ZOMBI_ROCKSDB_WAL_ENABLED").as_deref() {
+            Ok("0") | Ok("false") | Ok("FALSE") => false,
+            Ok("1") | Ok("true") | Ok("TRUE") => true,
+            Ok(other) => {
+                tracing::warn!(
+                    value = other,
+                    "Unrecognized ZOMBI_ROCKSDB_WAL_ENABLED value, defaulting to enabled"
+                );
+                true
+            }
+            Err(_) => true,
+        };
         tracing::info!(wal_enabled = wal_enabled, "RocksDB WAL policy configured");
         if !wal_enabled {
             tracing::warn!("WAL disabled — acknowledged writes may be lost on crash");
@@ -1747,7 +1756,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(dir.path()).unwrap();
         assert!(!storage.wal_enabled);
-        std::env::remove_var("ZOMBI_ROCKSDB_WAL_ENABLED");
     }
 
     #[test]
@@ -1758,6 +1766,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(dir.path()).unwrap();
         assert!(!storage.wal_enabled);
-        std::env::remove_var("ZOMBI_ROCKSDB_WAL_ENABLED");
+    }
+
+    #[test]
+    fn wal_treats_unknown_value_as_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_rocksdb_env();
+        std::env::set_var("ZOMBI_ROCKSDB_WAL_ENABLED", "yes");
+        let dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(dir.path()).unwrap();
+        assert!(storage.wal_enabled);
     }
 }
