@@ -91,6 +91,17 @@ services:
     networks:
       - monitoring
 
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: node-exporter
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - '--path.rootfs=/host'
+    networks:
+      - monitoring
+
   prometheus:
     image: prom/prometheus:v2.47.0
     container_name: prometheus

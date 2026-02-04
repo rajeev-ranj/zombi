@@ -1,0 +1,17 @@
+# Grafana Datasource for AWS mode
+# Used when running Grafana locally with SSH-tunneled Prometheus from EC2
+# Prometheus is reached via: SSH tunnel (port 9090) -> host.docker.internal
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://host.docker.internal:9090
+    isDefault: true
+    editable: false
+    uid: prometheus
+    jsonData:
+      timeInterval: "5s"
+      httpMethod: POST

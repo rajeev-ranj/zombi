@@ -6,3 +6,5 @@ public_key_path = "~/.ssh/id_ed25519.pub"
 ssh_cidr        = "0.0.0.0/0"
 http_cidr       = "0.0.0.0/0"
 zombi_image     = "ghcr.io/rajeev-ranj/zombi:latest"
+enable_loadgen        = false
+loadgen_instance_type = "t3.micro"

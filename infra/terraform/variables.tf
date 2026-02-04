@@ -12,6 +12,16 @@ variable "instance_type" {
   default = "t3.micro"
 }
 
+variable "enable_loadgen" {
+  type    = bool
+  default = false
+}
+
+variable "loadgen_instance_type" {
+  type    = string
+  default = "t3.small"
+}
+
 variable "key_pair_name" {
   type = string
 }

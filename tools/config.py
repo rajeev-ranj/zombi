@@ -105,6 +105,17 @@ DEFAULT_PROFILES = {
         scenarios=["cold-storage", "iceberg-read"],
         duration_multiplier=1.0,
     ),
+    "baseline": ProfileConfig(
+        scenarios=[
+            "peak-single", "peak-bulk",
+            "single-write", "bulk-write",
+            "read-throughput", "write-read-lag",
+            "mixed-workload", "backpressure",
+            "cold-storage", "consistency",
+        ],
+        duration_multiplier=3.0,
+        concurrency_levels=[50, 100, 200],
+    ),
 }
 
 # Scenario metadata

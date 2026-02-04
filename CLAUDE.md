@@ -124,22 +124,49 @@ cargo test -- --nocapture
 
 ### Load Testing
 
-For load/performance testing, use the unified `zombi-load` CLI:
+**Two entry points:**
 
+#### Local (docker-compose)
 ```bash
-# Quick sanity check (~3 min)
+docker-compose -f docker-compose.monitoring.yml up --build -d
+# Grafana: http://localhost:3000 (admin/admin)
+
 python tools/zombi_load.py run --profile quick --url http://localhost:8080
-
-# Full suite (~30 min)
 python tools/zombi_load.py run --profile full
-
-# Specific scenario
-python tools/zombi_load.py run --scenario single-write --workers 50
+python tools/zombi_load.py list   # show profiles and scenarios
 ```
 
-**AWS testing:** Run the load generator on EC2 (same VPC as Zombi server) to avoid network bottlenecks. See `tools/README.md` for deployment options.
+#### AWS (auto-deploys infra + local Grafana)
+```bash
+# Full baseline with cleanup (~75 min)
+./tools/aws_peak_performance.sh baseline yes t3.micro
+# Grafana auto-starts at http://localhost:3000 (no SSH needed)
 
-See `tools/README.md` for profiles, scenarios, and configuration options.
+# Keep infra running for inspection
+./tools/aws_peak_performance.sh baseline no t3.micro
+
+# Other modes: quick (~10 min), sustained (~12 min), comprehensive (~40 min)
+./tools/aws_peak_performance.sh quick yes t3.micro
+```
+
+**Prerequisites:** Terraform, AWS CLI, Docker, SSH key at `~/.ssh/id_ed25519`
+
+Results saved to `tools/results/<branch>/<timestamp>/` with auto-comparison across branches.
+
+### Tools Reference
+
+| File | Purpose |
+|------|---------|
+| `tools/zombi_load.py` | **Local CLI** — profiles: quick, full, stress, peak, baseline |
+| `tools/aws_peak_performance.sh` | **AWS CLI** — deploy, test, Grafana, compare, cleanup |
+| `tools/config.py` | Configuration loader (profiles, scenarios) |
+| `tools/output.py` | Result formatting and comparison |
+| `tools/peak_performance.py` | Single-write throughput (used by AWS scripts on EC2) |
+| `tools/peak_performance_bulk.py` | Bulk-write throughput (used by AWS scripts on EC2) |
+| `tools/benchmark.py` | Shared library + read/lag/encoding tests |
+| `tools/sustained_test.py` | Long-running sustained load |
+| `tools/scenario_test.py` | Scenario orchestrator (mixed, consistency) |
+| `tools/bandwidth_test.py` | Bandwidth maximization |
 
 ---
 
@@ -250,6 +277,7 @@ Any PR causing >30% regression should be flagged and investigated.
 | PERF-2 | Bulk writes (100/batch) | >100,000 ev/s | `hey` bulk-write test |
 | PERF-3 | Server write latency | <10 μs | `/stats` endpoint `avg_latency_us` |
 | PERF-4 | Iceberg snapshot commit | <500 ms | Flush timing logs |
+| PERF-5 | Clickstream bulk (100 diverse events) | >50,000 ev/s | `hey` clickstream bulk test |
 
 ---
 

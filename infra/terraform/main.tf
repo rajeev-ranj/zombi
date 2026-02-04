@@ -99,14 +99,33 @@ resource "aws_instance" "zombi" {
   vpc_security_group_ids = [aws_security_group.zombi.id]
   iam_instance_profile   = aws_iam_instance_profile.zombi.name
 
-  user_data = templatefile("${path.module}/user_data.sh", {
+  user_data_base64 = base64gzip(templatefile("${path.module}/user_data.sh", {
     region        = var.aws_region
     s3_bucket     = aws_s3_bucket.zombi.bucket
     zombi_image   = var.zombi_image
-  })
+  }))
 
   tags = {
     Name = "zombi-ec2"
+  }
+}
+
+resource "aws_instance" "loadgen" {
+  count                  = var.enable_loadgen ? 1 : 0
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.loadgen_instance_type
+  key_name               = aws_key_pair.zombi.key_name
+  vpc_security_group_ids = [aws_security_group.zombi.id]
+  iam_instance_profile   = aws_iam_instance_profile.zombi.name
+
+  user_data_base64 = base64gzip(templatefile("${path.module}/user_data_loadgen.sh", {
+    region            = var.aws_region
+    s3_bucket         = aws_s3_bucket.zombi.bucket
+    server_private_ip = aws_instance.zombi.private_ip
+  }))
+
+  tags = {
+    Name = "zombi-loadgen"
   }
 }
 
@@ -139,3 +158,16 @@ output "health_url" {
 output "stats_url" {
   value = "http://${aws_instance.zombi.public_ip}:8080/stats"
 }
+
+output "loadgen_public_ip" {
+  value = var.enable_loadgen ? aws_instance.loadgen[0].public_ip : "disabled"
+}
+
+output "loadgen_ssh_command" {
+  value = var.enable_loadgen ? "ssh -i ~/.ssh/id_ed25519 ubuntu@${aws_instance.loadgen[0].public_ip}" : "disabled"
+}
+
+output "server_private_ip" {
+  value = aws_instance.zombi.private_ip
+}
+
