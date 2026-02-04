@@ -231,7 +231,7 @@ components:
     TableParam:
       name: table
       in: path
-      description: "Table name. Pattern not yet enforced server-side (planned P0)."
+      description: "Table name. Must start with a letter, contain only alphanumeric, underscore, or hyphen characters, and be at most 128 characters."
       required: true
       schema:
         type: string

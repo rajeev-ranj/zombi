@@ -378,6 +378,25 @@ impl From<StorageError> for ApiError {
     }
 }
 
+/// Validates that a table name is safe for use in RocksDB keys and S3 paths.
+///
+/// Must start with an ASCII letter, contain only `[a-zA-Z0-9_-]`, and be at most 128 characters.
+fn validate_table_name(table: &str) -> Result<(), ApiError> {
+    if table.is_empty()
+        || table.len() > 128
+        || !table.as_bytes()[0].is_ascii_alphabetic()
+        || !table
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid table name '{}': must match ^[a-zA-Z][a-zA-Z0-9_-]{{0,127}}$",
+            table
+        )));
+    }
+    Ok(())
+}
+
 /// POST /tables/{table}
 /// Write a record to a table.
 /// Accepts either:
@@ -389,6 +408,7 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<WriteRecordResponse>), ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
     let body_len = body.len() as u64;
 
@@ -515,6 +535,7 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<BulkWriteResponse>), ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
     let body_len = body.len() as u64;
 
@@ -738,6 +759,7 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     Path(table): Path<String>,
     Query(query): Query<ReadRecordsQuery>,
 ) -> Result<Json<ReadRecordsResponse>, ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
 
     // Parse and validate projection
@@ -1019,6 +1041,7 @@ pub async fn get_table_metadata<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<TableMetadataResponse>, ApiError> {
+    validate_table_name(&table)?;
     let response = if let Some(ref cold) = state.cold_storage {
         let info = cold.storage_info();
         let metadata_location = cold.iceberg_metadata_location(&table);
@@ -1052,6 +1075,7 @@ pub async fn flush_table<H: HotStorage, C: ColdStorage>(
     State(_state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<FlushResponse>, ApiError> {
+    validate_table_name(&table)?;
     // TODO: Wire flusher into AppState to enable this endpoint
     // For now, return 501 Not Implemented
     Ok(Json(FlushResponse {
@@ -1070,6 +1094,7 @@ pub async fn compact_table<H: HotStorage, C: ColdStorage>(
     State(_state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<CompactResponse>, ApiError> {
+    validate_table_name(&table)?;
     // TODO: Wire compactor into AppState to enable this endpoint
     // For now, return 501 Not Implemented
     Ok(Json(CompactResponse {
