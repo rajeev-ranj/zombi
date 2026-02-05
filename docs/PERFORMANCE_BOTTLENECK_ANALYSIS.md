@@ -774,13 +774,9 @@ parsing the key. Medium complexity due to migration concerns.
 
 **Location:** `rocksdb.rs:391-394` (events), `rocksdb.rs:706-710` (offsets)
 
-Event writes use `write_opt(batch, &Self::write_options())` where `write_options()`
-disables WAL (`disable_wal(true)`). However, `commit_offset()` uses
-`self.db.put(key, value)` with **default** write options, which have WAL **enabled**.
-
-**Impact:** Consumer offset commits survive OS crashes; event writes do not.
-This is an undocumented inconsistency -- if the goal is no-WAL-for-throughput,
-consumer offsets should match. If durability matters, events should have WAL too.
+**Resolved:** WAL is now enabled by default (`ZOMBI_ROCKSDB_WAL_ENABLED=true`).
+Both event writes and consumer offset commits use `write_options()` which respects the WAL setting.
+Set `ZOMBI_ROCKSDB_WAL_ENABLED=false` to opt out for throughput at the cost of crash safety.
 
 **Fix:** Make explicit: either use `write_options()` for offsets too (consistent
 no-WAL) or add an env toggle for WAL on events. Low complexity.
@@ -829,7 +825,7 @@ These require Rust code modifications and testing.
 |--------|------|----------------|------------|-------|
 | Make memtable size env-configurable | `rocksdb.rs:107` | +10-15% write throughput at 128 MB | Low | Hard-coded to 64 MB; add `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` |
 | Make L0 compaction triggers env-configurable | `rocksdb.rs:119` | -15% write stalls at trigger=8 | Low | Hard-coded to 4; add env vars for trigger/slowdown/stop |
-| Re-enable WAL via env toggle | `rocksdb.rs:393` | -50% write speed, +crash safety | Low | `disable_wal(true)` hard-coded; add `ZOMBI_ROCKSDB_WAL_ENABLED` |
+| ~~Re-enable WAL via env toggle~~ | `rocksdb.rs` | **Done** — WAL enabled by default since v0.3 | ✅ | `ZOMBI_ROCKSDB_WAL_ENABLED` defaults to `true`; set `false` to opt out |
 | Remove `low_watermark` from single-write hot path | `handlers.rs:472` | Removes RocksDB iterator scan per write | Low | Move to periodic background sampling or 1/N sampling |
 | Fix bulk parse-before-backpressure | `handlers.rs:495` | Protects CPU/memory under overload | Low | Change `Json<BulkWriteRequest>` to `Bytes`, check size before parse |
 | Remove unused `batch_size` field | `flusher/mod.rs:24` | Reduces confusion | Trivial | Advisory field; no functional change |
