@@ -1696,3 +1696,91 @@ async fn test_read_with_cold_storage_returns_only_hot_data() {
     assert_eq!(json["count"], 1);
     assert_eq!(json["records"][0]["payload"], "hot-only-event");
 }
+
+// ============================================================================
+// Table Name Validation Tests (#101)
+// ============================================================================
+
+#[tokio::test]
+async fn test_write_rejects_table_starting_with_number() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/123bad")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "test", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_write_rejects_table_with_special_chars() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/bad%21name")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "test", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_read_rejects_invalid_table_name() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tables/123invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_write_accepts_valid_table_with_hyphens_and_underscores() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/my_events-v2")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "test", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn test_bulk_write_rejects_invalid_table_name() {
+    let (app, _dir) = create_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/123bad/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"events": [{"payload": "test"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

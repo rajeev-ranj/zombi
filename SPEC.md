@@ -445,15 +445,15 @@ message BulkWriteRequest {
 }
 ```
 
-### Table Name Validation (Planned — P0)
+### Table Name Validation
 
-Table names must be safe for internal keys and S3 paths. The following regex will be enforced at the API boundary (not yet implemented):
+Table names must be safe for internal keys and S3 paths. The following regex is enforced at the API boundary:
 
 ```
 ^[a-zA-Z][a-zA-Z0-9_-]{0,127}$
 ```
 
-Once enforced, invalid names will return `400 Bad Request`.
+Invalid names return `400 Bad Request`.
 
 ### Payload Encoding
 

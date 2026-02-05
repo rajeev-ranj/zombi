@@ -377,6 +377,24 @@ impl From<StorageError> for ApiError {
     }
 }
 
+/// Validates that a table name is safe for use in RocksDB keys and S3 paths.
+///
+/// Must start with an ASCII letter, contain only `[a-zA-Z0-9_-]`, and be at most 128 ASCII characters.
+pub(crate) fn validate_table_name(table: &str) -> Result<(), ApiError> {
+    if table.is_empty()
+        || table.len() > 128
+        || !table.as_bytes()[0].is_ascii_alphabetic()
+        || !table
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(ApiError::BadRequest(
+            "Invalid table name: must match ^[a-zA-Z][a-zA-Z0-9_-]{0,127}$".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// POST /tables/{table}
 /// Write a record to a table.
 /// Accepts either:
@@ -388,6 +406,7 @@ pub async fn write_record<H: HotStorage, C: ColdStorage>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<WriteRecordResponse>), ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
     let body_len = body.len() as u64;
 
@@ -514,6 +533,7 @@ pub async fn bulk_write<H: HotStorage, C: ColdStorage>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<BulkWriteResponse>), ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
     let body_len = body.len() as u64;
 
@@ -739,6 +759,7 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     Path(table): Path<String>,
     Query(query): Query<ReadRecordsQuery>,
 ) -> Result<Json<ReadRecordsResponse>, ApiError> {
+    validate_table_name(&table)?;
     let start = Instant::now();
 
     // Parse and validate projection
@@ -972,6 +993,7 @@ pub async fn get_table_metadata<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<TableMetadataResponse>, ApiError> {
+    validate_table_name(&table)?;
     let response = if let Some(ref cold) = state.cold_storage {
         let info = cold.storage_info();
         let metadata_location = cold.iceberg_metadata_location(&table);
@@ -1005,6 +1027,7 @@ pub async fn flush_table<H: HotStorage, C: ColdStorage>(
     State(_state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<FlushResponse>, ApiError> {
+    validate_table_name(&table)?;
     // TODO: Wire flusher into AppState to enable this endpoint
     // For now, return 501 Not Implemented
     Ok(Json(FlushResponse {
@@ -1023,6 +1046,7 @@ pub async fn compact_table<H: HotStorage, C: ColdStorage>(
     State(_state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<CompactResponse>, ApiError> {
+    validate_table_name(&table)?;
     // TODO: Wire compactor into AppState to enable this endpoint
     // For now, return 501 Not Implemented
     Ok(Json(CompactResponse {
@@ -1314,5 +1338,59 @@ fn refresh_hot_storage_metrics<H: HotStorage, C: ColdStorage>(state: &AppState<H
                 .hot
                 .update(&topic, partition, low, high);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_single_letter() {
+        assert!(validate_table_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_hyphens_underscores() {
+        assert!(validate_table_name("my_events-v2").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_max_length_128() {
+        let name = "a".to_string() + &"b".repeat(127);
+        assert_eq!(name.len(), 128);
+        assert!(validate_table_name(&name).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_length_129() {
+        let name = "a".to_string() + &"b".repeat(128);
+        assert_eq!(name.len(), 129);
+        assert!(validate_table_name(&name).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert!(validate_table_name("").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_starts_with_digit() {
+        assert!(validate_table_name("9table").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_special_chars() {
+        assert!(validate_table_name("bad!name").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        assert!(validate_table_name("../etc").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unicode() {
+        assert!(validate_table_name("caf\u{e9}").is_err());
     }
 }
