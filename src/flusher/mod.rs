@@ -1177,7 +1177,6 @@ mod tests {
                 base_path: String::new(),
             }
         }
-
     }
 
     #[tokio::test]
