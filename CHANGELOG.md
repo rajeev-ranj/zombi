@@ -45,6 +45,7 @@ All notable changes to Zombi are documented here.
 - **Table Name Validation** (Issue #101) — API rejects invalid table names at boundary (must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$`)
 
 ### Changed
+- **Hot-only HTTP reads** — `GET /tables/{table}` now reads from RocksDB hot buffer only; cold/historical reads go through Iceberg engines
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
   - New binaries can read legacy values.
   - Older binaries cannot read newly written values.

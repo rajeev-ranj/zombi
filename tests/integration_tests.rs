@@ -7,9 +7,55 @@ use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
+use zombi::contracts::{ColdStorage, StorageError};
 use zombi::metrics::MetricsRegistry;
 use zombi::proto;
 use zombi::storage::{RocksDbStorage, WriteCombiner, WriteCombinerConfig};
+
+/// Cold storage mock that panics if `read_events` is called.
+/// Proves the read handler does not query cold storage.
+struct PanicOnReadColdStorage;
+
+impl ColdStorage for PanicOnReadColdStorage {
+    async fn write_segment(
+        &self,
+        _topic: &str,
+        _partition: u32,
+        _events: &[zombi::contracts::StoredEvent],
+    ) -> Result<String, StorageError> {
+        Err(StorageError::S3("not configured".into()))
+    }
+
+    async fn read_events(
+        &self,
+        _topic: &str,
+        _partition: u32,
+        _start_offset: u64,
+        _limit: usize,
+        _since_ms: Option<i64>,
+        _until_ms: Option<i64>,
+        _projection: &zombi::contracts::ColumnProjection,
+    ) -> Result<Vec<zombi::contracts::StoredEvent>, StorageError> {
+        panic!("read_events must not be called — HTTP reads should use hot storage only");
+    }
+
+    async fn list_segments(
+        &self,
+        _topic: &str,
+        _partition: u32,
+    ) -> Result<Vec<zombi::contracts::SegmentInfo>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    fn storage_info(&self) -> zombi::contracts::ColdStorageInfo {
+        zombi::contracts::ColdStorageInfo {
+            storage_type: "panic-on-read".into(),
+            iceberg_enabled: false,
+            bucket: String::new(),
+            base_path: String::new(),
+        }
+    }
+}
 
 fn create_test_app_with_backpressure(
     config: BackpressureConfig,
@@ -70,6 +116,20 @@ fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
     let state = Arc::new(AppState::new(
         Arc::new(storage),
         Some(Arc::new(NoopColdStorage)),
+        Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
+        BackpressureConfig::default(),
+    ));
+    let router = create_router(state);
+    (router, dir)
+}
+
+fn create_test_app_with_panic_cold_storage() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let state = Arc::new(AppState::new(
+        Arc::new(storage),
+        Some(Arc::new(PanicOnReadColdStorage)),
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
@@ -1586,6 +1646,55 @@ async fn test_combiner_metrics_in_prometheus_output() {
     assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"0\"}"));
     assert!(body_str.contains("zombi_write_combiner_queue_depth{shard=\"1\"}"));
     assert!(body_str.contains("zombi_write_combiner_queue_depth_total"));
+}
+
+// ============================================================================
+// Hot-Only Read Tests (#102)
+// ============================================================================
+
+#[tokio::test]
+async fn test_read_with_cold_storage_returns_only_hot_data() {
+    // Use PanicOnReadColdStorage: if the handler calls read_events on cold storage,
+    // the test will panic — proving the handler only reads from hot storage.
+    let (app, _dir) = create_test_app_with_panic_cold_storage();
+
+    // Write one event to hot storage
+    let app_clone = app.clone();
+    let write_resp = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload": "hot-only-event", "partition": 0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write_resp.status(), StatusCode::ACCEPTED);
+
+    // Read back — must succeed without touching cold storage (would panic otherwise)
+    let read_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tables/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(read_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["count"], 1);
+    assert_eq!(json["records"][0]["payload"], "hot-only-event");
 }
 
 // ============================================================================

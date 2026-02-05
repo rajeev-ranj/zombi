@@ -7,7 +7,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use futures::future::join_all;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -750,9 +749,11 @@ fn project_event(
 }
 
 /// GET /tables/{table}
-/// Read records from a table (unified read from hot and cold storage).
+/// Read records from the hot buffer (RocksDB only).
 /// Results are ordered by timestamp.
 /// Supports optional `fields` query parameter for column projection.
+///
+/// Cold/historical reads go through Iceberg engines (Spark, Trino, DuckDB).
 pub async fn read_records<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
@@ -764,62 +765,14 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
     // Parse and validate projection
     let projection = parse_projection(&query.fields)?;
 
-    // Read from hot storage (pass None for start_offsets - could be added for consumer groups later)
-    let mut all_events = state
+    // Read from hot storage only (cold reads go through Iceberg engines)
+    let all_events = state
         .storage
         .read_all_partitions(&table, None, query.since, query.limit + 1)
         .map_err(|e| {
             state.metrics.record_error();
             ApiError::from(e)
         })?;
-
-    // Also read from cold storage if configured - parallel reads for all partitions
-    if let Some(ref cold) = state.cold_storage {
-        let partitions = state.storage.list_partitions(&table).unwrap_or_default();
-
-        // Create futures for all partition reads
-        let projection_ref = &projection;
-        let read_futures: Vec<_> = partitions
-            .iter()
-            .map(|&partition| {
-                let cold = cold.clone();
-                let table = table.clone();
-                async move {
-                    cold.read_events(
-                        &table,
-                        partition,
-                        0,
-                        query.limit + 1,
-                        query.since,
-                        None,
-                        projection_ref,
-                    )
-                    .await
-                    .unwrap_or_default()
-                }
-            })
-            .collect();
-
-        // Execute all reads in parallel
-        let results = join_all(read_futures).await;
-
-        // Collect and filter results
-        for cold_events in results {
-            let cold_events: Vec<_> = if let Some(since) = query.since {
-                cold_events
-                    .into_iter()
-                    .filter(|e| e.timestamp_ms >= since)
-                    .collect()
-            } else {
-                cold_events
-            };
-            all_events.extend(cold_events);
-        }
-
-        // Re-sort by timestamp and deduplicate
-        all_events.sort_by_key(|e| e.timestamp_ms);
-        all_events.dedup_by_key(|e| (e.timestamp_ms, e.sequence));
-    }
 
     let has_more = all_events.len() > query.limit;
     let events: Vec<_> = all_events.into_iter().take(query.limit).collect();
