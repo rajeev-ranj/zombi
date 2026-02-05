@@ -288,6 +288,10 @@ where
         let mut hour_groups: std::collections::BTreeMap<(i32, i32), Vec<StoredEvent>> =
             std::collections::BTreeMap::new();
 
+        // Note on partial failures: earlier hour groups may be written before a later write fails.
+        // For Iceberg, those files remain invisible until a snapshot commit because snapshots
+        // explicitly reference data files. For non-Iceberg, segments are keyed by offset range,
+        // so retries overwrite the same keys.
         for event in events {
             let key = if iceberg_enabled {
                 derive_partition_columns(event.timestamp_ms)
@@ -305,6 +309,8 @@ where
         for ((_date, _hour), group_events) in &hour_groups {
             let group_count = group_events.len();
             let group_bytes: usize = group_events.iter().map(|e| e.payload.len() + 64).sum();
+            // Ordering invariant: hot_storage.read() returns sequence-ordered events, and
+            // push() preserves insertion order within each hour group, so last() is max seq.
             let group_max_seq = group_events.last().map(|e| e.sequence).unwrap_or(watermark);
 
             cold_storage
@@ -454,27 +460,15 @@ where
                                             w.insert((topic.clone(), partition), new_watermark);
                                         }
 
-                                        if iceberg_enabled {
-                                            // Defer persistence until after snapshot commit
-                                            pending_watermark_persists
-                                                .entry(topic.clone())
-                                                .or_default()
-                                                .push((partition, new_watermark));
-                                        } else {
-                                            // Non-Iceberg: persist immediately
-                                            if let Err(e) = hot_storage.save_flush_watermark(
-                                                &topic,
-                                                partition,
-                                                new_watermark,
-                                            ) {
-                                                tracing::error!(
-                                                    topic = %topic,
-                                                    partition = partition,
-                                                    error = %e,
-                                                    "Failed to persist flush watermark"
-                                                );
-                                            }
-                                        }
+                                        persist_or_defer_watermark(
+                                            hot_storage.as_ref(),
+                                            &topic,
+                                            partition,
+                                            new_watermark,
+                                            iceberg_enabled,
+                                            &mut pending_watermark_persists,
+                                            flush_metrics.as_ref(),
+                                        );
 
                                         flushed_topics.insert(topic);
                                     }
@@ -512,23 +506,15 @@ where
                                     w.insert((topic.clone(), partition), new_watermark);
                                 }
 
-                                if iceberg_enabled {
-                                    pending_watermark_persists
-                                        .entry(topic.clone())
-                                        .or_default()
-                                        .push((partition, new_watermark));
-                                } else if let Err(e) = hot_storage.save_flush_watermark(
+                                persist_or_defer_watermark(
+                                    hot_storage.as_ref(),
                                     &topic,
                                     partition,
                                     new_watermark,
-                                ) {
-                                    tracing::error!(
-                                        topic = %topic,
-                                        partition = partition,
-                                        error = %e,
-                                        "Failed to persist flush watermark"
-                                    );
-                                }
+                                    iceberg_enabled,
+                                    &mut pending_watermark_persists,
+                                    flush_metrics.as_ref(),
+                                );
 
                                 flushed_topics.insert(topic);
                             }
@@ -630,22 +616,12 @@ where
                                     }
 
                                     // Persist flush watermarks now that the snapshot is committed
-                                    if let Some(partitions) =
-                                        pending_watermark_persists.remove(&topic)
-                                    {
-                                        for (partition, wm) in partitions {
-                                            if let Err(e) = hot_storage
-                                                .save_flush_watermark(&topic, partition, wm)
-                                            {
-                                                tracing::error!(
-                                                    topic = %topic,
-                                                    partition = partition,
-                                                    error = %e,
-                                                    "Failed to persist flush watermark after snapshot"
-                                                );
-                                            }
-                                        }
-                                    }
+                                    flush_pending_watermarks(
+                                        hot_storage.as_ref(),
+                                        &topic,
+                                        &mut pending_watermark_persists,
+                                        flush_metrics.as_ref(),
+                                    );
                                 }
                                 Ok(None) => {
                                     tracing::debug!(
@@ -748,32 +724,23 @@ where
 
                 total_events += count;
                 total_segments += 1;
-                flushed_topics.insert(topic.clone());
 
                 self.watermarks
                     .write()
                     .map_lock_err()?
                     .insert((topic.clone(), partition), new_watermark);
 
-                if self.config.iceberg_enabled {
-                    pending_watermark_persists
-                        .entry(topic)
-                        .or_default()
-                        .push((partition, new_watermark));
-                } else {
-                    // Non-Iceberg: persist immediately
-                    if let Err(e) =
-                        self.hot_storage
-                            .save_flush_watermark(&topic, partition, new_watermark)
-                    {
-                        tracing::error!(
-                            topic = %topic,
-                            partition = partition,
-                            error = %e,
-                            "Failed to persist flush watermark"
-                        );
-                    }
-                }
+                persist_or_defer_watermark(
+                    self.hot_storage.as_ref(),
+                    &topic,
+                    partition,
+                    new_watermark,
+                    self.config.iceberg_enabled,
+                    &mut pending_watermark_persists,
+                    self.flush_metrics.as_ref(),
+                );
+
+                flushed_topics.insert(topic);
 
                 if new_watermark > max_watermark {
                     max_watermark = new_watermark;
@@ -799,20 +766,12 @@ where
                             );
 
                             // Persist flush watermarks after successful snapshot
-                            if let Some(partitions) = pending_watermark_persists.remove(&topic) {
-                                for (partition, wm) in partitions {
-                                    if let Err(e) =
-                                        self.hot_storage.save_flush_watermark(&topic, partition, wm)
-                                    {
-                                        tracing::error!(
-                                            topic = %topic,
-                                            partition = partition,
-                                            error = %e,
-                                            "Failed to persist flush watermark after snapshot"
-                                        );
-                                    }
-                                }
-                            }
+                            flush_pending_watermarks(
+                                self.hot_storage.as_ref(),
+                                &topic,
+                                &mut pending_watermark_persists,
+                                self.flush_metrics.as_ref(),
+                            );
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -840,6 +799,52 @@ where
         Ok(*watermarks
             .get(&(topic.to_string(), partition))
             .unwrap_or(&0))
+    }
+}
+
+fn persist_or_defer_watermark<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    partition: u32,
+    watermark: u64,
+    iceberg_enabled: bool,
+    pending: &mut HashMap<String, Vec<(u32, u64)>>,
+    flush_metrics: &FlushMetrics,
+) {
+    if iceberg_enabled {
+        pending
+            .entry(topic.to_string())
+            .or_default()
+            .push((partition, watermark));
+    } else if let Err(e) = hot_storage.save_flush_watermark(topic, partition, watermark) {
+        flush_metrics.record_watermark_persist_error();
+        tracing::error!(
+            topic = %topic,
+            partition = partition,
+            error = %e,
+            "Failed to persist flush watermark"
+        );
+    }
+}
+
+fn flush_pending_watermarks<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    pending: &mut HashMap<String, Vec<(u32, u64)>>,
+    flush_metrics: &FlushMetrics,
+) {
+    if let Some(partitions) = pending.remove(topic) {
+        for (partition, wm) in partitions {
+            if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
+                flush_metrics.record_watermark_persist_error();
+                tracing::error!(
+                    topic = %topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to persist flush watermark after snapshot"
+                );
+            }
+        }
     }
 }
 
