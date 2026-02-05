@@ -45,6 +45,7 @@ All notable changes to Zombi are documented here.
 - **Table Name Validation** (Issue #101) — API rejects invalid table names at boundary (must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$`)
 
 ### Changed
+- **WAL enabled by default** — `ZOMBI_ROCKSDB_WAL_ENABLED` now defaults to `true` for crash-safe durability (set `false` to opt out)
 - **Hot-only HTTP reads** — `GET /tables/{table}` now reads from RocksDB hot buffer only; cold/historical reads go through Iceberg engines
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
   - New binaries can read legacy values.
@@ -59,6 +60,7 @@ All notable changes to Zombi are documented here.
   - Persist flush watermarks (restart-safe)
   - Delete hot data after Iceberg commit (bounded hot buffer)
   - Enable WAL by default (explicit performance opt-out)
+  - Table name validation for safe keys/S3 paths
 - **P1 Iceberg-Native Interfaces**
   - Iceberg REST Catalog API (server-side)
   - Arrow IPC content negotiation on read endpoint (`Accept` header)
