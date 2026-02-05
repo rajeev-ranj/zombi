@@ -223,7 +223,7 @@ where
     /// When `iceberg_enabled` is true, uses `target_file_size_bytes` to limit
     /// the segment size instead of event count alone.
     ///
-    /// Returns (events_flushed, new_watermark, bytes_flushed) on success.
+    /// Returns (events_flushed, new_watermark, bytes_flushed, segments_written) on success.
     #[allow(clippy::too_many_arguments)]
     async fn flush_partition(
         hot_storage: &H,
@@ -234,18 +234,18 @@ where
         max_segment_size: usize,
         iceberg_enabled: bool,
         target_file_size_bytes: usize,
-    ) -> Result<(usize, u64, usize), StorageError> {
+    ) -> Result<(usize, u64, usize, usize), StorageError> {
         let high_watermark = hot_storage.high_watermark(topic, partition)?;
 
         if high_watermark <= watermark {
-            return Ok((0, watermark, 0)); // Nothing to flush
+            return Ok((0, watermark, 0, 0)); // Nothing to flush
         }
 
         // Read events from hot storage
         let all_events = hot_storage.read(topic, partition, watermark + 1, max_segment_size)?;
 
         if all_events.is_empty() {
-            return Ok((0, watermark, 0));
+            return Ok((0, watermark, 0, 0));
         }
 
         // When Iceberg is enabled, use size-based batching
@@ -280,9 +280,11 @@ where
         };
 
         if events.is_empty() {
-            return Ok((0, watermark, 0));
+            return Ok((0, watermark, 0, 0));
         }
 
+        // Note: size truncation above caps the batch before hour grouping, so per-hour segments may
+        // be uneven.
         // Group events by (event_date, event_hour) for correct Iceberg partitioning.
         // BTreeMap iterates in (date, hour) order, ensuring chronological segment writes.
         let mut hour_groups: std::collections::BTreeMap<(i32, i32), Vec<StoredEvent>> =
@@ -335,7 +337,12 @@ where
             "Flushed events to cold storage"
         );
 
-        Ok((total_events_count, max_watermark, total_bytes_flushed))
+        Ok((
+            total_events_count,
+            max_watermark,
+            total_bytes_flushed,
+            num_segments,
+        ))
     }
 }
 
@@ -371,6 +378,8 @@ where
                 "Flusher background task started with pipelined S3 uploads"
             );
 
+            let mut pending_watermark_persists: HashMap<String, HashMap<u32, u64>> = HashMap::new();
+
             loop {
                 // Wait for either timeout or explicit flush request
                 tokio::select! {
@@ -394,9 +403,6 @@ where
 
                 // Collect unique topics for snapshot commit
                 let mut flushed_topics = std::collections::HashSet::new();
-                // Track watermark updates pending persistence (deferred until snapshot commit)
-                let mut pending_watermark_persists: HashMap<String, Vec<(u32, u64)>> =
-                    HashMap::new();
 
                 // Use FuturesUnordered for pipelined S3 uploads
                 let mut flush_futures: FuturesUnordered<_> = FuturesUnordered::new();
@@ -441,7 +447,7 @@ where
                             flush_futures.next().await
                         {
                             match result {
-                                Ok((count, new_watermark, bytes)) => {
+                                Ok((count, new_watermark, bytes, _num_segments)) => {
                                     if count > 0 {
                                         // Record flush metrics
                                         flush_metrics.record_flush(
@@ -492,7 +498,7 @@ where
                 while let Some((topic, partition, result, duration_us)) = flush_futures.next().await
                 {
                     match result {
-                        Ok((count, new_watermark, bytes)) => {
+                        Ok((count, new_watermark, bytes, _num_segments)) => {
                             if count > 0 {
                                 // Record flush metrics
                                 flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
@@ -639,12 +645,17 @@ where
                                 }
                             }
                         } else {
+                            let deferred_watermarks = pending_watermark_persists
+                                .get(&topic)
+                                .map(|partitions| partitions.len())
+                                .unwrap_or(0);
                             tracing::debug!(
                                 topic = %topic,
                                 pending_files = stats.file_count,
                                 pending_bytes = stats.total_bytes,
                                 threshold_files = snapshot_threshold_files,
                                 threshold_bytes = snapshot_threshold_bytes,
+                                deferred_watermarks = deferred_watermarks,
                                 "Deferring snapshot commit (thresholds not met)"
                             );
                         }
@@ -685,10 +696,11 @@ where
         let mut total_events = 0;
         let mut total_segments = 0;
         let mut max_watermark = 0u64;
-        let mut flushed_topics = std::collections::HashSet::new();
-        let mut pending_watermark_persists: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
+        let mut topics_to_commit = std::collections::HashSet::new();
+        let mut pending_watermark_persists: HashMap<String, HashMap<u32, u64>> = HashMap::new();
 
         for (topic, partition) in topics_to_flush {
+            topics_to_commit.insert(topic.clone());
             let current_watermark = self
                 .watermarks
                 .read()
@@ -698,7 +710,7 @@ where
                 .unwrap_or(0);
 
             let start = Instant::now();
-            let (count, new_watermark, bytes) = Self::flush_partition(
+            let (count, new_watermark, bytes, num_segments) = Self::flush_partition(
                 &self.hot_storage,
                 &self.cold_storage,
                 &topic,
@@ -723,7 +735,7 @@ where
                 }
 
                 total_events += count;
-                total_segments += 1;
+                total_segments += num_segments;
 
                 self.watermarks
                     .write()
@@ -740,8 +752,6 @@ where
                     self.flush_metrics.as_ref(),
                 );
 
-                flushed_topics.insert(topic);
-
                 if new_watermark > max_watermark {
                     max_watermark = new_watermark;
                 }
@@ -750,7 +760,8 @@ where
 
         // Force commit all pending snapshots on flush_now (typically used for shutdown)
         if self.config.iceberg_enabled {
-            for topic in flushed_topics {
+            let mut commit_error: Option<StorageError> = None;
+            for topic in topics_to_commit {
                 let stats = self.cold_storage.pending_snapshot_stats(&topic);
                 if stats.file_count > 0 {
                     match self.cold_storage.commit_snapshot(&topic).await {
@@ -781,9 +792,15 @@ where
                                 error = %e,
                                 "Failed to commit Iceberg snapshot on flush_now"
                             );
+                            if commit_error.is_none() {
+                                commit_error = Some(e);
+                            }
                         }
                     }
                 }
+            }
+            if let Some(err) = commit_error {
+                return Err(err);
             }
         }
 
@@ -808,14 +825,14 @@ fn persist_or_defer_watermark<H: HotStorage>(
     partition: u32,
     watermark: u64,
     iceberg_enabled: bool,
-    pending: &mut HashMap<String, Vec<(u32, u64)>>,
+    pending: &mut HashMap<String, HashMap<u32, u64>>,
     flush_metrics: &FlushMetrics,
 ) {
     if iceberg_enabled {
         pending
             .entry(topic.to_string())
             .or_default()
-            .push((partition, watermark));
+            .insert(partition, watermark);
     } else if let Err(e) = hot_storage.save_flush_watermark(topic, partition, watermark) {
         flush_metrics.record_watermark_persist_error();
         tracing::error!(
@@ -830,19 +847,24 @@ fn persist_or_defer_watermark<H: HotStorage>(
 fn flush_pending_watermarks<H: HotStorage>(
     hot_storage: &H,
     topic: &str,
-    pending: &mut HashMap<String, Vec<(u32, u64)>>,
+    pending: &mut HashMap<String, HashMap<u32, u64>>,
     flush_metrics: &FlushMetrics,
 ) {
     if let Some(partitions) = pending.remove(topic) {
         for (partition, wm) in partitions {
-            if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
-                flush_metrics.record_watermark_persist_error();
-                tracing::error!(
-                    topic = %topic,
-                    partition = partition,
-                    error = %e,
-                    "Failed to persist flush watermark after snapshot"
-                );
+            if hot_storage
+                .save_flush_watermark(topic, partition, wm)
+                .is_err()
+            {
+                if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
+                    flush_metrics.record_watermark_persist_error();
+                    tracing::error!(
+                        topic = %topic,
+                        partition = partition,
+                        error = %e,
+                        "Failed to persist flush watermark after retry"
+                    );
+                }
             }
         }
     }
@@ -851,7 +873,9 @@ fn flush_pending_watermarks<H: HotStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{BulkWriteEvent, ColdStorageInfo, SegmentInfo, StoredEvent};
+    use crate::contracts::{
+        BulkWriteEvent, ColdStorageInfo, PendingSnapshotStats, SegmentInfo, StoredEvent,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -885,6 +909,7 @@ mod tests {
     struct TestHotStorage {
         events: HashMap<(String, u32), Vec<StoredEvent>>,
         flush_watermarks: Mutex<HashMap<(String, u32), u64>>,
+        save_failures_remaining: Mutex<u32>,
     }
 
     impl TestHotStorage {
@@ -1027,6 +1052,16 @@ mod tests {
             partition: u32,
             watermark: u64,
         ) -> Result<(), StorageError> {
+            {
+                let mut remaining = self
+                    .save_failures_remaining
+                    .lock()
+                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(StorageError::S3("injected watermark failure".into()));
+                }
+            }
             let mut wm = self
                 .flush_watermarks
                 .lock()
@@ -1052,6 +1087,8 @@ mod tests {
         writes: Mutex<Vec<(String, u32, Vec<StoredEvent>)>>,
         /// If set, the Nth write_segment call (0-indexed) will fail.
         fail_on_call: Mutex<Option<usize>>,
+        pending_stats: Mutex<HashMap<String, PendingSnapshotStats>>,
+        commit_counter: Mutex<i64>,
     }
 
     impl ColdStorage for TestColdStorage {
@@ -1074,6 +1111,13 @@ mod tests {
                 return Err(StorageError::S3("injected failure".into()));
             }
             writes.push((topic.to_string(), partition, events.to_vec()));
+            let mut pending = self
+                .pending_stats
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            let stats = pending.entry(topic.to_string()).or_default();
+            stats.file_count += 1;
+            stats.total_bytes += events.iter().map(|e| e.payload.len() as u64).sum::<u64>();
             Ok(format!("segment-{}", call_index))
         }
 
@@ -1088,6 +1132,33 @@ mod tests {
             _projection: &crate::contracts::ColumnProjection,
         ) -> Result<Vec<StoredEvent>, StorageError> {
             Ok(Vec::new())
+        }
+
+        fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
+            let pending = self.pending_stats.lock().ok();
+            pending
+                .and_then(|p| p.get(topic).cloned())
+                .unwrap_or_default()
+        }
+
+        async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
+            let mut pending = self
+                .pending_stats
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            if let Some(stats) = pending.get_mut(topic) {
+                if stats.file_count > 0 {
+                    stats.file_count = 0;
+                    stats.total_bytes = 0;
+                    let mut counter = self
+                        .commit_counter
+                        .lock()
+                        .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                    *counter += 1;
+                    return Ok(Some(*counter));
+                }
+            }
+            Ok(None)
         }
 
         async fn list_segments(
@@ -1107,9 +1178,6 @@ mod tests {
             }
         }
 
-        async fn commit_snapshot(&self, _topic: &str) -> Result<Option<i64>, StorageError> {
-            Ok(None)
-        }
     }
 
     #[tokio::test]
@@ -1536,5 +1604,92 @@ mod tests {
 
         // Watermark should NOT be persisted (remained at 0)
         assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_deferred_watermarks_survive_across_cycles() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![make_event(1, TS_HOUR_0_START), make_event(2, TS_HOUR_0_MID)],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            interval: Duration::from_millis(10),
+            max_segment_size: 1,
+            snapshot_threshold_files: 2,
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            0,
+            "Watermark should remain deferred until snapshot commit"
+        );
+
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if hot.load_flush_watermark("events", 0).unwrap() == 2 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            2,
+            "Watermark should persist after snapshot commit"
+        );
+
+        flusher.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_watermark_persist_failure_retries_once() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+
+        let hot = Arc::new(hot);
+        *hot.save_failures_remaining.lock().unwrap() = 1;
+
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
+        let flush_metrics = Arc::new(FlushMetrics::default());
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::clone(&flush_metrics),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 1);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 1);
+        assert_eq!(
+            flush_metrics
+                .watermark_persist_errors_total
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

@@ -581,6 +581,14 @@ impl RocksDbStorage {
         opts
     }
 
+    /// Creates durable write options for small critical metadata writes.
+    fn write_options_durable(&self) -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.disable_wal(false);
+        opts.set_sync(true);
+        opts
+    }
+
     /// Creates optimized read options for scanning with optional upper bound (#7).
     fn read_options_with_bound(upper_bound: Option<&[u8]>) -> ReadOptions {
         let mut opts = ReadOptions::default();
@@ -1119,7 +1127,7 @@ impl HotStorage for RocksDbStorage {
             .put_opt(
                 key.as_bytes(),
                 watermark.to_be_bytes(),
-                &self.write_options(),
+                &self.write_options_durable(),
             )
             .map_err(|e| StorageError::RocksDb(e.to_string()))
     }
