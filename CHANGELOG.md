@@ -43,6 +43,7 @@ All notable changes to Zombi are documented here.
   - Statistics for: `sequence`, `partition`, `timestamp_ms`, `event_date`, `event_hour`
 
 ### Changed
+- **Hot-only HTTP reads** — `GET /tables/{table}` now reads from RocksDB hot buffer only; cold/historical reads go through Iceberg engines
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
   - New binaries can read legacy values.
   - Older binaries cannot read newly written values.
