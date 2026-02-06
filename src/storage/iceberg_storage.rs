@@ -259,113 +259,146 @@ impl IcebergStorage {
     /// Commits pending data files by creating a new snapshot.
     /// This should be called after a batch of write_segment calls.
     pub async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
-        // Snapshot pending files for this topic.
-        let pending = {
-            let pending = self.pending_data_files.read().map_lock_err()?;
-            let mut collected = Vec::new();
-            for ((pending_topic, _partition), files) in pending.iter() {
-                if pending_topic == topic {
-                    collected.extend(files.iter().cloned());
+        // Drain pending files for this topic under a write lock. This prevents
+        // races where new files are added between a read snapshot and later clear.
+        // New writes after this point remain in the map for the next snapshot.
+        let drained_by_key = {
+            let mut pending = self.pending_data_files.write().map_lock_err()?;
+            let keys: Vec<(String, u32)> = pending
+                .keys()
+                .filter(|(pending_topic, _partition)| pending_topic == topic)
+                .cloned()
+                .collect();
+            let mut drained = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(files) = pending.remove(&key) {
+                    drained.push((key, files));
                 }
             }
-            collected
+            drained
         };
 
-        if pending.is_empty() {
+        if drained_by_key.is_empty() {
             return Ok(None);
         }
 
-        let mut metadata = self.get_or_create_metadata(topic)?;
+        let pending: Vec<(DataFile, ParquetFileMetadata)> = drained_by_key
+            .iter()
+            .flat_map(|(_key, files)| files.iter().cloned())
+            .collect();
 
-        // Calculate totals
-        let total_files = pending.len();
-        let total_rows: i64 = pending.iter().map(|(_, m)| m.row_count as i64).sum();
+        let commit_result: Result<(i64, usize, i64), StorageError> = async {
+            let mut metadata = self.get_or_create_metadata(topic)?;
 
-        let snapshot_id = crate::storage::generate_snapshot_id();
+            // Calculate totals
+            let total_files = pending.len();
+            let total_rows: i64 = pending.iter().map(|(_, m)| m.row_count as i64).sum();
 
-        // Build manifest file with all data file entries
-        let mut manifest = ManifestFile::new(snapshot_id, metadata.last_sequence_number + 1);
-        for (data_file, _) in &pending {
-            manifest.add_data_file(data_file.clone());
+            let snapshot_id = crate::storage::generate_snapshot_id();
+
+            // Build manifest file with all data file entries
+            let mut manifest = ManifestFile::new(snapshot_id, metadata.last_sequence_number + 1);
+            for (data_file, _) in &pending {
+                manifest.add_data_file(data_file.clone());
+            }
+
+            // Serialize manifest to Avro and upload
+            let manifest_filename = manifest_file_name();
+            let manifest_key = self.metadata_key(topic, &manifest_filename);
+            let manifest_s3_path = format!("s3://{}/{}", self.bucket, manifest_key);
+            let manifest_avro_bytes = manifest.to_avro_bytes(&metadata)?;
+            let manifest_length = manifest_avro_bytes.len() as i64;
+            self.upload_bytes(&manifest_key, manifest_avro_bytes, "application/avro")
+                .await?;
+
+            // Build manifest list entry pointing to the real manifest
+            let manifest_list_entries = vec![ManifestListEntry {
+                manifest_path: manifest_s3_path,
+                manifest_length,
+                partition_spec_id: 0,
+                content: 0,
+                sequence_number: metadata.last_sequence_number + 1,
+                min_sequence_number: metadata.last_sequence_number + 1,
+                added_snapshot_id: snapshot_id,
+                added_files_count: total_files as i32,
+                existing_files_count: 0,
+                deleted_files_count: 0,
+                added_rows_count: total_rows,
+                existing_rows_count: 0,
+                deleted_rows_count: 0,
+            }];
+
+            // Serialize manifest list to Avro and upload
+            let manifest_list_filename = manifest_list_file_name(snapshot_id);
+            let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
+            let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
+            let manifest_list_avro =
+                manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
+            self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
+                .await?;
+
+            // Add snapshot to metadata
+            metadata.add_snapshot(
+                &manifest_list_s3_path,
+                total_files,
+                total_rows,
+                SnapshotOperation::Append,
+            );
+
+            // Write new metadata file
+            let version = {
+                let mut versions = self.metadata_versions.write().map_lock_err()?;
+                let v = versions.entry(topic.to_string()).or_insert(0);
+                *v += 1;
+                *v
+            };
+
+            let metadata_filename = metadata_file_name(version);
+            let metadata_key = self.metadata_key(topic, &metadata_filename);
+            let metadata_json = metadata.to_json()?.into_bytes();
+            self.upload_bytes(&metadata_key, metadata_json, "application/json")
+                .await?;
+
+            // Update cached metadata
+            {
+                let mut cached = self.table_metadata.write().map_lock_err()?;
+                cached.insert(topic.to_string(), metadata);
+            }
+
+            Ok((snapshot_id, total_files, total_rows))
         }
+        .await;
 
-        // Serialize manifest to Avro and upload
-        let manifest_filename = manifest_file_name();
-        let manifest_key = self.metadata_key(topic, &manifest_filename);
-        let manifest_s3_path = format!("s3://{}/{}", self.bucket, manifest_key);
-        let manifest_avro_bytes = manifest.to_avro_bytes(&metadata)?;
-        let manifest_length = manifest_avro_bytes.len() as i64;
-        self.upload_bytes(&manifest_key, manifest_avro_bytes, "application/avro")
-            .await?;
-
-        // Build manifest list entry pointing to the real manifest
-        let manifest_list_entries = vec![ManifestListEntry {
-            manifest_path: manifest_s3_path,
-            manifest_length,
-            partition_spec_id: 0,
-            content: 0,
-            sequence_number: metadata.last_sequence_number + 1,
-            min_sequence_number: metadata.last_sequence_number + 1,
-            added_snapshot_id: snapshot_id,
-            added_files_count: total_files as i32,
-            existing_files_count: 0,
-            deleted_files_count: 0,
-            added_rows_count: total_rows,
-            existing_rows_count: 0,
-            deleted_rows_count: 0,
-        }];
-
-        // Serialize manifest list to Avro and upload
-        let manifest_list_filename = manifest_list_file_name(snapshot_id);
-        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
-        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
-        let manifest_list_avro = manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
-        self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
-            .await?;
-
-        // Add snapshot to metadata
-        metadata.add_snapshot(
-            &manifest_list_s3_path,
-            total_files,
-            total_rows,
-            SnapshotOperation::Append,
-        );
-
-        // Write new metadata file
-        let version = {
-            let mut versions = self.metadata_versions.write().map_lock_err()?;
-            let v = versions.entry(topic.to_string()).or_insert(0);
-            *v += 1;
-            *v
-        };
-
-        let metadata_filename = metadata_file_name(version);
-        let metadata_key = self.metadata_key(topic, &metadata_filename);
-        let metadata_json = metadata.to_json()?.into_bytes();
-        self.upload_bytes(&metadata_key, metadata_json, "application/json")
-            .await?;
-
-        // Update cached metadata
-        {
-            let mut cached = self.table_metadata.write().map_lock_err()?;
-            cached.insert(topic.to_string(), metadata);
+        match commit_result {
+            Ok((snapshot_id, total_files, total_rows)) => {
+                tracing::info!(
+                    topic = topic,
+                    snapshot_id = snapshot_id,
+                    files = total_files,
+                    rows = total_rows,
+                    "Created Iceberg snapshot"
+                );
+                Ok(Some(snapshot_id))
+            }
+            Err(error) => {
+                // Restore drained pending files so they can be retried on the next commit.
+                match self.pending_data_files.write() {
+                    Ok(mut pending_map) => {
+                        for (key, mut files) in drained_by_key {
+                            pending_map.entry(key).or_default().append(&mut files);
+                        }
+                    }
+                    Err(lock_error) => {
+                        tracing::error!(
+                            topic = topic,
+                            error = %lock_error,
+                            "Failed to restore pending snapshot files after commit failure"
+                        );
+                    }
+                }
+                Err(error)
+            }
         }
-
-        // Clear committed pending files only after all uploads and metadata writes succeed.
-        {
-            let mut pending = self.pending_data_files.write().map_lock_err()?;
-            pending.retain(|(pending_topic, _partition), _| pending_topic != topic);
-        }
-
-        tracing::info!(
-            topic = topic,
-            snapshot_id = snapshot_id,
-            files = total_files,
-            rows = total_rows,
-            "Created Iceberg snapshot"
-        );
-
-        Ok(Some(snapshot_id))
     }
 
     /// Returns the current table metadata for a topic.
