@@ -1005,6 +1005,7 @@ fn flush_pending_watermarks<H: HotStorage>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
     hot_storage: &H,
     cold_storage: &C,
@@ -2254,17 +2255,18 @@ mod tests {
             2,
             "Both events should be eventually persisted after replay"
         );
-        let writes = cold.writes.lock().unwrap();
-        let first_sequences: Vec<u64> = writes
-            .iter()
-            .filter_map(|(_, _, events)| events.first().map(|e| e.sequence))
-            .collect();
+        let first_sequences: Vec<u64> = {
+            let writes = cold.writes.lock().unwrap();
+            writes
+                .iter()
+                .filter_map(|(_, _, events)| events.first().map(|e| e.sequence))
+                .collect()
+        };
         assert_eq!(
             first_sequences,
             vec![1, 1, 2],
             "Sequence 1 should be replayed after cleanup"
         );
-        drop(writes);
 
         flusher.stop().await.unwrap();
     }
