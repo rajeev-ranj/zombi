@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+use apache_avro::types::Value as AvroValue;
+use apache_avro::Reader as AvroReader;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::primitives::ByteStream;
@@ -219,6 +221,297 @@ impl IcebergStorage {
     /// Returns the S3 key for metadata files.
     fn metadata_key(&self, topic: &str, filename: &str) -> String {
         make_metadata_key(&self.base_path, topic, filename)
+    }
+
+    /// Parses a metadata file version from a key like `.../v12.metadata.json`.
+    fn parse_metadata_version_from_key(key: &str) -> Option<i64> {
+        let filename = key.rsplit('/').next()?;
+        let version = filename.strip_prefix('v')?.strip_suffix(".metadata.json")?;
+        version.parse::<i64>().ok()
+    }
+
+    /// Parses an S3 URI (`s3://bucket/key`) into `(bucket, key)`.
+    fn parse_s3_uri(uri: &str) -> Result<(String, String), StorageError> {
+        let without_scheme = uri
+            .strip_prefix("s3://")
+            .ok_or_else(|| StorageError::InvalidInput(format!("Invalid S3 URI: {}", uri)))?;
+        let (bucket, key) = without_scheme.split_once('/').ok_or_else(|| {
+            StorageError::InvalidInput(format!("Invalid S3 URI (missing key): {}", uri))
+        })?;
+        if bucket.is_empty() || key.is_empty() {
+            return Err(StorageError::InvalidInput(format!(
+                "Invalid S3 URI (empty bucket/key): {}",
+                uri
+            )));
+        }
+        Ok((bucket.to_string(), key.to_string()))
+    }
+
+    /// Helper: fetches a named field from an Avro record.
+    fn avro_record_field<'a>(
+        fields: &'a [(String, AvroValue)],
+        name: &str,
+    ) -> Option<&'a AvroValue> {
+        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// Helper: unwraps Avro union values.
+    fn avro_unwrap_union(value: &AvroValue) -> &AvroValue {
+        match value {
+            AvroValue::Union(_, inner) => inner.as_ref(),
+            other => other,
+        }
+    }
+
+    /// Helper: extracts an i32/int field from an Avro record.
+    fn avro_record_i32(fields: &[(String, AvroValue)], name: &str) -> Option<i32> {
+        match Self::avro_unwrap_union(Self::avro_record_field(fields, name)?) {
+            AvroValue::Int(v) => Some(*v),
+            AvroValue::Long(v) => i32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// Helper: extracts a string field from an Avro record.
+    fn avro_record_string<'a>(fields: &'a [(String, AvroValue)], name: &str) -> Option<&'a str> {
+        match Self::avro_unwrap_union(Self::avro_record_field(fields, name)?) {
+            AvroValue::String(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Helper: extracts a bytes value from an Avro map keyed by field-id.
+    fn avro_map_bytes_by_field_id(
+        map: &HashMap<String, AvroValue>,
+        field_id: i32,
+    ) -> Option<&[u8]> {
+        let key = field_id.to_string();
+        match Self::avro_unwrap_union(map.get(&key)?) {
+            AvroValue::Bytes(v) => Some(v.as_slice()),
+            AvroValue::Fixed(_, v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Decodes a big-endian i64 from bytes.
+    fn decode_i64_be(bytes: &[u8]) -> Option<i64> {
+        let arr: [u8; 8] = bytes.try_into().ok()?;
+        Some(i64::from_be_bytes(arr))
+    }
+
+    /// Decodes a big-endian i32 from bytes.
+    fn decode_i32_be(bytes: &[u8]) -> Option<i32> {
+        let arr: [u8; 4] = bytes.try_into().ok()?;
+        Some(i32::from_be_bytes(arr))
+    }
+
+    /// Extracts data-manifest paths from a manifest-list Avro file.
+    fn extract_manifest_paths_from_manifest_list_avro(
+        bytes: &[u8],
+    ) -> Result<Vec<String>, StorageError> {
+        let reader =
+            AvroReader::new(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut manifest_paths = Vec::new();
+
+        for value in reader {
+            let value = value.map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let fields = match value {
+                AvroValue::Record(fields) => fields,
+                _ => continue,
+            };
+
+            // Only data manifests are relevant for flush watermark reconciliation.
+            let content = Self::avro_record_i32(&fields, "content").unwrap_or(0);
+            if content != 0 {
+                continue;
+            }
+
+            if let Some(path) = Self::avro_record_string(&fields, "manifest_path") {
+                manifest_paths.push(path.to_string());
+            }
+        }
+
+        Ok(manifest_paths)
+    }
+
+    /// Extracts max committed sequence watermark per partition from one manifest file.
+    fn extract_partition_watermarks_from_manifest_avro(
+        bytes: &[u8],
+    ) -> Result<HashMap<u32, u64>, StorageError> {
+        let reader =
+            AvroReader::new(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut per_partition = HashMap::new();
+
+        for value in reader {
+            let value = value.map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let entry_fields = match value {
+                AvroValue::Record(fields) => fields,
+                _ => continue,
+            };
+
+            // Skip deleted entries.
+            if Self::avro_record_i32(&entry_fields, "status") == Some(2) {
+                continue;
+            }
+
+            let data_file_fields = match Self::avro_unwrap_union(
+                match Self::avro_record_field(&entry_fields, "data_file") {
+                    Some(v) => v,
+                    None => continue,
+                },
+            ) {
+                AvroValue::Record(fields) => fields,
+                _ => continue,
+            };
+
+            let upper_bounds = match Self::avro_unwrap_union(
+                match Self::avro_record_field(data_file_fields, "upper_bounds") {
+                    Some(v) => v,
+                    None => continue,
+                },
+            ) {
+                AvroValue::Map(map) => map,
+                _ => continue,
+            };
+
+            let sequence = match Self::avro_map_bytes_by_field_id(
+                upper_bounds,
+                crate::storage::iceberg::field_ids::SEQUENCE,
+            )
+            .and_then(Self::decode_i64_be)
+            .and_then(|v| u64::try_from(v).ok())
+            {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let partition = match Self::avro_map_bytes_by_field_id(
+                upper_bounds,
+                crate::storage::iceberg::field_ids::PARTITION,
+            )
+            .and_then(Self::decode_i32_be)
+            .and_then(|v| u32::try_from(v).ok())
+            {
+                Some(v) => v,
+                None => continue,
+            };
+
+            per_partition
+                .entry(partition)
+                .and_modify(|current: &mut u64| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+
+        Ok(per_partition)
+    }
+
+    /// Lists all keys for a prefix with pagination.
+    async fn list_keys_with_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let client = &self.client;
+        let mut continuation_token: Option<String> = None;
+        let mut keys = Vec::new();
+
+        loop {
+            let continuation = continuation_token.clone();
+            let response = s3_retry!(
+                operation = {
+                    let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+                    if let Some(token) = continuation.as_deref() {
+                        request = request.continuation_token(token);
+                    }
+                    request.send().await
+                },
+                retry_config = self.retry_config,
+                context = format!("LIST s3://{}/{}", bucket, prefix),
+            )?;
+
+            let is_truncated = response.is_truncated().unwrap_or(false);
+            continuation_token = response.next_continuation_token().map(|t| t.to_string());
+
+            if let Some(contents) = response.contents {
+                for object in contents {
+                    if let Some(key) = object.key {
+                        keys.push(key);
+                    }
+                }
+            }
+
+            if !is_truncated {
+                break;
+            }
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Downloads an S3 object as bytes.
+    async fn download_object_bytes(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        let client = &self.client;
+        let response = s3_retry!(
+            operation = client.get_object().bucket(bucket).key(key).send().await,
+            retry_config = self.retry_config,
+            context = format!("GET s3://{}/{}", bucket, key),
+        )?;
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| StorageError::S3(e.to_string()))?
+            .into_bytes();
+        Ok(bytes.to_vec())
+    }
+
+    /// Loads the latest metadata file for a topic from S3, populating local caches.
+    async fn load_latest_table_metadata(
+        &self,
+        topic: &str,
+    ) -> Result<Option<TableMetadata>, StorageError> {
+        if let Some(cached) = self.get_table_metadata(topic)? {
+            return Ok(Some(cached));
+        }
+
+        let metadata_prefix = format!("{}/{}/metadata/", self.base_path, topic);
+        let keys = self
+            .list_keys_with_prefix(&self.bucket, &metadata_prefix)
+            .await?;
+
+        let latest = keys
+            .into_iter()
+            .filter_map(|key| {
+                Self::parse_metadata_version_from_key(&key).map(|version| (version, key))
+            })
+            .max_by_key(|(version, _)| *version);
+
+        let Some((version, key)) = latest else {
+            return Ok(None);
+        };
+
+        let bytes = self.download_object_bytes(&self.bucket, &key).await?;
+        let json =
+            String::from_utf8(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let metadata = TableMetadata::from_json(&json)?;
+
+        {
+            let mut cached = self.table_metadata.write().map_lock_err()?;
+            cached.insert(topic.to_string(), metadata.clone());
+        }
+        {
+            let mut versions = self.metadata_versions.write().map_lock_err()?;
+            versions.insert(topic.to_string(), version);
+        }
+
+        Ok(Some(metadata))
     }
 
     /// Checks if an S3 key belongs to the specified partition.
@@ -657,6 +950,58 @@ impl ColdStorage for IcebergStorage {
         }
     }
 
+    async fn committed_flush_watermarks(
+        &self,
+        topic: &str,
+    ) -> Result<HashMap<u32, u64>, StorageError> {
+        let metadata = match self.load_latest_table_metadata(topic).await? {
+            Some(metadata) => metadata,
+            None => return Ok(HashMap::new()),
+        };
+
+        let current_snapshot_id = match metadata.current_snapshot_id {
+            Some(id) => id,
+            None => return Ok(HashMap::new()),
+        };
+
+        let manifest_list_uri = match metadata
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id == current_snapshot_id)
+            .map(|snapshot| snapshot.manifest_list.clone())
+        {
+            Some(uri) => uri,
+            None => return Ok(HashMap::new()),
+        };
+
+        let (manifest_list_bucket, manifest_list_key) = Self::parse_s3_uri(&manifest_list_uri)?;
+        let manifest_list_bytes = self
+            .download_object_bytes(&manifest_list_bucket, &manifest_list_key)
+            .await?;
+        let manifest_paths =
+            Self::extract_manifest_paths_from_manifest_list_avro(&manifest_list_bytes)?;
+
+        let mut seen_paths = HashSet::new();
+        let mut per_partition = HashMap::new();
+        for manifest_uri in manifest_paths {
+            if !seen_paths.insert(manifest_uri.clone()) {
+                continue;
+            }
+            let (bucket, key) = Self::parse_s3_uri(&manifest_uri)?;
+            let manifest_bytes = self.download_object_bytes(&bucket, &key).await?;
+            let manifest_watermarks =
+                Self::extract_partition_watermarks_from_manifest_avro(&manifest_bytes)?;
+            for (partition, watermark) in manifest_watermarks {
+                per_partition
+                    .entry(partition)
+                    .and_modify(|current: &mut u64| *current = (*current).max(watermark))
+                    .or_insert(watermark);
+            }
+        }
+
+        Ok(per_partition)
+    }
+
     fn pending_snapshot_stats_for_partition(
         &self,
         topic: &str,
@@ -994,6 +1339,115 @@ mod tests {
         for count in partition_counts {
             assert!((12..=13).contains(&count));
         }
+    }
+
+    #[test]
+    fn parse_metadata_version_from_key_extracts_numeric_version() {
+        assert_eq!(
+            IcebergStorage::parse_metadata_version_from_key(
+                "tables/events/metadata/v42.metadata.json"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            IcebergStorage::parse_metadata_version_from_key("tables/events/metadata/snap-1.avro"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_manifest_paths_filters_non_data_manifests() {
+        let metadata = TableMetadata::new("s3://test-bucket/tables/events");
+        let entries = vec![
+            ManifestListEntry {
+                manifest_path: "s3://test-bucket/tables/events/metadata/data-m0.avro".into(),
+                manifest_length: 100,
+                partition_spec_id: 0,
+                content: 0,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 1,
+                added_files_count: 1,
+                existing_files_count: 0,
+                deleted_files_count: 0,
+                added_rows_count: 10,
+                existing_rows_count: 0,
+                deleted_rows_count: 0,
+            },
+            ManifestListEntry {
+                manifest_path: "s3://test-bucket/tables/events/metadata/delete-m0.avro".into(),
+                manifest_length: 100,
+                partition_spec_id: 0,
+                content: 1,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 1,
+                added_files_count: 0,
+                existing_files_count: 0,
+                deleted_files_count: 1,
+                added_rows_count: 0,
+                existing_rows_count: 0,
+                deleted_rows_count: 10,
+            },
+        ];
+
+        let avro = manifest_list_to_avro_bytes(&entries, &metadata).unwrap();
+        let paths = IcebergStorage::extract_manifest_paths_from_manifest_list_avro(&avro).unwrap();
+        assert_eq!(
+            paths,
+            vec!["s3://test-bucket/tables/events/metadata/data-m0.avro".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_partition_watermarks_reads_upper_bounds() {
+        use crate::storage::{ColumnStatistics, PartitionValues};
+
+        fn make_data_file(partition: u32, sequence_max: u64) -> DataFile {
+            let parquet_meta = ParquetFileMetadata {
+                path: format!("test-{}-{}.parquet", partition, sequence_max),
+                row_count: 1,
+                min_sequence: sequence_max,
+                max_sequence: sequence_max,
+                min_timestamp_ms: 0,
+                max_timestamp_ms: 0,
+                file_size_bytes: 1,
+                partition_values: PartitionValues::default(),
+                column_stats: ColumnStatistics {
+                    sequence_min: sequence_max,
+                    sequence_max,
+                    partition_min: partition,
+                    partition_max: partition,
+                    timestamp_min: 0,
+                    timestamp_max: 0,
+                    event_date_min: 0,
+                    event_date_max: 0,
+                    event_hour_min: 0,
+                    event_hour_max: 0,
+                },
+            };
+            DataFile::from_parquet_metadata(
+                &parquet_meta,
+                "s3://test-bucket/tables/events/data/file.parquet",
+            )
+        }
+
+        let metadata = TableMetadata::new("s3://test-bucket/tables/events");
+        let mut manifest = ManifestFile::new(123, 1);
+        manifest.add_data_file(make_data_file(0, 3));
+        manifest.add_data_file(make_data_file(0, 7));
+        manifest.add_data_file(make_data_file(1, 4));
+        manifest.entries.push(crate::storage::ManifestEntry {
+            status: 2,
+            snapshot_id: 123,
+            data_file: make_data_file(0, 99),
+        });
+
+        let avro = manifest.to_avro_bytes(&metadata).unwrap();
+        let per_partition =
+            IcebergStorage::extract_partition_watermarks_from_manifest_avro(&avro).unwrap();
+        assert_eq!(per_partition.get(&0), Some(&7));
+        assert_eq!(per_partition.get(&1), Some(&4));
     }
 
     #[tokio::test]

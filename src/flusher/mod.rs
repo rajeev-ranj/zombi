@@ -8,7 +8,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::contracts::{
-    ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, StorageError, StoredEvent,
+    ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, PendingSnapshotStats,
+    StorageError, StoredEvent,
 };
 use crate::metrics::{FlushMetrics, IcebergMetrics};
 use crate::storage::{derive_partition_columns, CatalogClient};
@@ -37,6 +38,9 @@ pub struct FlusherConfig {
     /// Minimum bytes accumulated before committing a snapshot.
     /// Default: 1GB. Snapshot commits when this OR threshold_files is exceeded.
     pub snapshot_threshold_bytes: usize,
+    /// Maximum age for pending snapshot data before forcing a commit.
+    /// Prevents low-volume topics from holding deferred watermarks indefinitely.
+    pub snapshot_max_age: Duration,
     /// Maximum concurrent S3 uploads during flush.
     /// Default: 4. Higher values can improve throughput but increase memory usage.
     pub max_concurrent_s3_uploads: usize,
@@ -52,6 +56,7 @@ impl Default for FlusherConfig {
             iceberg_enabled: false,
             snapshot_threshold_files: 10,
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
+            snapshot_max_age: Duration::from_secs(1800),  // 30 minutes
             max_concurrent_s3_uploads: 4,
         }
     }
@@ -81,6 +86,7 @@ impl FlusherConfig {
             iceberg_enabled: true,
             snapshot_threshold_files: 10, // Batch snapshots for reduced metadata churn
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
+            snapshot_max_age: Duration::from_secs(1800), // 30 minutes
             max_concurrent_s3_uploads: 4, // Pipeline S3 writes
         }
     }
@@ -224,6 +230,98 @@ where
         Ok(all)
     }
 
+    /// On startup (Iceberg mode), reconcile durable flush watermarks with the
+    /// highest sequence already committed in Iceberg metadata.
+    ///
+    /// This prevents re-flushing already committed data when a crash happens
+    /// after snapshot commit but before durable watermark persistence.
+    async fn reconcile_committed_watermarks_on_startup(&self) {
+        let topic_partitions = match Self::list_topic_partitions(self.hot_storage.as_ref()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to list topics for startup watermark reconciliation"
+                );
+                return;
+            }
+        };
+
+        let mut topics = std::collections::HashSet::new();
+        topics.extend(topic_partitions.into_iter().map(|(topic, _)| topic));
+
+        for topic in topics {
+            let committed = match self.cold_storage.committed_flush_watermarks(&topic).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        topic = %topic,
+                        error = %e,
+                        "Failed to load committed Iceberg watermarks during startup reconciliation"
+                    );
+                    continue;
+                }
+            };
+
+            if committed.is_empty() {
+                continue;
+            }
+
+            for (partition, committed_watermark) in committed {
+                let durable = match self.hot_storage.load_flush_watermark(&topic, partition) {
+                    Ok(wm) => wm,
+                    Err(e) => {
+                        self.flush_metrics.record_watermark_persist_error();
+                        tracing::warn!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Failed to load durable watermark during startup reconciliation, using 0"
+                        );
+                        0
+                    }
+                };
+
+                if committed_watermark <= durable {
+                    continue;
+                }
+
+                match self.watermarks.write() {
+                    Ok(mut in_memory) => {
+                        in_memory.insert((topic.clone(), partition), committed_watermark);
+                    }
+                    Err(e) => {
+                        self.flush_metrics.record_watermark_persist_error();
+                        tracing::error!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Failed to update in-memory watermark during startup reconciliation"
+                        );
+                        continue;
+                    }
+                }
+
+                persist_committed_watermark_or_defer(
+                    self.hot_storage.as_ref(),
+                    &topic,
+                    partition,
+                    committed_watermark,
+                    self.pending_watermark_persists.as_ref(),
+                    self.flush_metrics.as_ref(),
+                );
+
+                tracing::info!(
+                    topic = %topic,
+                    partition = partition,
+                    durable_watermark = durable,
+                    reconciled_watermark = committed_watermark,
+                    "Reconciled startup watermark from committed Iceberg metadata"
+                );
+            }
+        }
+    }
+
     /// Flushes a single topic/partition.
     ///
     /// When `iceberg_enabled` is true, uses `target_file_size_bytes` to limit
@@ -360,6 +458,10 @@ where
     async fn start(&self) -> Result<(), StorageError> {
         self.shutdown.store(false, Ordering::SeqCst);
 
+        if self.config.iceberg_enabled {
+            self.reconcile_committed_watermarks_on_startup().await;
+        }
+
         let hot_storage = Arc::clone(&self.hot_storage);
         let cold_storage = Arc::clone(&self.cold_storage);
         let watermarks = Arc::clone(&self.watermarks);
@@ -372,6 +474,7 @@ where
         let target_file_size_bytes = self.config.target_file_size_bytes;
         let snapshot_threshold_files = self.config.snapshot_threshold_files;
         let snapshot_threshold_bytes = self.config.snapshot_threshold_bytes;
+        let snapshot_max_age = self.config.snapshot_max_age;
         let max_concurrent_uploads = self.config.max_concurrent_s3_uploads;
         let flush_metrics = Arc::clone(&self.flush_metrics);
         let iceberg_metrics = Arc::clone(&self.iceberg_metrics);
@@ -384,6 +487,7 @@ where
                 max_concurrent_uploads = max_concurrent_uploads,
                 "Flusher background task started with pipelined S3 uploads"
             );
+            let mut pending_snapshot_since: HashMap<String, tokio::time::Instant> = HashMap::new();
 
             loop {
                 // Wait for either timeout or explicit flush request
@@ -457,61 +561,27 @@ where
                         if let Some((topic, partition, result, duration_us, files_before)) =
                             flush_futures.next().await
                         {
-                            match result {
-                                Ok((count, new_watermark, bytes, num_segments)) => {
-                                    if count > 0 {
-                                        // Record flush metrics
-                                        flush_metrics.record_flush(
-                                            count as u64,
-                                            bytes as u64,
-                                            duration_us,
-                                        );
-
-                                        // Record Iceberg metrics if enabled
-                                        if iceberg_enabled {
-                                            iceberg_metrics.record_parquet_write(
-                                                &topic,
-                                                bytes as u64,
-                                                num_segments as u64,
-                                            );
-                                        }
-
-                                        if let Ok(mut w) = watermarks.write() {
-                                            w.insert((topic.clone(), partition), new_watermark);
-                                        }
-
-                                        persist_or_defer_watermark(
-                                            hot_storage.as_ref(),
-                                            &topic,
-                                            partition,
-                                            new_watermark,
-                                            iceberg_enabled,
-                                            pending_watermark_persists.as_ref(),
-                                            flush_metrics.as_ref(),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    // Record S3 error
-                                    iceberg_metrics.record_s3_error();
-                                    clear_failed_partition_state(
-                                        hot_storage.as_ref(),
-                                        cold_storage.as_ref(),
-                                        &topic,
-                                        partition,
-                                        files_before,
-                                        watermarks.as_ref(),
-                                        pending_watermark_persists.as_ref(),
-                                        flush_metrics.as_ref(),
-                                        iceberg_metrics.as_ref(),
-                                    );
-                                    tracing::error!(
-                                        topic = %topic,
-                                        partition = partition,
-                                        error = %e,
-                                        "Failed to flush partition"
-                                    );
-                                }
+                            if let Err(e) = apply_partition_flush_result(
+                                hot_storage.as_ref(),
+                                cold_storage.as_ref(),
+                                &topic,
+                                partition,
+                                files_before,
+                                result,
+                                duration_us,
+                                iceberg_enabled,
+                                watermarks.as_ref(),
+                                pending_watermark_persists.as_ref(),
+                                flush_metrics.as_ref(),
+                                iceberg_metrics.as_ref(),
+                                "Failed to flush partition",
+                            ) {
+                                tracing::error!(
+                                    topic = %topic,
+                                    partition = partition,
+                                    error = %e,
+                                    "Background flush error handled"
+                                );
                             }
                         }
                     }
@@ -521,57 +591,27 @@ where
                 while let Some((topic, partition, result, duration_us, files_before)) =
                     flush_futures.next().await
                 {
-                    match result {
-                        Ok((count, new_watermark, bytes, num_segments)) => {
-                            if count > 0 {
-                                // Record flush metrics
-                                flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
-
-                                // Record Iceberg metrics if enabled
-                                if iceberg_enabled {
-                                    iceberg_metrics.record_parquet_write(
-                                        &topic,
-                                        bytes as u64,
-                                        num_segments as u64,
-                                    );
-                                }
-
-                                if let Ok(mut w) = watermarks.write() {
-                                    w.insert((topic.clone(), partition), new_watermark);
-                                }
-
-                                persist_or_defer_watermark(
-                                    hot_storage.as_ref(),
-                                    &topic,
-                                    partition,
-                                    new_watermark,
-                                    iceberg_enabled,
-                                    pending_watermark_persists.as_ref(),
-                                    flush_metrics.as_ref(),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            // Record S3 error
-                            iceberg_metrics.record_s3_error();
-                            clear_failed_partition_state(
-                                hot_storage.as_ref(),
-                                cold_storage.as_ref(),
-                                &topic,
-                                partition,
-                                files_before,
-                                watermarks.as_ref(),
-                                pending_watermark_persists.as_ref(),
-                                flush_metrics.as_ref(),
-                                iceberg_metrics.as_ref(),
-                            );
-                            tracing::error!(
-                                topic = %topic,
-                                partition = partition,
-                                error = %e,
-                                "Failed to flush partition"
-                            );
-                        }
+                    if let Err(e) = apply_partition_flush_result(
+                        hot_storage.as_ref(),
+                        cold_storage.as_ref(),
+                        &topic,
+                        partition,
+                        files_before,
+                        result,
+                        duration_us,
+                        iceberg_enabled,
+                        watermarks.as_ref(),
+                        pending_watermark_persists.as_ref(),
+                        flush_metrics.as_ref(),
+                        iceberg_metrics.as_ref(),
+                        "Failed to flush partition",
+                    ) {
+                        tracing::error!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Background flush error handled"
+                        );
                     }
                 }
 
@@ -588,111 +628,83 @@ where
                     for topic in topics_to_check {
                         let stats = cold_storage.pending_snapshot_stats(&topic);
 
-                        // Check if we've exceeded either threshold
-                        let should_commit = stats.file_count >= snapshot_threshold_files
-                            || stats.total_bytes >= snapshot_threshold_bytes as u64;
+                        if stats.file_count > 0 {
+                            let pending_age = pending_snapshot_since
+                                .entry(topic.clone())
+                                .or_insert_with(tokio::time::Instant::now)
+                                .elapsed();
 
-                        if should_commit {
-                            tracing::debug!(
-                                topic = %topic,
-                                pending_files = stats.file_count,
-                                pending_bytes = stats.total_bytes,
-                                threshold_files = snapshot_threshold_files,
-                                threshold_bytes = snapshot_threshold_bytes,
-                                "Snapshot threshold exceeded, committing"
-                            );
+                            // Check if we've exceeded thresholds or max age.
+                            let threshold_exceeded = stats.file_count >= snapshot_threshold_files
+                                || stats.total_bytes >= snapshot_threshold_bytes as u64;
+                            let age_exceeded = pending_age >= snapshot_max_age;
+                            let should_commit = threshold_exceeded || age_exceeded;
 
-                            match cold_storage.commit_snapshot(&topic).await {
-                                Ok(Some(snapshot_id)) => {
-                                    // Record snapshot commit metric
-                                    iceberg_metrics.record_snapshot_commit(&topic);
-                                    tracing::info!(
-                                        topic = %topic,
-                                        snapshot_id = snapshot_id,
-                                        files = stats.file_count,
-                                        bytes = stats.total_bytes,
-                                        "Committed Iceberg snapshot (batched)"
-                                    );
+                            if should_commit {
+                                tracing::debug!(
+                                    topic = %topic,
+                                    pending_files = stats.file_count,
+                                    pending_bytes = stats.total_bytes,
+                                    pending_age_secs = pending_age.as_secs_f64(),
+                                    threshold_files = snapshot_threshold_files,
+                                    threshold_bytes = snapshot_threshold_bytes,
+                                    snapshot_max_age_secs = snapshot_max_age.as_secs(),
+                                    reason = if age_exceeded && !threshold_exceeded {
+                                        "age"
+                                    } else {
+                                        "threshold"
+                                    },
+                                    "Committing Iceberg snapshot"
+                                );
 
-                                    // Catalog auto-registration (non-fatal)
+                                let committed_snapshot = match commit_snapshot_for_topic(
+                                    hot_storage.as_ref(),
+                                    cold_storage.as_ref(),
+                                    &topic,
+                                    stats,
+                                    pending_watermark_persists.as_ref(),
+                                    flush_metrics.as_ref(),
+                                    iceberg_metrics.as_ref(),
+                                    "Committed Iceberg snapshot (batched)",
+                                    "No Iceberg snapshot to commit (no pending files)",
+                                    "Failed to commit Iceberg snapshot",
+                                )
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        // Don't persist watermarks if snapshot commit
+                                        // failed — the data isn't durable yet.
+                                        continue;
+                                    }
+                                };
+
+                                pending_snapshot_since.remove(&topic);
+                                if committed_snapshot.is_some() {
                                     if let Some(ref catalog) = catalog_client {
-                                        if let Some(metadata_json) =
-                                            cold_storage.table_metadata_json(&topic)
-                                        {
-                                            match serde_json::from_str::<
-                                                crate::storage::TableMetadata,
-                                            >(
-                                                &metadata_json
-                                            ) {
-                                                Ok(metadata) => {
-                                                    let is_new = registered_topics
-                                                        .read()
-                                                        .map(|r| !r.contains(&topic))
-                                                        .unwrap_or(true);
-                                                    let result = if is_new {
-                                                        catalog
-                                                            .register_table(&topic, &metadata)
-                                                            .await
-                                                    } else {
-                                                        catalog
-                                                            .update_table(&topic, &metadata)
-                                                            .await
-                                                    };
-                                                    match result {
-                                                        Ok(()) => {
-                                                            if let Ok(mut r) =
-                                                                registered_topics.write()
-                                                            {
-                                                                r.insert(topic.clone());
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                error = %e,
-                                                                topic = %topic,
-                                                                "Catalog update failed (non-fatal)"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        topic = %topic,
-                                                        "Failed to parse table metadata for catalog"
-                                                    );
-                                                }
-                                            }
-                                        }
+                                        update_catalog_registration(
+                                            catalog,
+                                            cold_storage.as_ref(),
+                                            &topic,
+                                            registered_topics.as_ref(),
+                                        )
+                                        .await;
                                     }
                                 }
-                                Ok(None) => {
-                                    tracing::debug!(
-                                        topic = %topic,
-                                        "No Iceberg snapshot to commit (no pending files)"
-                                    );
-                                }
-                                Err(e) => {
-                                    iceberg_metrics.record_s3_error();
-                                    tracing::error!(
-                                        topic = %topic,
-                                        error = %e,
-                                        "Failed to commit Iceberg snapshot"
-                                    );
-                                    // Don't persist watermarks if snapshot commit
-                                    // failed — the data isn't durable yet.
-                                    continue;
-                                }
+                            } else {
+                                tracing::debug!(
+                                    topic = %topic,
+                                    pending_files = stats.file_count,
+                                    pending_bytes = stats.total_bytes,
+                                    pending_age_secs = pending_age.as_secs_f64(),
+                                    threshold_files = snapshot_threshold_files,
+                                    threshold_bytes = snapshot_threshold_bytes,
+                                    snapshot_max_age_secs = snapshot_max_age.as_secs(),
+                                    "Deferring snapshot commit (thresholds and age not met)"
+                                );
                             }
-
-                            // Persist deferred watermarks after successful snapshot commit.
-                            flush_pending_watermarks(
-                                hot_storage.as_ref(),
-                                &topic,
-                                pending_watermark_persists.as_ref(),
-                                flush_metrics.as_ref(),
-                            );
-                        } else if stats.file_count == 0 {
+                        } else {
+                            pending_snapshot_since.remove(&topic);
                             // No pending files and no commit needed: the data was
                             // already committed in a prior cycle but the watermark
                             // persist failed and was re-queued. Safe to persist now.
@@ -773,64 +785,31 @@ where
             .await;
             let duration_us = start.elapsed().as_micros() as u64;
 
-            match result {
-                Ok((count, new_watermark, bytes, num_segments)) => {
-                    if count > 0 {
-                        // Record flush metrics
-                        self.flush_metrics
-                            .record_flush(count as u64, bytes as u64, duration_us);
-
-                        // Record Iceberg metrics if enabled
-                        if self.config.iceberg_enabled {
-                            self.iceberg_metrics.record_parquet_write(
-                                &topic,
-                                bytes as u64,
-                                num_segments as u64,
-                            );
-                        }
-
-                        total_events += count;
-                        total_segments += num_segments;
-
-                        self.watermarks
-                            .write()
-                            .map_lock_err()?
-                            .insert((topic.clone(), partition), new_watermark);
-
-                        persist_or_defer_watermark(
-                            self.hot_storage.as_ref(),
-                            &topic,
-                            partition,
-                            new_watermark,
-                            self.config.iceberg_enabled,
-                            self.pending_watermark_persists.as_ref(),
-                            self.flush_metrics.as_ref(),
-                        );
-
+            match apply_partition_flush_result(
+                self.hot_storage.as_ref(),
+                self.cold_storage.as_ref(),
+                &topic,
+                partition,
+                files_before,
+                result,
+                duration_us,
+                self.config.iceberg_enabled,
+                self.watermarks.as_ref(),
+                self.pending_watermark_persists.as_ref(),
+                self.flush_metrics.as_ref(),
+                self.iceberg_metrics.as_ref(),
+                "Failed to flush partition in flush_now",
+            ) {
+                Ok(applied) => {
+                    total_events += applied.events_flushed;
+                    total_segments += applied.segments_written;
+                    if let Some(new_watermark) = applied.new_watermark {
                         if new_watermark > max_watermark {
                             max_watermark = new_watermark;
                         }
                     }
                 }
                 Err(e) => {
-                    self.iceberg_metrics.record_s3_error();
-                    clear_failed_partition_state(
-                        self.hot_storage.as_ref(),
-                        self.cold_storage.as_ref(),
-                        &topic,
-                        partition,
-                        files_before,
-                        self.watermarks.as_ref(),
-                        self.pending_watermark_persists.as_ref(),
-                        self.flush_metrics.as_ref(),
-                        self.iceberg_metrics.as_ref(),
-                    );
-                    tracing::error!(
-                        topic = %topic,
-                        partition = partition,
-                        error = %e,
-                        "Failed to flush partition in flush_now"
-                    );
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
@@ -850,37 +829,22 @@ where
             for topic in topics_to_commit {
                 let stats = self.cold_storage.pending_snapshot_stats(&topic);
                 if stats.file_count > 0 {
-                    match self.cold_storage.commit_snapshot(&topic).await {
-                        Ok(Some(snapshot_id)) => {
-                            // Record snapshot commit metric
-                            self.iceberg_metrics.record_snapshot_commit(&topic);
-                            tracing::info!(
-                                topic = %topic,
-                                snapshot_id = snapshot_id,
-                                files = stats.file_count,
-                                bytes = stats.total_bytes,
-                                "Force-committed Iceberg snapshot on flush_now"
-                            );
-
-                            // Persist flush watermarks after successful snapshot
-                            flush_pending_watermarks(
-                                self.hot_storage.as_ref(),
-                                &topic,
-                                self.pending_watermark_persists.as_ref(),
-                                self.flush_metrics.as_ref(),
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            self.iceberg_metrics.record_s3_error();
-                            tracing::error!(
-                                topic = %topic,
-                                error = %e,
-                                "Failed to commit Iceberg snapshot on flush_now"
-                            );
-                            if commit_error.is_none() {
-                                commit_error = Some(e);
-                            }
+                    if let Err(e) = commit_snapshot_for_topic(
+                        self.hot_storage.as_ref(),
+                        self.cold_storage.as_ref(),
+                        &topic,
+                        stats,
+                        self.pending_watermark_persists.as_ref(),
+                        self.flush_metrics.as_ref(),
+                        self.iceberg_metrics.as_ref(),
+                        "Force-committed Iceberg snapshot on flush_now",
+                        "No Iceberg snapshot to commit (no pending files)",
+                        "Failed to commit Iceberg snapshot on flush_now",
+                    )
+                    .await
+                    {
+                        if commit_error.is_none() {
+                            commit_error = Some(e);
                         }
                     }
                 } else {
@@ -923,6 +887,228 @@ where
         Ok(*watermarks
             .get(&(topic.to_string(), partition))
             .unwrap_or(&0))
+    }
+}
+
+struct AppliedPartitionFlush {
+    events_flushed: usize,
+    segments_written: usize,
+    new_watermark: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_partition_flush_result<H: HotStorage, C: ColdStorage>(
+    hot_storage: &H,
+    cold_storage: &C,
+    topic: &str,
+    partition: u32,
+    files_before: usize,
+    result: Result<(usize, u64, usize, usize), StorageError>,
+    duration_us: u64,
+    iceberg_enabled: bool,
+    watermarks: &RwLock<HashMap<(String, u32), u64>>,
+    pending_watermark_persists: &RwLock<DeferredWatermarks>,
+    flush_metrics: &FlushMetrics,
+    iceberg_metrics: &IcebergMetrics,
+    error_log: &'static str,
+) -> Result<AppliedPartitionFlush, StorageError> {
+    match result {
+        Ok((count, new_watermark, bytes, num_segments)) => {
+            if count == 0 {
+                return Ok(AppliedPartitionFlush {
+                    events_flushed: 0,
+                    segments_written: 0,
+                    new_watermark: None,
+                });
+            }
+
+            flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
+
+            if iceberg_enabled {
+                iceberg_metrics.record_parquet_write(topic, bytes as u64, num_segments as u64);
+            }
+
+            match watermarks.write() {
+                Ok(mut w) => {
+                    w.insert((topic.to_string(), partition), new_watermark);
+                }
+                Err(e) => {
+                    flush_metrics.record_watermark_persist_error();
+                    return Err(StorageError::LockPoisoned(e.to_string()));
+                }
+            }
+
+            persist_or_defer_watermark(
+                hot_storage,
+                topic,
+                partition,
+                new_watermark,
+                iceberg_enabled,
+                pending_watermark_persists,
+                flush_metrics,
+            );
+
+            Ok(AppliedPartitionFlush {
+                events_flushed: count,
+                segments_written: num_segments,
+                new_watermark: Some(new_watermark),
+            })
+        }
+        Err(e) => {
+            iceberg_metrics.record_s3_error();
+            clear_failed_partition_state(
+                hot_storage,
+                cold_storage,
+                topic,
+                partition,
+                files_before,
+                watermarks,
+                pending_watermark_persists,
+                flush_metrics,
+                iceberg_metrics,
+            );
+            tracing::error!(
+                topic = %topic,
+                partition = partition,
+                error = %e,
+                "{}",
+                error_log
+            );
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_snapshot_for_topic<H: HotStorage, C: ColdStorage>(
+    hot_storage: &H,
+    cold_storage: &C,
+    topic: &str,
+    stats: PendingSnapshotStats,
+    pending_watermark_persists: &RwLock<DeferredWatermarks>,
+    flush_metrics: &FlushMetrics,
+    iceberg_metrics: &IcebergMetrics,
+    success_log: &'static str,
+    no_snapshot_log: &'static str,
+    error_log: &'static str,
+) -> Result<Option<i64>, StorageError> {
+    let snapshot_id = match cold_storage.commit_snapshot(topic).await {
+        Ok(snapshot_id) => snapshot_id,
+        Err(e) => {
+            iceberg_metrics.record_s3_error();
+            tracing::error!(
+                topic = %topic,
+                error = %e,
+                "{}",
+                error_log
+            );
+            return Err(e);
+        }
+    };
+
+    if let Some(snapshot_id) = snapshot_id {
+        iceberg_metrics.record_snapshot_commit(topic);
+        tracing::info!(
+            topic = %topic,
+            snapshot_id = snapshot_id,
+            files = stats.file_count,
+            bytes = stats.total_bytes,
+            "{}",
+            success_log
+        );
+    } else {
+        tracing::debug!(topic = %topic, "{}", no_snapshot_log);
+    }
+
+    // Persist deferred watermark writes now that snapshot state is durable.
+    flush_pending_watermarks(
+        hot_storage,
+        topic,
+        pending_watermark_persists,
+        flush_metrics,
+    );
+
+    Ok(snapshot_id)
+}
+
+async fn update_catalog_registration<C: ColdStorage>(
+    catalog: &CatalogClient,
+    cold_storage: &C,
+    topic: &str,
+    registered_topics: &RwLock<std::collections::HashSet<String>>,
+) {
+    let Some(metadata_json) = cold_storage.table_metadata_json(topic) else {
+        return;
+    };
+
+    let metadata = match serde_json::from_str::<crate::storage::TableMetadata>(&metadata_json) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                topic = %topic,
+                "Failed to parse table metadata for catalog"
+            );
+            return;
+        }
+    };
+
+    let is_new = registered_topics
+        .read()
+        .map(|r| !r.contains(topic))
+        .unwrap_or(true);
+    let result = if is_new {
+        catalog.register_table(topic, &metadata).await
+    } else {
+        catalog.update_table(topic, &metadata).await
+    };
+
+    match result {
+        Ok(()) => {
+            if let Ok(mut r) = registered_topics.write() {
+                r.insert(topic.to_string());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                topic = %topic,
+                "Catalog update failed (non-fatal)"
+            );
+        }
+    }
+}
+
+fn persist_committed_watermark_or_defer<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    partition: u32,
+    watermark: u64,
+    pending: &RwLock<DeferredWatermarks>,
+    flush_metrics: &FlushMetrics,
+) {
+    if let Err(e) = hot_storage.save_flush_watermark(topic, partition, watermark) {
+        flush_metrics.record_watermark_persist_error();
+        tracing::warn!(
+            topic = %topic,
+            partition = partition,
+            watermark = watermark,
+            error = %e,
+            "Failed to persist reconciled startup watermark, deferring retry"
+        );
+        if let Ok(mut deferred) = pending.write() {
+            deferred
+                .entry(topic.to_string())
+                .or_default()
+                .insert(partition, watermark);
+        } else {
+            flush_metrics.record_watermark_persist_error();
+            tracing::error!(
+                topic = %topic,
+                partition = partition,
+                "Failed to defer reconciled startup watermark due to lock error"
+            );
+        }
     }
 }
 
@@ -1035,42 +1221,87 @@ fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
     flush_metrics: &FlushMetrics,
     iceberg_metrics: &IcebergMetrics,
 ) {
-    // Load durable watermark for rollback decision.
-    let durable_watermark = match hot_storage.load_flush_watermark(topic, partition) {
-        Ok(wm) => wm,
-        Err(e) => {
-            flush_metrics.record_watermark_persist_error();
-            tracing::error!(
-                topic = %topic,
-                partition = partition,
-                error = %e,
-                "Failed to load durable watermark during failure recovery, resetting to 0"
-            );
-            0
-        }
-    };
-
-    let in_memory_watermark = watermarks
-        .read()
-        .ok()
-        .and_then(|w| w.get(&(topic.to_string(), partition)).copied())
-        .unwrap_or(0);
-
     let files_after = cold_storage
         .pending_snapshot_stats_for_partition(topic, partition)
         .file_count;
     let new_files_written = files_after > files_before;
-    let watermark_advanced = in_memory_watermark > durable_watermark;
 
-    // Clear pending files if:
-    // - New segments were written this cycle (partial write), OR
-    // - The in-memory watermark advanced past durable, meaning prior pending
-    //   files will be re-flushed after rollback and would otherwise duplicate.
-    //
-    // Skip clearing if neither condition is true (pre-write failure with no
-    // watermark advancement), which preserves files from prior successful cycles.
-    if new_files_written || watermark_advanced {
+    // Clear pending files only when this cycle wrote new files before failing.
+    // For pre-write failures, preserve existing pending files and deferred
+    // watermark state so a later commit/persist retry can succeed.
+    if new_files_written {
         cold_storage.clear_pending_data_files(topic, partition);
+
+        // Load durable watermark for rollback decision.
+        let durable_watermark = match hot_storage.load_flush_watermark(topic, partition) {
+            Ok(wm) => wm,
+            Err(e) => {
+                flush_metrics.record_watermark_persist_error();
+                tracing::error!(
+                    topic = %topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to load durable watermark during failure recovery, resetting to 0"
+                );
+                0
+            }
+        };
+
+        // Roll back in-memory watermark to last durable value so dropped pending files are re-flushed.
+        match watermarks.write() {
+            Ok(mut in_memory) => {
+                let key = (topic.to_string(), partition);
+                let previous = in_memory.get(&key).copied().unwrap_or(0);
+                if durable_watermark == 0 {
+                    in_memory.remove(&key);
+                } else {
+                    in_memory.insert(key, durable_watermark);
+                }
+                if previous != durable_watermark {
+                    tracing::warn!(
+                        topic = %topic,
+                        partition = partition,
+                        previous_watermark = previous,
+                        rolled_back_to = durable_watermark,
+                        "Rolled back in-memory flush watermark after partition failure"
+                    );
+                }
+            }
+            Err(e) => {
+                flush_metrics.record_watermark_persist_error();
+                tracing::error!(
+                    topic = %topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to roll back in-memory watermark due to lock error"
+                );
+            }
+        }
+
+        if let Ok(mut deferred) = pending_watermarks.write() {
+            let remove_topic = if let Some(partitions) = deferred.get_mut(topic) {
+                partitions.remove(&partition);
+                partitions.is_empty()
+            } else {
+                false
+            };
+            if remove_topic {
+                deferred.remove(topic);
+            }
+        } else {
+            flush_metrics.record_watermark_persist_error();
+            tracing::error!(
+                topic = %topic,
+                partition = partition,
+                "Failed to clear deferred watermark state for failed partition due to lock error"
+            );
+        }
+    } else {
+        tracing::debug!(
+            topic = %topic,
+            partition = partition,
+            "Flush failed before writing new files; preserving deferred watermark state"
+        );
     }
 
     // Keep gauges in sync with cold-storage truth after cleanup.
@@ -1080,56 +1311,6 @@ fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
         pending_stats.file_count as u64,
         pending_stats.total_bytes,
     );
-
-    // Roll back in-memory watermark to last durable value so dropped pending files are re-flushed.
-    match watermarks.write() {
-        Ok(mut in_memory) => {
-            let key = (topic.to_string(), partition);
-            let previous = in_memory.get(&key).copied().unwrap_or(0);
-            if durable_watermark == 0 {
-                in_memory.remove(&key);
-            } else {
-                in_memory.insert(key, durable_watermark);
-            }
-            if previous != durable_watermark {
-                tracing::warn!(
-                    topic = %topic,
-                    partition = partition,
-                    previous_watermark = previous,
-                    rolled_back_to = durable_watermark,
-                    "Rolled back in-memory flush watermark after partition failure"
-                );
-            }
-        }
-        Err(e) => {
-            flush_metrics.record_watermark_persist_error();
-            tracing::error!(
-                topic = %topic,
-                partition = partition,
-                error = %e,
-                "Failed to roll back in-memory watermark due to lock error"
-            );
-        }
-    }
-
-    if let Ok(mut deferred) = pending_watermarks.write() {
-        let remove_topic = if let Some(partitions) = deferred.get_mut(topic) {
-            partitions.remove(&partition);
-            partitions.is_empty()
-        } else {
-            false
-        };
-        if remove_topic {
-            deferred.remove(topic);
-        }
-    } else {
-        flush_metrics.record_watermark_persist_error();
-        tracing::error!(
-            topic = %topic,
-            partition = partition,
-            "Failed to clear deferred watermark state for failed partition due to lock error"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1151,6 +1332,7 @@ mod tests {
         assert!(!config.iceberg_enabled);
         assert_eq!(config.snapshot_threshold_files, 10);
         assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
+        assert_eq!(config.snapshot_max_age, Duration::from_secs(1800));
         assert_eq!(config.max_concurrent_s3_uploads, 4);
     }
 
@@ -1164,6 +1346,7 @@ mod tests {
         assert!(config.iceberg_enabled);
         assert_eq!(config.snapshot_threshold_files, 10);
         assert_eq!(config.snapshot_threshold_bytes, 1024 * 1024 * 1024); // 1GB
+        assert_eq!(config.snapshot_max_age, Duration::from_secs(1800));
         assert_eq!(config.max_concurrent_s3_uploads, 4);
     }
 
@@ -1362,6 +1545,7 @@ mod tests {
         commit_attempts: Mutex<usize>,
         pending_stats: Mutex<HashMap<(String, u32), PendingSnapshotStats>>,
         commit_counter: Mutex<i64>,
+        committed_watermarks: Mutex<HashMap<String, HashMap<u32, u64>>>,
     }
 
     impl ColdStorage for TestColdStorage {
@@ -1501,6 +1685,17 @@ mod tests {
                 pending.remove(&(topic.to_string(), partition));
             }
         }
+
+        async fn committed_flush_watermarks(
+            &self,
+            topic: &str,
+        ) -> Result<HashMap<u32, u64>, StorageError> {
+            let committed = self
+                .committed_watermarks
+                .lock()
+                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+            Ok(committed.get(topic).cloned().unwrap_or_default())
+        }
     }
 
     #[tokio::test]
@@ -1550,6 +1745,86 @@ mod tests {
         assert_eq!(writes[0].0, "events");
         assert_eq!(writes[0].1, 0);
         assert_eq!(writes[0].2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_committed_iceberg_watermark() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+        let hot = Arc::new(hot);
+
+        let cold = Arc::new(TestColdStorage::default());
+        cold.committed_watermarks
+            .lock()
+            .unwrap()
+            .entry("events".to_string())
+            .or_default()
+            .insert(0, 7);
+
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            FlusherConfig {
+                iceberg_enabled: true,
+                ..Default::default()
+            },
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        assert_eq!(flusher.flush_watermark("events", 0).await.unwrap(), 7);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 7);
+
+        flusher.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_reconciliation_defers_watermark_persist_on_failure() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+        let hot = Arc::new(hot);
+        *hot.save_failures_remaining.lock().unwrap() = 1;
+
+        let cold = Arc::new(TestColdStorage::default());
+        cold.committed_watermarks
+            .lock()
+            .unwrap()
+            .entry("events".to_string())
+            .or_default()
+            .insert(0, 1);
+
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            FlusherConfig {
+                iceberg_enabled: true,
+                interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        // Startup reconciliation should update in-memory watermark even if
+        // durable persistence fails on the first attempt.
+        assert_eq!(flusher.flush_watermark("events", 0).await.unwrap(), 1);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 0);
+
+        // Background loop should retry deferred persist when no pending files exist.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if hot.load_flush_watermark("events", 0).unwrap() == 1 {
+                break;
+            }
+        }
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 1);
+
+        flusher.stop().await.unwrap();
     }
 
     // --- Hour-boundary splitting tests (Issue #98) ---
@@ -2263,7 +2538,6 @@ mod tests {
         let config = FlusherConfig {
             iceberg_enabled: true,
             interval: Duration::from_millis(10),
-            max_segment_size: 1,
             snapshot_threshold_files: 2,
             ..Default::default()
         };
@@ -2277,26 +2551,19 @@ mod tests {
 
         flusher.start().await.unwrap();
 
-        // Cycle 1: flush sequence 1, watermark advances in-memory, pending files = 1.
+        // First cycle: sequence 1 write succeeds, sequence 2 write fails in the
+        // same flush pass (partial failure), so cleanup clears pending files and
+        // rolls back to durable watermark.
         for _ in 0..5 {
             tokio::time::advance(Duration::from_millis(10)).await;
             tokio::task::yield_now().await;
-            if cold.writes.lock().unwrap().len() == 1 {
+            if cold.writes.lock().unwrap().len() == 1
+                && cold.pending_snapshot_stats("events").file_count == 0
+            {
                 break;
             }
         }
         assert_eq!(cold.writes.lock().unwrap().len(), 1);
-        assert_eq!(cold.pending_snapshot_stats("events").file_count, 1);
-
-        // Cycle 2: write fails and cleanup clears pending files. In-memory watermark
-        // must roll back to the durable watermark (still 0 because no snapshot committed yet).
-        for _ in 0..5 {
-            tokio::time::advance(Duration::from_millis(10)).await;
-            tokio::task::yield_now().await;
-            if cold.pending_snapshot_stats("events").file_count == 0 {
-                break;
-            }
-        }
         assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
         assert_eq!(
             flusher.flush_watermark("events", 0).await.unwrap(),
@@ -2336,7 +2603,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn background_failure_cleanup_resyncs_pending_metrics() {
+    async fn background_pre_write_failure_preserves_pending_metrics() {
         let mut hot = TestHotStorage::default();
         hot.insert(
             "events",
@@ -2386,7 +2653,8 @@ mod tests {
             1
         );
 
-        // Next cycle fails and clears pending files; metrics must resync to 0.
+        // Next cycle fails before writing new files. Pending files and metrics
+        // should stay intact so deferred state can be retried.
         for _ in 0..5 {
             tokio::time::advance(Duration::from_millis(10)).await;
             tokio::task::yield_now().await;
@@ -2394,21 +2662,21 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 1);
         assert_eq!(
             *iceberg_metrics
                 .pending_snapshot_files
                 .get("events")
                 .unwrap(),
-            0,
-            "Pending file gauge should reflect cleanup state"
+            1,
+            "Pending file gauge should remain unchanged on pre-write failure"
         );
         assert_eq!(
             *iceberg_metrics
                 .pending_snapshot_bytes
                 .get("events")
                 .unwrap(),
-            0
+            1
         );
 
         flusher.stop().await.unwrap();
@@ -2500,6 +2768,109 @@ mod tests {
             1,
             "Deferred watermark must be persisted on quiet topic"
         );
+    }
+
+    /// P1 regression: pre-write failures must not discard deferred watermarks.
+    /// If commit already succeeded but watermark persist previously failed,
+    /// the deferred watermark should survive transient flush errors and retry.
+    #[tokio::test]
+    async fn pre_write_failure_preserves_deferred_watermark_state() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+
+        let hot = Arc::new(hot);
+        // First persist attempt + retry both fail, leaving deferred state queued.
+        *hot.save_failures_remaining.lock().unwrap() = 2;
+
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            snapshot_threshold_files: 1, // commit snapshot immediately
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let first = flusher.flush_now().await.unwrap();
+        assert_eq!(first.events_flushed, 1);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 0);
+
+        // Inject a pre-write failure (high_watermark read) on next cycle.
+        *hot.high_watermark_failures.lock().unwrap() = 1;
+        let second = flusher.flush_now().await;
+        assert!(second.is_err(), "Expected injected pre-write failure");
+
+        // In-memory watermark should remain advanced so retry can persist
+        // without re-flushing data.
+        assert_eq!(flusher.flush_watermark("events", 0).await.unwrap(), 1);
+
+        // Next cycle should persist deferred watermark without re-flushing.
+        let third = flusher.flush_now().await.unwrap();
+        assert_eq!(third.events_flushed, 0);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 1);
+        assert_eq!(
+            cold.writes.lock().unwrap().len(),
+            1,
+            "Should not re-flush after pre-write failure"
+        );
+    }
+
+    /// Under-threshold pending files should still commit after max age to
+    /// prevent deferred watermarks from staying in memory indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn background_commits_under_threshold_after_snapshot_max_age() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            interval: Duration::from_millis(10),
+            snapshot_threshold_files: 10,
+            snapshot_threshold_bytes: usize::MAX,
+            snapshot_max_age: Duration::from_millis(35),
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        // First cycles flush data but stay under commit thresholds.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 1);
+        assert_eq!(hot.load_flush_watermark("events", 0).unwrap(), 0);
+
+        // Eventually age threshold should force a snapshot commit.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if hot.load_flush_watermark("events", 0).unwrap() == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            1,
+            "Watermark should persist after age-triggered commit"
+        );
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+
+        flusher.stop().await.unwrap();
     }
 
     /// P2 regression: a pre-write failure (e.g., high_watermark read error)

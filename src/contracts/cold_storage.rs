@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 
 use serde::Serialize;
@@ -110,6 +111,18 @@ pub trait ColdStorage: Send + Sync {
     /// a snapshot), but clearing them from `pending_data_files` prevents
     /// duplicate rows on the next retry cycle.
     fn clear_pending_data_files(&self, _topic: &str, _partition: u32) {}
+
+    /// Returns the highest committed sequence watermark per partition for a topic.
+    ///
+    /// Implementations should only consider files reachable from the current
+    /// committed snapshot (not orphan files). Backends without snapshot semantics
+    /// return an empty map.
+    fn committed_flush_watermarks(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<HashMap<u32, u64>, StorageError>> + Send {
+        async move { Ok(HashMap::new()) }
+    }
 }
 
 /// Information about a stored segment.

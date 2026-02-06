@@ -156,6 +156,16 @@ impl ColdStorage for ColdStorageBackend {
             Self::Iceberg(s) => s.clear_pending_data_files(topic, partition),
         }
     }
+
+    async fn committed_flush_watermarks(
+        &self,
+        topic: &str,
+    ) -> Result<std::collections::HashMap<u32, u64>, StorageError> {
+        match self {
+            Self::S3(s) => s.committed_flush_watermarks(topic).await,
+            Self::Iceberg(s) => s.committed_flush_watermarks(topic).await,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -147,6 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .and_then(|v| v.parse::<usize>().ok())
                 .map(|gb| gb * 1024 * 1024 * 1024)
                 .unwrap_or(base_config.snapshot_threshold_bytes),
+            snapshot_max_age: std::env::var("ZOMBI_SNAPSHOT_MAX_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(base_config.snapshot_max_age),
             max_concurrent_s3_uploads: std::env::var("ZOMBI_MAX_CONCURRENT_S3_UPLOADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -161,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 target_file_size_mb = config.target_file_size_bytes / (1024 * 1024),
                 snapshot_threshold_files = config.snapshot_threshold_files,
                 snapshot_threshold_gb = config.snapshot_threshold_bytes / (1024 * 1024 * 1024),
+                snapshot_max_age_secs = config.snapshot_max_age.as_secs(),
                 max_concurrent_s3_uploads = config.max_concurrent_s3_uploads,
                 "Iceberg mode enabled - using optimized flush settings with pipelined S3 uploads"
             );
