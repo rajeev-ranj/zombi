@@ -433,6 +433,7 @@ where
 
                     // Create the flush future with timing
                     flush_futures.push(async move {
+                        let files_before = cold.pending_snapshot_stats(&topic_clone).file_count;
                         let start = Instant::now();
                         let result = Self::flush_partition(
                             &hot,
@@ -446,12 +447,12 @@ where
                         )
                         .await;
                         let duration_us = start.elapsed().as_micros() as u64;
-                        (topic_clone, partition, result, duration_us)
+                        (topic_clone, partition, result, duration_us, files_before)
                     });
 
                     // If we've reached max concurrency, wait for one to complete
                     if flush_futures.len() >= max_concurrent_uploads {
-                        if let Some((topic, partition, result, duration_us)) =
+                        if let Some((topic, partition, result, duration_us, files_before)) =
                             flush_futures.next().await
                         {
                             match result {
@@ -496,6 +497,7 @@ where
                                         cold_storage.as_ref(),
                                         &topic,
                                         partition,
+                                        files_before,
                                         watermarks.as_ref(),
                                         pending_watermark_persists.as_ref(),
                                         flush_metrics.as_ref(),
@@ -514,7 +516,8 @@ where
                 }
 
                 // Drain remaining futures
-                while let Some((topic, partition, result, duration_us)) = flush_futures.next().await
+                while let Some((topic, partition, result, duration_us, files_before)) =
+                    flush_futures.next().await
                 {
                     match result {
                         Ok((count, new_watermark, bytes, num_segments)) => {
@@ -554,6 +557,7 @@ where
                                 cold_storage.as_ref(),
                                 &topic,
                                 partition,
+                                files_before,
                                 watermarks.as_ref(),
                                 pending_watermark_persists.as_ref(),
                                 flush_metrics.as_ref(),
@@ -659,14 +663,6 @@ where
                                             }
                                         }
                                     }
-
-                                    // Persist flush watermarks now that the snapshot is committed
-                                    flush_pending_watermarks(
-                                        hot_storage.as_ref(),
-                                        &topic,
-                                        pending_watermark_persists.as_ref(),
-                                        flush_metrics.as_ref(),
-                                    );
                                 }
                                 Ok(None) => {
                                     tracing::debug!(
@@ -681,22 +677,28 @@ where
                                         error = %e,
                                         "Failed to commit Iceberg snapshot"
                                     );
+                                    // Don't persist watermarks if snapshot commit
+                                    // failed — the data isn't durable yet.
+                                    continue;
                                 }
                             }
-                        } else {
-                            let deferred_watermarks = pending_watermark_persists
-                                .read()
-                                .ok()
-                                .and_then(|pending| pending.get(&topic).map(|p| p.len()))
-                                .unwrap_or(0);
-                            tracing::debug!(
-                                topic = %topic,
-                                pending_files = stats.file_count,
-                                pending_bytes = stats.total_bytes,
-                                threshold_files = snapshot_threshold_files,
-                                threshold_bytes = snapshot_threshold_bytes,
-                                deferred_watermarks = deferred_watermarks,
-                                "Deferring snapshot commit (thresholds not met)"
+
+                            // Persist deferred watermarks after successful snapshot commit.
+                            flush_pending_watermarks(
+                                hot_storage.as_ref(),
+                                &topic,
+                                pending_watermark_persists.as_ref(),
+                                flush_metrics.as_ref(),
+                            );
+                        } else if stats.file_count == 0 {
+                            // No pending files and no commit needed: the data was
+                            // already committed in a prior cycle but the watermark
+                            // persist failed and was re-queued. Safe to persist now.
+                            flush_pending_watermarks(
+                                hot_storage.as_ref(),
+                                &topic,
+                                pending_watermark_persists.as_ref(),
+                                flush_metrics.as_ref(),
                             );
                         }
                     }
@@ -751,6 +753,7 @@ where
                 .copied()
                 .unwrap_or(0);
 
+            let files_before = self.cold_storage.pending_snapshot_stats(&topic).file_count;
             let start = Instant::now();
             let result = Self::flush_partition(
                 &self.hot_storage,
@@ -811,6 +814,7 @@ where
                         self.cold_storage.as_ref(),
                         &topic,
                         partition,
+                        files_before,
                         self.watermarks.as_ref(),
                         self.pending_watermark_persists.as_ref(),
                         self.flush_metrics.as_ref(),
@@ -874,6 +878,15 @@ where
                             }
                         }
                     }
+                } else {
+                    // No pending files: the data was already committed in a
+                    // prior cycle but watermark persist failed. Safe to retry.
+                    flush_pending_watermarks(
+                        self.hot_storage.as_ref(),
+                        &topic,
+                        self.pending_watermark_persists.as_ref(),
+                        self.flush_metrics.as_ref(),
+                    );
                 }
             }
             if let Some(err) = commit_error {
@@ -1011,23 +1024,13 @@ fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
     cold_storage: &C,
     topic: &str,
     partition: u32,
+    files_before: usize,
     watermarks: &RwLock<HashMap<(String, u32), u64>>,
     pending_watermarks: &RwLock<DeferredWatermarks>,
     flush_metrics: &FlushMetrics,
     iceberg_metrics: &IcebergMetrics,
 ) {
-    // Clear only the failed partition's pending files so successful partitions remain commit-able.
-    cold_storage.clear_pending_data_files(topic, partition);
-
-    // Keep gauges in sync with cold-storage truth after cleanup.
-    let pending_stats = cold_storage.pending_snapshot_stats(topic);
-    iceberg_metrics.update_pending_stats(
-        topic,
-        pending_stats.file_count as u64,
-        pending_stats.total_bytes,
-    );
-
-    // Roll back in-memory watermark to last durable value so dropped pending files are re-flushed.
+    // Load durable watermark for rollback decision.
     let durable_watermark = match hot_storage.load_flush_watermark(topic, partition) {
         Ok(wm) => wm,
         Err(e) => {
@@ -1041,6 +1044,37 @@ fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
             0
         }
     };
+
+    let in_memory_watermark = watermarks
+        .read()
+        .ok()
+        .and_then(|w| w.get(&(topic.to_string(), partition)).copied())
+        .unwrap_or(0);
+
+    let files_after = cold_storage.pending_snapshot_stats(topic).file_count;
+    let new_files_written = files_after > files_before;
+    let watermark_advanced = in_memory_watermark > durable_watermark;
+
+    // Clear pending files if:
+    // - New segments were written this cycle (partial write), OR
+    // - The in-memory watermark advanced past durable, meaning prior pending
+    //   files will be re-flushed after rollback and would otherwise duplicate.
+    //
+    // Skip clearing if neither condition is true (pre-write failure with no
+    // watermark advancement), which preserves files from prior successful cycles.
+    if new_files_written || watermark_advanced {
+        cold_storage.clear_pending_data_files(topic, partition);
+    }
+
+    // Keep gauges in sync with cold-storage truth after cleanup.
+    let pending_stats = cold_storage.pending_snapshot_stats(topic);
+    iceberg_metrics.update_pending_stats(
+        topic,
+        pending_stats.file_count as u64,
+        pending_stats.total_bytes,
+    );
+
+    // Roll back in-memory watermark to last durable value so dropped pending files are re-flushed.
     match watermarks.write() {
         Ok(mut in_memory) => {
             let key = (topic.to_string(), partition);
@@ -1131,6 +1165,8 @@ mod tests {
         events: HashMap<(String, u32), Vec<StoredEvent>>,
         flush_watermarks: Mutex<HashMap<(String, u32), u64>>,
         save_failures_remaining: Mutex<u32>,
+        /// When > 0, high_watermark() will fail and decrement.
+        high_watermark_failures: Mutex<u32>,
     }
 
     impl TestHotStorage {
@@ -1184,6 +1220,12 @@ mod tests {
         }
 
         fn high_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+            if let Ok(mut remaining) = self.high_watermark_failures.lock() {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(StorageError::S3("injected high_watermark failure".into()));
+                }
+            }
             let key = (topic.to_string(), partition);
             let events = self
                 .events
@@ -2380,6 +2422,178 @@ mod tests {
                 .watermark_persist_errors_total
                 .load(Ordering::Relaxed),
             0
+        );
+    }
+
+    /// P1 regression: deferred watermarks must be persisted even when no
+    /// pending data files exist (quiet topic after prior persist failure).
+    #[tokio::test]
+    async fn flush_deferred_watermark_persisted_without_pending_files() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+
+        let hot = Arc::new(hot);
+        // Fail the first two save_flush_watermark calls (initial attempt + retry)
+        // so the watermark gets re-queued to the deferred map.
+        *hot.save_failures_remaining.lock().unwrap() = 2;
+
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            snapshot_threshold_files: 1, // commit snapshot immediately
+            ..Default::default()
+        };
+        let flush_metrics = Arc::new(FlushMetrics::default());
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::clone(&flush_metrics),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        // First flush: writes data, commits snapshot, but watermark persist
+        // fails twice → re-queued to deferred map.
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 1);
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            0,
+            "Watermark should NOT be persisted after both attempts failed"
+        );
+        assert_eq!(
+            flush_metrics
+                .watermark_persist_errors_total
+                .load(Ordering::Relaxed),
+            1,
+            "One error recorded (retry also failed)"
+        );
+
+        // Second flush: no new data to flush, but the deferred watermark
+        // should now be persisted (save_failures exhausted).
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 0);
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            1,
+            "Deferred watermark must be persisted on quiet topic"
+        );
+    }
+
+    /// P2 regression: a pre-write failure (e.g., high_watermark read error)
+    /// must NOT call clear_pending_data_files. We verify by calling
+    /// clear_failed_partition_state with files_before == files_after.
+    #[tokio::test]
+    async fn pre_write_failure_preserves_prior_pending_files() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![make_event(1, TS_HOUR_0_START), make_event(2, TS_HOUR_0_MID)],
+        );
+
+        let cold = TestColdStorage::default();
+
+        // Simulate 3 pending files from a prior successful cycle
+        {
+            let mut pending = cold.pending_stats.lock().unwrap();
+            pending.insert(
+                ("events".to_string(), 0),
+                PendingSnapshotStats {
+                    file_count: 3,
+                    total_bytes: 1024,
+                },
+            );
+        }
+
+        // Inject a high_watermark failure so flush_partition fails before
+        // any cold storage writes.
+        *hot.high_watermark_failures.lock().unwrap() = 1;
+
+        let files_before = cold.pending_snapshot_stats("events").file_count;
+        assert_eq!(files_before, 3);
+
+        // Call flush_partition directly — it will fail at high_watermark()
+        let result = BackgroundFlusher::<TestHotStorage, TestColdStorage>::flush_partition(
+            &hot,
+            &cold,
+            "events",
+            0,
+            0,     // watermark
+            10000, // max_segment_size
+            true,  // iceberg_enabled
+            128 * 1024 * 1024,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "Should fail on injected high_watermark error"
+        );
+
+        // Simulate the caller's guard (clear_failed_partition_state now
+        // checks files_before internally)
+        let files_after = cold.pending_snapshot_stats("events").file_count;
+        assert_eq!(
+            files_before, files_after,
+            "No new files should have been added"
+        );
+
+        // Verify pending files are preserved
+        assert_eq!(
+            cold.pending_snapshot_stats("events").file_count,
+            3,
+            "Pre-write failure must NOT clear prior cycles' pending files"
+        );
+    }
+
+    /// Verifies that a partial write failure (where some segments were written
+    /// before the error) DOES trigger cleanup via clear_failed_partition_state.
+    #[tokio::test]
+    async fn partial_write_failure_clears_pending_files() {
+        let mut hot = TestHotStorage::default();
+        // Two events in different hours → two segment writes
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+            ],
+        );
+
+        let cold = TestColdStorage::default();
+        // Fail on second write_segment call (hour-1)
+        *cold.fail_on_call.lock().unwrap() = Some(1);
+
+        let files_before = cold.pending_snapshot_stats("events").file_count;
+        assert_eq!(files_before, 0);
+
+        let result = BackgroundFlusher::<TestHotStorage, TestColdStorage>::flush_partition(
+            &hot,
+            &cold,
+            "events",
+            0,
+            0,     // watermark
+            10000, // max_segment_size
+            true,  // iceberg_enabled
+            128 * 1024 * 1024,
+        )
+        .await;
+        assert!(result.is_err(), "Should fail on second segment write");
+
+        // The caller's guard: file count increased → cleanup should fire
+        let files_after = cold.pending_snapshot_stats("events").file_count;
+        assert!(
+            files_after > files_before,
+            "Partial write should have added files"
+        );
+
+        // Simulate what clear_failed_partition_state does
+        cold.clear_pending_data_files("events", 0);
+        assert_eq!(
+            cold.pending_snapshot_stats("events").file_count,
+            0,
+            "Partial write failure should clear pending files to prevent duplicates"
         );
     }
 }
