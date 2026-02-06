@@ -85,6 +85,18 @@ pub trait ColdStorage: Send + Sync {
         PendingSnapshotStats::default()
     }
 
+    /// Returns pending snapshot stats for a specific topic/partition.
+    ///
+    /// This is used by partition failure cleanup logic to avoid topic-wide
+    /// races under concurrent partition flushes.
+    fn pending_snapshot_stats_for_partition(
+        &self,
+        _topic: &str,
+        _partition: u32,
+    ) -> PendingSnapshotStats {
+        PendingSnapshotStats::default()
+    }
+
     /// Returns the current table metadata JSON for catalog registration.
     /// Only Iceberg backends return Some; S3 backends return None.
     fn table_metadata_json(&self, _topic: &str) -> Option<String> {

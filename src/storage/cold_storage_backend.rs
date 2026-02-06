@@ -139,6 +139,17 @@ impl ColdStorage for ColdStorageBackend {
         }
     }
 
+    fn pending_snapshot_stats_for_partition(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> PendingSnapshotStats {
+        match self {
+            Self::S3(s) => s.pending_snapshot_stats_for_partition(topic, partition),
+            Self::Iceberg(s) => s.pending_snapshot_stats_for_partition(topic, partition),
+        }
+    }
+
     fn clear_pending_data_files(&self, topic: &str, partition: u32) {
         match self {
             Self::S3(s) => s.clear_pending_data_files(topic, partition),
@@ -178,9 +189,27 @@ mod tests {
 
         let backend = ColdStorageBackend::iceberg(storage);
         assert_eq!(backend.pending_snapshot_stats("events").file_count, 2);
+        assert_eq!(
+            backend
+                .pending_snapshot_stats_for_partition("events", 0)
+                .file_count,
+            1
+        );
+        assert_eq!(
+            backend
+                .pending_snapshot_stats_for_partition("events", 1)
+                .file_count,
+            1
+        );
 
         backend.clear_pending_data_files("events", 1);
         assert_eq!(backend.pending_snapshot_stats("events").file_count, 1);
+        assert_eq!(
+            backend
+                .pending_snapshot_stats_for_partition("events", 1)
+                .file_count,
+            0
+        );
 
         backend.clear_pending_data_files("events", 0);
         assert_eq!(backend.pending_snapshot_stats("events").file_count, 0);

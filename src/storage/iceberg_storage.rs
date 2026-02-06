@@ -657,6 +657,34 @@ impl ColdStorage for IcebergStorage {
         }
     }
 
+    fn pending_snapshot_stats_for_partition(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> PendingSnapshotStats {
+        let pending = match self.pending_data_files.read() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    topic = topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to acquire lock for partition pending_snapshot_stats, returning default"
+                );
+                return PendingSnapshotStats::default();
+            }
+        };
+
+        if let Some(files) = pending.get(&(topic.to_string(), partition)) {
+            PendingSnapshotStats {
+                file_count: files.len(),
+                total_bytes: files.iter().map(|(_, m)| m.file_size_bytes).sum::<u64>(),
+            }
+        } else {
+            PendingSnapshotStats::default()
+        }
+    }
+
     fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
         let pending = match self.pending_data_files.read() {
             Ok(p) => p,
@@ -992,9 +1020,27 @@ mod tests {
             .insert_pending_data_files_for_test("events", 1, 1)
             .unwrap();
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 2);
+        assert_eq!(
+            storage
+                .pending_snapshot_stats_for_partition("events", 0)
+                .file_count,
+            1
+        );
+        assert_eq!(
+            storage
+                .pending_snapshot_stats_for_partition("events", 1)
+                .file_count,
+            1
+        );
 
         storage.clear_pending_data_files("events", 1);
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
+        assert_eq!(
+            storage
+                .pending_snapshot_stats_for_partition("events", 1)
+                .file_count,
+            0
+        );
         storage.clear_pending_data_files("events", 0);
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 0);
     }

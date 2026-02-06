@@ -433,7 +433,9 @@ where
 
                     // Create the flush future with timing
                     flush_futures.push(async move {
-                        let files_before = cold.pending_snapshot_stats(&topic_clone).file_count;
+                        let files_before = cold
+                            .pending_snapshot_stats_for_partition(&topic_clone, partition)
+                            .file_count;
                         let start = Instant::now();
                         let result = Self::flush_partition(
                             &hot,
@@ -753,7 +755,10 @@ where
                 .copied()
                 .unwrap_or(0);
 
-            let files_before = self.cold_storage.pending_snapshot_stats(&topic).file_count;
+            let files_before = self
+                .cold_storage
+                .pending_snapshot_stats_for_partition(&topic, partition)
+                .file_count;
             let start = Instant::now();
             let result = Self::flush_partition(
                 &self.hot_storage,
@@ -1051,7 +1056,9 @@ fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
         .and_then(|w| w.get(&(topic.to_string(), partition)).copied())
         .unwrap_or(0);
 
-    let files_after = cold_storage.pending_snapshot_stats(topic).file_count;
+    let files_after = cold_storage
+        .pending_snapshot_stats_for_partition(topic, partition)
+        .file_count;
     let new_files_written = files_after > files_before;
     let watermark_advanced = in_memory_watermark > durable_watermark;
 
@@ -1414,6 +1421,21 @@ mod tests {
                 }
             }
             stats
+        }
+
+        fn pending_snapshot_stats_for_partition(
+            &self,
+            topic: &str,
+            partition: u32,
+        ) -> PendingSnapshotStats {
+            let pending = match self.pending_stats.lock() {
+                Ok(p) => p,
+                Err(_) => return PendingSnapshotStats::default(),
+            };
+            pending
+                .get(&(topic.to_string(), partition))
+                .cloned()
+                .unwrap_or_default()
         }
 
         async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
@@ -2481,8 +2503,7 @@ mod tests {
     }
 
     /// P2 regression: a pre-write failure (e.g., high_watermark read error)
-    /// must NOT call clear_pending_data_files. We verify by calling
-    /// clear_failed_partition_state with files_before == files_after.
+    /// must NOT call clear_pending_data_files.
     #[tokio::test]
     async fn pre_write_failure_preserves_prior_pending_files() {
         let mut hot = TestHotStorage::default();
@@ -2510,7 +2531,9 @@ mod tests {
         // any cold storage writes.
         *hot.high_watermark_failures.lock().unwrap() = 1;
 
-        let files_before = cold.pending_snapshot_stats("events").file_count;
+        let files_before = cold
+            .pending_snapshot_stats_for_partition("events", 0)
+            .file_count;
         assert_eq!(files_before, 3);
 
         // Call flush_partition directly — it will fail at high_watermark()
@@ -2530,17 +2553,34 @@ mod tests {
             "Should fail on injected high_watermark error"
         );
 
-        // Simulate the caller's guard (clear_failed_partition_state now
-        // checks files_before internally)
-        let files_after = cold.pending_snapshot_stats("events").file_count;
+        let files_after = cold
+            .pending_snapshot_stats_for_partition("events", 0)
+            .file_count;
         assert_eq!(
             files_before, files_after,
             "No new files should have been added"
         );
 
+        let watermarks = RwLock::new(HashMap::new());
+        let deferred = RwLock::new(HashMap::new());
+        let flush_metrics = FlushMetrics::default();
+        let iceberg_metrics = IcebergMetrics::default();
+        clear_failed_partition_state(
+            &hot,
+            &cold,
+            "events",
+            0,
+            files_before,
+            &watermarks,
+            &deferred,
+            &flush_metrics,
+            &iceberg_metrics,
+        );
+
         // Verify pending files are preserved
         assert_eq!(
-            cold.pending_snapshot_stats("events").file_count,
+            cold.pending_snapshot_stats_for_partition("events", 0)
+                .file_count,
             3,
             "Pre-write failure must NOT clear prior cycles' pending files"
         );
@@ -2565,7 +2605,9 @@ mod tests {
         // Fail on second write_segment call (hour-1)
         *cold.fail_on_call.lock().unwrap() = Some(1);
 
-        let files_before = cold.pending_snapshot_stats("events").file_count;
+        let files_before = cold
+            .pending_snapshot_stats_for_partition("events", 0)
+            .file_count;
         assert_eq!(files_before, 0);
 
         let result = BackgroundFlusher::<TestHotStorage, TestColdStorage>::flush_partition(
@@ -2581,19 +2623,97 @@ mod tests {
         .await;
         assert!(result.is_err(), "Should fail on second segment write");
 
-        // The caller's guard: file count increased → cleanup should fire
-        let files_after = cold.pending_snapshot_stats("events").file_count;
+        let files_after = cold
+            .pending_snapshot_stats_for_partition("events", 0)
+            .file_count;
         assert!(
             files_after > files_before,
             "Partial write should have added files"
         );
 
-        // Simulate what clear_failed_partition_state does
-        cold.clear_pending_data_files("events", 0);
+        let watermarks = RwLock::new(HashMap::new());
+        let deferred = RwLock::new(HashMap::new());
+        let flush_metrics = FlushMetrics::default();
+        let iceberg_metrics = IcebergMetrics::default();
+        clear_failed_partition_state(
+            &hot,
+            &cold,
+            "events",
+            0,
+            files_before,
+            &watermarks,
+            &deferred,
+            &flush_metrics,
+            &iceberg_metrics,
+        );
+
         assert_eq!(
-            cold.pending_snapshot_stats("events").file_count,
+            cold.pending_snapshot_stats_for_partition("events", 0)
+                .file_count,
             0,
             "Partial write failure should clear pending files to prevent duplicates"
+        );
+    }
+
+    /// P1 regression: cleanup decisions must use partition-scoped pending stats,
+    /// not topic-wide aggregates that can be skewed by concurrent partitions.
+    #[tokio::test]
+    async fn concurrent_partition_cleanup_uses_partition_scoped_stats() {
+        let hot = TestHotStorage::default();
+        let cold = TestColdStorage::default();
+
+        {
+            let mut pending = cold.pending_stats.lock().unwrap();
+            pending.insert(
+                ("events".to_string(), 0),
+                PendingSnapshotStats {
+                    file_count: 3,
+                    total_bytes: 300,
+                },
+            );
+        }
+
+        let files_before = cold
+            .pending_snapshot_stats_for_partition("events", 1)
+            .file_count;
+        assert_eq!(files_before, 0);
+
+        // Simulate concurrent partition changes:
+        // - partition 0 cleaned up by another worker
+        // - partition 1 wrote files before failing
+        {
+            let mut pending = cold.pending_stats.lock().unwrap();
+            pending.remove(&("events".to_string(), 0));
+            pending.insert(
+                ("events".to_string(), 1),
+                PendingSnapshotStats {
+                    file_count: 2,
+                    total_bytes: 200,
+                },
+            );
+        }
+
+        let watermarks = RwLock::new(HashMap::new());
+        let deferred = RwLock::new(HashMap::new());
+        let flush_metrics = FlushMetrics::default();
+        let iceberg_metrics = IcebergMetrics::default();
+        clear_failed_partition_state(
+            &hot,
+            &cold,
+            "events",
+            1,
+            files_before,
+            &watermarks,
+            &deferred,
+            &flush_metrics,
+            &iceberg_metrics,
+        );
+
+        assert_eq!(
+            cold.pending_snapshot_stats_for_partition("events", 1)
+                .file_count,
+            0,
+            "Partition 1 pending files should be cleaned up based on its own stats"
         );
     }
 }
