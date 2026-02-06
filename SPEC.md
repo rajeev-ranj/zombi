@@ -274,6 +274,8 @@ See API section for full parameter reference.
 - Flush watermarks are persisted in RocksDB per (topic, partition) to prevent duplicate Iceberg writes on restart.
 - Hot data is deleted after successful Iceberg commit (or direct flush in non-Iceberg mode), with an optional retention window
   (`ZOMBI_HOT_RETENTION_SECS`, default 0) for in-flight reads. Cleanup is idempotent and retried on next cycle if it fails.
+  Note: the retention window is best-effort during normal runtime only; on startup and shutdown, retention
+  is bypassed since there are no in-flight reads.
 - RocksDB tuning env vars (defaults in parentheses): `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` (64),
   `ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS` (3), `ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER` (4),
   `ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB` (64), `ZOMBI_ROCKSDB_BLOCK_CACHE_MB` (128),

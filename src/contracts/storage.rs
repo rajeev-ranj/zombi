@@ -69,10 +69,10 @@ pub trait HotStorage: Send + Sync {
         partition: u32,
     ) -> Result<Option<u64>, StorageError>;
 
-    /// Lists all partitions that have data for a topic.
+    /// Lists all known partitions for a topic (including those with only metadata after cleanup).
     fn list_partitions(&self, topic: &str) -> Result<Vec<u32>, StorageError>;
 
-    /// Lists all topics that have data.
+    /// Lists all known topics (including those with only metadata after cleanup).
     fn list_topics(&self) -> Result<Vec<String>, StorageError>;
 
     /// Reads events from all partitions, merged by timestamp.
@@ -146,7 +146,8 @@ pub trait HotStorage: Send + Sync {
     /// Deletes events from hot storage up to (and including) `up_to_sequence`.
     ///
     /// Also deletes associated idempotency keys and timestamp index entries.
-    /// High watermark keys (`hwm:*`) and flush watermark keys (`flush_wm:*`) are preserved.
+    /// High watermark keys (`hwm:*`), flush watermark keys (`flush_wm:*`), and
+    /// cleanup watermark keys (`cleanup_wm:*`) are preserved.
     ///
     /// Returns the count of deleted event keys. Idempotent: calling with a sequence
     /// at or below the last cleanup watermark returns 0.
