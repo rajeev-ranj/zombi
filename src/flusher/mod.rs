@@ -482,6 +482,8 @@ where
                                 Err(e) => {
                                     // Record S3 error
                                     iceberg_metrics.record_s3_error();
+                                    // Clear pending data files to prevent duplicate rows on retry
+                                    cold_storage.clear_pending_data_files(&topic);
                                     tracing::error!(
                                         topic = %topic,
                                         partition = partition,
@@ -528,6 +530,8 @@ where
                         Err(e) => {
                             // Record S3 error
                             iceberg_metrics.record_s3_error();
+                            // Clear pending data files to prevent duplicate rows on retry
+                            cold_storage.clear_pending_data_files(&topic);
                             tracing::error!(
                                 topic = %topic,
                                 partition = partition,
@@ -698,8 +702,11 @@ where
         let mut max_watermark = 0u64;
         let mut topics_to_commit = std::collections::HashSet::new();
         let mut pending_watermark_persists: HashMap<String, HashMap<u32, u64>> = HashMap::new();
+        let mut first_error: Option<StorageError> = None;
 
         for (topic, partition) in topics_to_flush {
+            // Always add to topics_to_commit so pending snapshots from prior
+            // cycles get committed even if this partition has no new data.
             topics_to_commit.insert(topic.clone());
             let current_watermark = self
                 .watermarks
@@ -710,7 +717,7 @@ where
                 .unwrap_or(0);
 
             let start = Instant::now();
-            let (count, new_watermark, bytes, num_segments) = Self::flush_partition(
+            let result = Self::flush_partition(
                 &self.hot_storage,
                 &self.cold_storage,
                 &topic,
@@ -720,40 +727,58 @@ where
                 self.config.iceberg_enabled,
                 self.config.target_file_size_bytes,
             )
-            .await?;
+            .await;
             let duration_us = start.elapsed().as_micros() as u64;
 
-            if count > 0 {
-                // Record flush metrics
-                self.flush_metrics
-                    .record_flush(count as u64, bytes as u64, duration_us);
+            match result {
+                Ok((count, new_watermark, bytes, num_segments)) => {
+                    if count > 0 {
+                        // Record flush metrics
+                        self.flush_metrics
+                            .record_flush(count as u64, bytes as u64, duration_us);
 
-                // Record Iceberg metrics if enabled
-                if self.config.iceberg_enabled {
-                    self.iceberg_metrics
-                        .record_parquet_write(&topic, bytes as u64);
+                        // Record Iceberg metrics if enabled
+                        if self.config.iceberg_enabled {
+                            self.iceberg_metrics
+                                .record_parquet_write(&topic, bytes as u64);
+                        }
+
+                        total_events += count;
+                        total_segments += num_segments;
+
+                        self.watermarks
+                            .write()
+                            .map_lock_err()?
+                            .insert((topic.clone(), partition), new_watermark);
+
+                        persist_or_defer_watermark(
+                            self.hot_storage.as_ref(),
+                            &topic,
+                            partition,
+                            new_watermark,
+                            self.config.iceberg_enabled,
+                            &mut pending_watermark_persists,
+                            self.flush_metrics.as_ref(),
+                        );
+
+                        if new_watermark > max_watermark {
+                            max_watermark = new_watermark;
+                        }
+                    }
                 }
-
-                total_events += count;
-                total_segments += num_segments;
-
-                self.watermarks
-                    .write()
-                    .map_lock_err()?
-                    .insert((topic.clone(), partition), new_watermark);
-
-                persist_or_defer_watermark(
-                    self.hot_storage.as_ref(),
-                    &topic,
-                    partition,
-                    new_watermark,
-                    self.config.iceberg_enabled,
-                    &mut pending_watermark_persists,
-                    self.flush_metrics.as_ref(),
-                );
-
-                if new_watermark > max_watermark {
-                    max_watermark = new_watermark;
+                Err(e) => {
+                    self.iceberg_metrics.record_s3_error();
+                    // Clear pending data files to prevent duplicate rows on retry
+                    self.cold_storage.clear_pending_data_files(&topic);
+                    tracing::error!(
+                        topic = %topic,
+                        partition = partition,
+                        error = %e,
+                        "Failed to flush partition in flush_now"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
             }
         }
@@ -804,6 +829,11 @@ where
             }
         }
 
+        // Return the first flush-partition error if any occurred
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
         Ok(FlushResult {
             events_flushed: total_events,
             segments_written: total_segments,
@@ -851,21 +881,28 @@ fn flush_pending_watermarks<H: HotStorage>(
     flush_metrics: &FlushMetrics,
 ) {
     if let Some(partitions) = pending.remove(topic) {
+        let mut failed = HashMap::new();
         for (partition, wm) in partitions {
             if hot_storage
                 .save_flush_watermark(topic, partition, wm)
                 .is_err()
             {
+                // Retry once
                 if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
                     flush_metrics.record_watermark_persist_error();
                     tracing::error!(
                         topic = %topic,
                         partition = partition,
                         error = %e,
-                        "Failed to persist flush watermark after retry"
+                        "Failed to persist flush watermark after retry, re-queuing"
                     );
+                    // Re-queue so the next cycle retries
+                    failed.insert(partition, wm);
                 }
             }
+        }
+        if !failed.is_empty() {
+            pending.insert(topic.to_string(), failed);
         }
     }
 }
@@ -1177,6 +1214,12 @@ mod tests {
                 base_path: String::new(),
             }
         }
+
+        fn clear_pending_data_files(&self, topic: &str) {
+            if let Ok(mut pending) = self.pending_stats.lock() {
+                pending.remove(topic);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1435,6 +1478,86 @@ mod tests {
             writes.len(),
             1,
             "Only the first segment should have been written"
+        );
+    }
+
+    /// Verifies that a partial flush failure followed by a retry does not
+    /// produce duplicate data files in cold storage. This is the regression
+    /// test for the [HIGH] finding: without `clear_pending_data_files`,
+    /// the hour-0 segment from the first (failed) attempt would accumulate
+    /// alongside the hour-0 segment from the second (successful) attempt,
+    /// causing duplicate rows after snapshot commit.
+    #[tokio::test]
+    async fn flush_retry_after_partial_failure_no_duplicates() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+            ],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        // Fail on the 2nd write_segment (hour-1), so hour-0 succeeds
+        *cold.fail_on_call.lock().unwrap() = Some(1);
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        // First attempt: hour-0 write succeeds, hour-1 fails.
+        // flush_now should return an error and clear pending data files.
+        let result = flusher.flush_now().await;
+        assert!(result.is_err(), "Should fail when a segment write fails");
+
+        // Pending stats should be cleared by clear_pending_data_files
+        let pending = cold.pending_snapshot_stats("events");
+        assert_eq!(
+            pending.file_count, 0,
+            "Pending files should be cleared after partial failure"
+        );
+
+        // Watermark should NOT have advanced (no successful flush)
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            0,
+            "Watermark must not advance after failed flush"
+        );
+
+        // Clear the failure injection for the retry
+        *cold.fail_on_call.lock().unwrap() = None;
+
+        // Second attempt: both hour-0 and hour-1 should succeed cleanly
+        let result = flusher.flush_now().await.unwrap();
+        assert_eq!(result.events_flushed, 2);
+
+        let writes = cold.writes.lock().unwrap();
+        // Total writes: 1 (hour-0 from first attempt) + 2 (hour-0 + hour-1 from retry)
+        // = 3 total write_segment calls. But only 2 of them (the retry pair) should
+        // be in pending_data_files when the snapshot commits, because the first
+        // attempt's hour-0 was cleared.
+        assert_eq!(
+            writes.len(),
+            3,
+            "3 total write_segment calls: 1 orphaned + 2 from successful retry"
+        );
+
+        // The pending stats after successful flush+commit should be zero
+        // (snapshot was committed in flush_now for iceberg mode)
+        let pending = cold.pending_snapshot_stats("events");
+        assert_eq!(
+            pending.file_count, 0,
+            "All pending files should be committed after successful retry"
         );
     }
 

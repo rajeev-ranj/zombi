@@ -90,6 +90,14 @@ pub trait ColdStorage: Send + Sync {
     fn table_metadata_json(&self, _topic: &str) -> Option<String> {
         None
     }
+
+    /// Clears pending (uncommitted) data files for a topic.
+    ///
+    /// Called when a flush partition fails partway through writing hour-group
+    /// segments. The already-uploaded S3 files become orphans (invisible without
+    /// a snapshot), but clearing them from `pending_data_files` prevents
+    /// duplicate rows on the next retry cycle.
+    fn clear_pending_data_files(&self, _topic: &str) {}
 }
 
 /// Information about a stored segment.

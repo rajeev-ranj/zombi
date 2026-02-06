@@ -557,6 +557,20 @@ impl ColdStorage for IcebergStorage {
             .and_then(|m| m.to_json().ok())
     }
 
+    fn clear_pending_data_files(&self, topic: &str) {
+        if let Ok(mut pending) = self.pending_data_files.write() {
+            if let Some(removed) = pending.remove(topic) {
+                if !removed.is_empty() {
+                    tracing::warn!(
+                        topic = topic,
+                        orphaned_files = removed.len(),
+                        "Cleared pending data files after flush failure (orphaned S3 files remain)"
+                    );
+                }
+            }
+        }
+    }
+
     fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
         let pending = match self.pending_data_files.read() {
             Ok(p) => p,
