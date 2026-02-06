@@ -492,10 +492,14 @@ where
                                     // Record S3 error
                                     iceberg_metrics.record_s3_error();
                                     clear_failed_partition_state(
+                                        hot_storage.as_ref(),
                                         cold_storage.as_ref(),
                                         &topic,
                                         partition,
+                                        watermarks.as_ref(),
                                         pending_watermark_persists.as_ref(),
+                                        flush_metrics.as_ref(),
+                                        iceberg_metrics.as_ref(),
                                     );
                                     tracing::error!(
                                         topic = %topic,
@@ -546,10 +550,14 @@ where
                             // Record S3 error
                             iceberg_metrics.record_s3_error();
                             clear_failed_partition_state(
+                                hot_storage.as_ref(),
                                 cold_storage.as_ref(),
                                 &topic,
                                 partition,
+                                watermarks.as_ref(),
                                 pending_watermark_persists.as_ref(),
+                                flush_metrics.as_ref(),
+                                iceberg_metrics.as_ref(),
                             );
                             tracing::error!(
                                 topic = %topic,
@@ -799,10 +807,14 @@ where
                 Err(e) => {
                     self.iceberg_metrics.record_s3_error();
                     clear_failed_partition_state(
+                        self.hot_storage.as_ref(),
                         self.cold_storage.as_ref(),
                         &topic,
                         partition,
+                        self.watermarks.as_ref(),
                         self.pending_watermark_persists.as_ref(),
+                        self.flush_metrics.as_ref(),
+                        self.iceberg_metrics.as_ref(),
                     );
                     tracing::error!(
                         topic = %topic,
@@ -952,21 +964,27 @@ fn flush_pending_watermarks<H: HotStorage>(
     if let Some(partitions) = partitions {
         let mut failed = HashMap::new();
         for (partition, wm) in partitions {
-            if hot_storage
-                .save_flush_watermark(topic, partition, wm)
-                .is_err()
-            {
-                // Retry once
-                if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
-                    flush_metrics.record_watermark_persist_error();
-                    tracing::error!(
+            match hot_storage.save_flush_watermark(topic, partition, wm) {
+                Ok(()) => {}
+                Err(first_err) => {
+                    tracing::warn!(
                         topic = %topic,
                         partition = partition,
-                        error = %e,
-                        "Failed to persist flush watermark after retry, re-queuing"
+                        error = %first_err,
+                        "Failed to persist flush watermark, retrying once"
                     );
-                    // Re-queue so the next cycle retries
-                    failed.insert(partition, wm);
+                    // Retry once
+                    if let Err(e) = hot_storage.save_flush_watermark(topic, partition, wm) {
+                        flush_metrics.record_watermark_persist_error();
+                        tracing::error!(
+                            topic = %topic,
+                            partition = partition,
+                            error = %e,
+                            "Failed to persist flush watermark after retry, re-queuing"
+                        );
+                        // Re-queue so the next cycle retries
+                        failed.insert(partition, wm);
+                    }
                 }
             }
         }
@@ -987,14 +1005,70 @@ fn flush_pending_watermarks<H: HotStorage>(
     }
 }
 
-fn clear_failed_partition_state<C: ColdStorage>(
+fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
+    hot_storage: &H,
     cold_storage: &C,
     topic: &str,
     partition: u32,
+    watermarks: &RwLock<HashMap<(String, u32), u64>>,
     pending_watermarks: &RwLock<DeferredWatermarks>,
+    flush_metrics: &FlushMetrics,
+    iceberg_metrics: &IcebergMetrics,
 ) {
     // Clear only the failed partition's pending files so successful partitions remain commit-able.
     cold_storage.clear_pending_data_files(topic, partition);
+
+    // Keep gauges in sync with cold-storage truth after cleanup.
+    let pending_stats = cold_storage.pending_snapshot_stats(topic);
+    iceberg_metrics.update_pending_stats(
+        topic,
+        pending_stats.file_count as u64,
+        pending_stats.total_bytes,
+    );
+
+    // Roll back in-memory watermark to last durable value so dropped pending files are re-flushed.
+    let durable_watermark = match hot_storage.load_flush_watermark(topic, partition) {
+        Ok(wm) => wm,
+        Err(e) => {
+            flush_metrics.record_watermark_persist_error();
+            tracing::error!(
+                topic = %topic,
+                partition = partition,
+                error = %e,
+                "Failed to load durable watermark during failure recovery, resetting to 0"
+            );
+            0
+        }
+    };
+    match watermarks.write() {
+        Ok(mut in_memory) => {
+            let key = (topic.to_string(), partition);
+            let previous = in_memory.get(&key).copied().unwrap_or(0);
+            if durable_watermark == 0 {
+                in_memory.remove(&key);
+            } else {
+                in_memory.insert(key, durable_watermark);
+            }
+            if previous != durable_watermark {
+                tracing::warn!(
+                    topic = %topic,
+                    partition = partition,
+                    previous_watermark = previous,
+                    rolled_back_to = durable_watermark,
+                    "Rolled back in-memory flush watermark after partition failure"
+                );
+            }
+        }
+        Err(e) => {
+            flush_metrics.record_watermark_persist_error();
+            tracing::error!(
+                topic = %topic,
+                partition = partition,
+                error = %e,
+                "Failed to roll back in-memory watermark due to lock error"
+            );
+        }
+    }
 
     if let Ok(mut deferred) = pending_watermarks.write() {
         let remove_topic = if let Some(partitions) = deferred.get_mut(topic) {
@@ -1007,6 +1081,7 @@ fn clear_failed_partition_state<C: ColdStorage>(
             deferred.remove(topic);
         }
     } else {
+        flush_metrics.record_watermark_persist_error();
         tracing::error!(
             topic = %topic,
             partition = partition,
@@ -2099,6 +2174,176 @@ mod tests {
         assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
         assert!(*cold.commit_attempts.lock().unwrap() >= 2);
         assert_eq!(cold.writes.lock().unwrap().len(), 1); // No re-flush on quiet topic
+
+        flusher.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_failure_rolls_back_in_memory_watermark_to_durable() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+            ],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        // First write succeeds; second write attempt fails, triggering cleanup.
+        *cold.fail_on_call.lock().unwrap() = Some(1);
+
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            interval: Duration::from_millis(10),
+            max_segment_size: 1,
+            snapshot_threshold_files: 2,
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        // Cycle 1: flush sequence 1, watermark advances in-memory, pending files = 1.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if cold.writes.lock().unwrap().len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(cold.writes.lock().unwrap().len(), 1);
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 1);
+
+        // Cycle 2: write fails and cleanup clears pending files. In-memory watermark
+        // must roll back to the durable watermark (still 0 because no snapshot committed yet).
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if cold.pending_snapshot_stats("events").file_count == 0 {
+                break;
+            }
+        }
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+        assert_eq!(
+            flusher.flush_watermark("events", 0).await.unwrap(),
+            0,
+            "In-memory watermark must roll back after cleanup"
+        );
+
+        // Remove failure injection and allow replay from durable watermark.
+        *cold.fail_on_call.lock().unwrap() = None;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if hot.load_flush_watermark("events", 0).unwrap() == 2 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            2,
+            "Both events should be eventually persisted after replay"
+        );
+        let writes = cold.writes.lock().unwrap();
+        let first_sequences: Vec<u64> = writes
+            .iter()
+            .filter_map(|(_, _, events)| events.first().map(|e| e.sequence))
+            .collect();
+        assert_eq!(
+            first_sequences,
+            vec![1, 1, 2],
+            "Sequence 1 should be replayed after cleanup"
+        );
+        drop(writes);
+
+        flusher.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_failure_cleanup_resyncs_pending_metrics() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![
+                make_event(1, TS_HOUR_0_START),
+                make_event(2, TS_HOUR_1_START),
+            ],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        *cold.fail_on_call.lock().unwrap() = Some(1);
+
+        let flush_metrics = Arc::new(FlushMetrics::default());
+        let iceberg_metrics = Arc::new(IcebergMetrics::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            interval: Duration::from_millis(10),
+            max_segment_size: 1,
+            snapshot_threshold_files: 10,
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            flush_metrics,
+            Arc::clone(&iceberg_metrics),
+        );
+
+        flusher.start().await.unwrap();
+
+        // First cycle writes one pending file and increments pending metrics.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if cold.writes.lock().unwrap().len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            *iceberg_metrics
+                .pending_snapshot_files
+                .get("events")
+                .unwrap(),
+            1
+        );
+
+        // Next cycle fails and clears pending files; metrics must resync to 0.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if iceberg_metrics.s3_errors_total.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+        }
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+        assert_eq!(
+            *iceberg_metrics
+                .pending_snapshot_files
+                .get("events")
+                .unwrap(),
+            0,
+            "Pending file gauge should reflect cleanup state"
+        );
+        assert_eq!(
+            *iceberg_metrics
+                .pending_snapshot_bytes
+                .get("events")
+                .unwrap(),
+            0
+        );
 
         flusher.stop().await.unwrap();
     }
