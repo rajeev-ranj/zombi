@@ -21,6 +21,8 @@ use crate::storage::{
     SnapshotOperation, TableMetadata,
 };
 
+type PendingDataFiles = HashMap<(String, u32), Vec<(DataFile, ParquetFileMetadata)>>;
+
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
 pub struct IcebergStorage {
     client: Client,
@@ -30,8 +32,8 @@ pub struct IcebergStorage {
     table_metadata: RwLock<HashMap<String, TableMetadata>>,
     /// Metadata version counter per topic
     metadata_versions: RwLock<HashMap<String, i64>>,
-    /// Accumulated data files per topic (for manifest generation)
-    pending_data_files: RwLock<HashMap<String, Vec<(DataFile, ParquetFileMetadata)>>>,
+    /// Accumulated data files per (topic, partition) for manifest generation.
+    pending_data_files: RwLock<PendingDataFiles>,
     /// Retry configuration for S3 operations
     retry_config: RetryConfig,
     /// Schema configs for structured column extraction, keyed by table/topic name.
@@ -133,6 +135,44 @@ impl IcebergStorage {
         &self.base_path
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_pending_data_files_for_test(
+        &self,
+        topic: &str,
+        partition: u32,
+        count: usize,
+    ) -> Result<(), StorageError> {
+        let mut pending = self.pending_data_files.write().map_lock_err()?;
+        let entries = pending.entry((topic.to_string(), partition)).or_default();
+
+        for i in 0..count {
+            let mut column_stats = crate::storage::ColumnStatistics {
+                sequence_min: (i + 1) as u64,
+                sequence_max: (i + 1) as u64,
+                ..Default::default()
+            };
+            column_stats.partition_min = partition;
+            column_stats.partition_max = partition;
+
+            let metadata = ParquetFileMetadata {
+                path: format!("test-{}-{}-{}.parquet", topic, partition, i),
+                row_count: 1,
+                min_sequence: (i + 1) as u64,
+                max_sequence: (i + 1) as u64,
+                min_timestamp_ms: 0,
+                max_timestamp_ms: 0,
+                file_size_bytes: 1,
+                partition_values: Default::default(),
+                column_stats,
+            };
+            let s3_path = format!("s3://{}/{}", self.bucket, metadata.path);
+            let data_file = DataFile::from_parquet_metadata(&metadata, &s3_path);
+            entries.push((data_file, metadata));
+        }
+
+        Ok(())
+    }
+
     /// Gets or creates table metadata for a topic.
     /// If a `TableSchemaConfig` is registered for this topic, the metadata
     /// will use the structured schema with extracted columns.
@@ -219,10 +259,16 @@ impl IcebergStorage {
     /// Commits pending data files by creating a new snapshot.
     /// This should be called after a batch of write_segment calls.
     pub async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
-        // Get pending files
+        // Snapshot pending files for this topic.
         let pending = {
-            let mut pending = self.pending_data_files.write().map_lock_err()?;
-            pending.remove(topic).unwrap_or_default()
+            let pending = self.pending_data_files.read().map_lock_err()?;
+            let mut collected = Vec::new();
+            for ((pending_topic, _partition), files) in pending.iter() {
+                if pending_topic == topic {
+                    collected.extend(files.iter().cloned());
+                }
+            }
+            collected
         };
 
         if pending.is_empty() {
@@ -305,6 +351,12 @@ impl IcebergStorage {
             cached.insert(topic.to_string(), metadata);
         }
 
+        // Clear committed pending files only after all uploads and metadata writes succeed.
+        {
+            let mut pending = self.pending_data_files.write().map_lock_err()?;
+            pending.retain(|(pending_topic, _partition), _| pending_topic != topic);
+        }
+
         tracing::info!(
             topic = topic,
             snapshot_id = snapshot_id,
@@ -374,11 +426,11 @@ impl ColdStorage for IcebergStorage {
         // Create DataFile entry
         let data_file = DataFile::from_parquet_metadata(&parquet_metadata, &s3_path);
 
-        // Add to pending files for this topic
+        // Add to pending files for this topic/partition
         {
             let mut pending = self.pending_data_files.write().map_lock_err()?;
             pending
-                .entry(topic.to_string())
+                .entry((topic.to_string(), partition))
                 .or_default()
                 .push((data_file, parquet_metadata.clone()));
         }
@@ -557,12 +609,13 @@ impl ColdStorage for IcebergStorage {
             .and_then(|m| m.to_json().ok())
     }
 
-    fn clear_pending_data_files(&self, topic: &str) {
+    fn clear_pending_data_files(&self, topic: &str, partition: u32) {
         if let Ok(mut pending) = self.pending_data_files.write() {
-            if let Some(removed) = pending.remove(topic) {
+            if let Some(removed) = pending.remove(&(topic.to_string(), partition)) {
                 if !removed.is_empty() {
                     tracing::warn!(
                         topic = topic,
+                        partition = partition,
                         orphaned_files = removed.len(),
                         "Cleared pending data files after flush failure (orphaned S3 files remain)"
                     );
@@ -584,9 +637,16 @@ impl ColdStorage for IcebergStorage {
             }
         };
 
-        if let Some(files) = pending.get(topic) {
-            let file_count = files.len();
-            let total_bytes: u64 = files.iter().map(|(_, m)| m.file_size_bytes).sum();
+        let mut file_count = 0usize;
+        let mut total_bytes = 0u64;
+        for ((pending_topic, _partition), files) in pending.iter() {
+            if pending_topic == topic {
+                file_count += files.len();
+                total_bytes += files.iter().map(|(_, m)| m.file_size_bytes).sum::<u64>();
+            }
+        }
+
+        if file_count > 0 {
             PendingSnapshotStats {
                 file_count,
                 total_bytes,
@@ -695,7 +755,7 @@ fn make_metadata_key(base_path: &str, topic: &str, filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::write_parquet_to_bytes;
+    use crate::storage::{write_parquet_to_bytes, RetryConfig};
 
     #[test]
     fn test_data_file_key() {
@@ -873,5 +933,65 @@ mod tests {
         for count in partition_counts {
             assert!((12..=13).contains(&count));
         }
+    }
+
+    #[tokio::test]
+    async fn clear_pending_data_files_is_partition_scoped() {
+        let retry = RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+        };
+        let storage = IcebergStorage::with_endpoint_and_retry(
+            "test-bucket",
+            "tables",
+            "http://127.0.0.1:9",
+            "us-east-1",
+            retry,
+        )
+        .await
+        .unwrap();
+
+        storage
+            .insert_pending_data_files_for_test("events", 0, 1)
+            .unwrap();
+        storage
+            .insert_pending_data_files_for_test("events", 1, 1)
+            .unwrap();
+        assert_eq!(storage.pending_snapshot_stats("events").file_count, 2);
+
+        storage.clear_pending_data_files("events", 1);
+        assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
+        storage.clear_pending_data_files("events", 0);
+        assert_eq!(storage.pending_snapshot_stats("events").file_count, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_snapshot_failure_preserves_pending_entries() {
+        let retry = RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+        };
+        let storage = IcebergStorage::with_endpoint_and_retry(
+            "test-bucket",
+            "tables",
+            "http://127.0.0.1:9",
+            "us-east-1",
+            retry,
+        )
+        .await
+        .unwrap();
+
+        storage
+            .insert_pending_data_files_for_test("events", 0, 1)
+            .unwrap();
+        assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
+
+        let result = storage.commit_snapshot("events").await;
+        assert!(result.is_err());
+
+        // Pending files should still be present after a failed commit attempt.
+        assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
     }
 }

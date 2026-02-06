@@ -1,7 +1,8 @@
 //! Unified cold storage backend that supports both S3 and Iceberg modes.
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, ColumnProjection, SegmentInfo, StorageError, StoredEvent,
+    ColdStorage, ColdStorageInfo, ColumnProjection, PendingSnapshotStats, SegmentInfo,
+    StorageError, StoredEvent,
 };
 use crate::storage::{IcebergStorage, S3Storage};
 
@@ -129,5 +130,59 @@ impl ColdStorage for ColdStorageBackend {
             Self::S3(_) => None,
             Self::Iceberg(s) => s.table_metadata_json(topic),
         }
+    }
+
+    fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
+        match self {
+            Self::S3(s) => s.pending_snapshot_stats(topic),
+            Self::Iceberg(s) => s.pending_snapshot_stats(topic),
+        }
+    }
+
+    fn clear_pending_data_files(&self, topic: &str, partition: u32) {
+        match self {
+            Self::S3(s) => s.clear_pending_data_files(topic, partition),
+            Self::Iceberg(s) => s.clear_pending_data_files(topic, partition),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{IcebergStorage, RetryConfig};
+
+    #[tokio::test]
+    async fn cold_storage_backend_delegates_pending_methods() {
+        let retry = RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+        };
+        let storage = IcebergStorage::with_endpoint_and_retry(
+            "test-bucket",
+            "tables",
+            "http://127.0.0.1:9",
+            "us-east-1",
+            retry,
+        )
+        .await
+        .unwrap();
+
+        storage
+            .insert_pending_data_files_for_test("events", 0, 1)
+            .unwrap();
+        storage
+            .insert_pending_data_files_for_test("events", 1, 1)
+            .unwrap();
+
+        let backend = ColdStorageBackend::iceberg(storage);
+        assert_eq!(backend.pending_snapshot_stats("events").file_count, 2);
+
+        backend.clear_pending_data_files("events", 1);
+        assert_eq!(backend.pending_snapshot_stats("events").file_count, 1);
+
+        backend.clear_pending_data_files("events", 0);
+        assert_eq!(backend.pending_snapshot_stats("events").file_count, 0);
     }
 }

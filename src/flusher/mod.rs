@@ -447,7 +447,7 @@ where
                             flush_futures.next().await
                         {
                             match result {
-                                Ok((count, new_watermark, bytes, _num_segments)) => {
+                                Ok((count, new_watermark, bytes, num_segments)) => {
                                     if count > 0 {
                                         // Record flush metrics
                                         flush_metrics.record_flush(
@@ -458,8 +458,11 @@ where
 
                                         // Record Iceberg metrics if enabled
                                         if iceberg_enabled {
-                                            iceberg_metrics
-                                                .record_parquet_write(&topic, bytes as u64);
+                                            iceberg_metrics.record_parquet_write(
+                                                &topic,
+                                                bytes as u64,
+                                                num_segments as u64,
+                                            );
                                         }
 
                                         if let Ok(mut w) = watermarks.write() {
@@ -482,8 +485,12 @@ where
                                 Err(e) => {
                                     // Record S3 error
                                     iceberg_metrics.record_s3_error();
-                                    // Clear pending data files to prevent duplicate rows on retry
-                                    cold_storage.clear_pending_data_files(&topic);
+                                    clear_failed_partition_state(
+                                        cold_storage.as_ref(),
+                                        &topic,
+                                        partition,
+                                        &mut pending_watermark_persists,
+                                    );
                                     tracing::error!(
                                         topic = %topic,
                                         partition = partition,
@@ -500,14 +507,18 @@ where
                 while let Some((topic, partition, result, duration_us)) = flush_futures.next().await
                 {
                     match result {
-                        Ok((count, new_watermark, bytes, _num_segments)) => {
+                        Ok((count, new_watermark, bytes, num_segments)) => {
                             if count > 0 {
                                 // Record flush metrics
                                 flush_metrics.record_flush(count as u64, bytes as u64, duration_us);
 
                                 // Record Iceberg metrics if enabled
                                 if iceberg_enabled {
-                                    iceberg_metrics.record_parquet_write(&topic, bytes as u64);
+                                    iceberg_metrics.record_parquet_write(
+                                        &topic,
+                                        bytes as u64,
+                                        num_segments as u64,
+                                    );
                                 }
 
                                 if let Ok(mut w) = watermarks.write() {
@@ -530,8 +541,12 @@ where
                         Err(e) => {
                             // Record S3 error
                             iceberg_metrics.record_s3_error();
-                            // Clear pending data files to prevent duplicate rows on retry
-                            cold_storage.clear_pending_data_files(&topic);
+                            clear_failed_partition_state(
+                                cold_storage.as_ref(),
+                                &topic,
+                                partition,
+                                &mut pending_watermark_persists,
+                            );
                             tracing::error!(
                                 topic = %topic,
                                 partition = partition,
@@ -739,8 +754,11 @@ where
 
                         // Record Iceberg metrics if enabled
                         if self.config.iceberg_enabled {
-                            self.iceberg_metrics
-                                .record_parquet_write(&topic, bytes as u64);
+                            self.iceberg_metrics.record_parquet_write(
+                                &topic,
+                                bytes as u64,
+                                num_segments as u64,
+                            );
                         }
 
                         total_events += count;
@@ -768,8 +786,12 @@ where
                 }
                 Err(e) => {
                     self.iceberg_metrics.record_s3_error();
-                    // Clear pending data files to prevent duplicate rows on retry
-                    self.cold_storage.clear_pending_data_files(&topic);
+                    clear_failed_partition_state(
+                        self.cold_storage.as_ref(),
+                        &topic,
+                        partition,
+                        &mut pending_watermark_persists,
+                    );
                     tracing::error!(
                         topic = %topic,
                         partition = partition,
@@ -904,6 +926,26 @@ fn flush_pending_watermarks<H: HotStorage>(
         if !failed.is_empty() {
             pending.insert(topic.to_string(), failed);
         }
+    }
+}
+
+fn clear_failed_partition_state<C: ColdStorage>(
+    cold_storage: &C,
+    topic: &str,
+    partition: u32,
+    pending_watermarks: &mut HashMap<String, HashMap<u32, u64>>,
+) {
+    // Clear only the failed partition's pending files so successful partitions remain commit-able.
+    cold_storage.clear_pending_data_files(topic, partition);
+
+    let remove_topic = if let Some(partitions) = pending_watermarks.get_mut(topic) {
+        partitions.remove(&partition);
+        partitions.is_empty()
+    } else {
+        false
+    };
+    if remove_topic {
+        pending_watermarks.remove(topic);
     }
 }
 
@@ -1124,7 +1166,7 @@ mod tests {
         writes: Mutex<Vec<(String, u32, Vec<StoredEvent>)>>,
         /// If set, the Nth write_segment call (0-indexed) will fail.
         fail_on_call: Mutex<Option<usize>>,
-        pending_stats: Mutex<HashMap<String, PendingSnapshotStats>>,
+        pending_stats: Mutex<HashMap<(String, u32), PendingSnapshotStats>>,
         commit_counter: Mutex<i64>,
     }
 
@@ -1152,7 +1194,7 @@ mod tests {
                 .pending_stats
                 .lock()
                 .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
-            let stats = pending.entry(topic.to_string()).or_default();
+            let stats = pending.entry((topic.to_string(), partition)).or_default();
             stats.file_count += 1;
             stats.total_bytes += events.iter().map(|e| e.payload.len() as u64).sum::<u64>();
             Ok(format!("segment-{}", call_index))
@@ -1172,10 +1214,19 @@ mod tests {
         }
 
         fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
-            let pending = self.pending_stats.lock().ok();
-            pending
-                .and_then(|p| p.get(topic).cloned())
-                .unwrap_or_default()
+            let pending = match self.pending_stats.lock() {
+                Ok(p) => p,
+                Err(_) => return PendingSnapshotStats::default(),
+            };
+
+            let mut stats = PendingSnapshotStats::default();
+            for ((pending_topic, _partition), per_partition_stats) in pending.iter() {
+                if pending_topic == topic {
+                    stats.file_count += per_partition_stats.file_count;
+                    stats.total_bytes += per_partition_stats.total_bytes;
+                }
+            }
+            stats
         }
 
         async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
@@ -1183,17 +1234,21 @@ mod tests {
                 .pending_stats
                 .lock()
                 .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
-            if let Some(stats) = pending.get_mut(topic) {
-                if stats.file_count > 0 {
+            let mut had_pending = false;
+            for ((pending_topic, _partition), stats) in pending.iter_mut() {
+                if pending_topic == topic && stats.file_count > 0 {
+                    had_pending = true;
                     stats.file_count = 0;
                     stats.total_bytes = 0;
-                    let mut counter = self
-                        .commit_counter
-                        .lock()
-                        .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
-                    *counter += 1;
-                    return Ok(Some(*counter));
                 }
+            }
+            if had_pending {
+                let mut counter = self
+                    .commit_counter
+                    .lock()
+                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                *counter += 1;
+                return Ok(Some(*counter));
             }
             Ok(None)
         }
@@ -1215,9 +1270,9 @@ mod tests {
             }
         }
 
-        fn clear_pending_data_files(&self, topic: &str) {
+        fn clear_pending_data_files(&self, topic: &str, partition: u32) {
             if let Ok(mut pending) = self.pending_stats.lock() {
-                pending.remove(topic);
+                pending.remove(&(topic.to_string(), partition));
             }
         }
     }
@@ -1559,6 +1614,82 @@ mod tests {
             pending.file_count, 0,
             "All pending files should be committed after successful retry"
         );
+    }
+
+    #[tokio::test]
+    async fn flush_multi_partition_partial_failure_preserves_successful_partition() {
+        let mut hot = TestHotStorage::default();
+        hot.insert(
+            "events",
+            0,
+            vec![StoredEvent {
+                sequence: 1,
+                topic: "events".into(),
+                partition: 0,
+                payload: vec![1],
+                timestamp_ms: TS_HOUR_0_START,
+                idempotency_key: None,
+            }],
+        );
+        hot.insert(
+            "events",
+            1,
+            vec![StoredEvent {
+                sequence: 1,
+                topic: "events".into(),
+                partition: 1,
+                payload: vec![2],
+                timestamp_ms: TS_HOUR_0_START,
+                idempotency_key: None,
+            }],
+        );
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        // Partition 0 write succeeds first, then partition 1 write fails.
+        *cold.fail_on_call.lock().unwrap() = Some(1);
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            snapshot_threshold_files: 1,
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        let result = flusher.flush_now().await;
+        assert!(
+            result.is_err(),
+            "flush_now should surface the failed partition"
+        );
+
+        // Successful partition should still be committed and watermark persisted.
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            1,
+            "Partition 0 watermark should persist after its successful commit"
+        );
+        // Failed partition should not be persisted.
+        assert_eq!(
+            hot.load_flush_watermark("events", 1).unwrap(),
+            0,
+            "Partition 1 watermark must remain unpersisted after failure"
+        );
+
+        // flush_now force-commits surviving pending files, so no pending files remain.
+        assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+
+        *cold.fail_on_call.lock().unwrap() = None;
+        let retry = flusher.flush_now().await.unwrap();
+        assert_eq!(
+            retry.events_flushed, 1,
+            "Retry should flush only the previously failed partition"
+        );
+        assert_eq!(hot.load_flush_watermark("events", 1).unwrap(), 1);
     }
 
     #[tokio::test]

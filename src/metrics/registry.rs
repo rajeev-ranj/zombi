@@ -187,17 +187,17 @@ pub struct IcebergMetrics {
 }
 
 impl IcebergMetrics {
-    /// Records a Parquet file write.
+    /// Records Parquet file writes.
     #[inline]
-    pub fn record_parquet_write(&self, topic: &str, bytes: u64) {
+    pub fn record_parquet_write(&self, topic: &str, bytes: u64, files: u64) {
         self.parquet_files_written_total
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(files, Ordering::Relaxed);
 
         // Update pending files and bytes for the topic
         self.pending_snapshot_files
             .entry(topic.to_string())
-            .and_modify(|v| *v += 1)
-            .or_insert(1);
+            .and_modify(|v| *v += files)
+            .or_insert(files);
         self.pending_snapshot_bytes
             .entry(topic.to_string())
             .and_modify(|v| *v += bytes)
@@ -674,14 +674,14 @@ mod tests {
     #[test]
     fn test_iceberg_metrics() {
         let metrics = IcebergMetrics::default();
-        metrics.record_parquet_write("events", 1_000_000);
-        metrics.record_parquet_write("events", 2_000_000);
+        metrics.record_parquet_write("events", 1_000_000, 1);
+        metrics.record_parquet_write("events", 2_000_000, 2);
 
         assert_eq!(
             metrics.parquet_files_written_total.load(Ordering::Relaxed),
-            2
+            3
         );
-        assert_eq!(*metrics.pending_snapshot_files.get("events").unwrap(), 2);
+        assert_eq!(*metrics.pending_snapshot_files.get("events").unwrap(), 3);
         assert_eq!(
             *metrics.pending_snapshot_bytes.get("events").unwrap(),
             3_000_000
