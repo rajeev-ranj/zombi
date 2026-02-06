@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 
 use serde::Serialize;
@@ -85,10 +86,42 @@ pub trait ColdStorage: Send + Sync {
         PendingSnapshotStats::default()
     }
 
+    /// Returns pending snapshot stats for a specific topic/partition.
+    ///
+    /// This is used by partition failure cleanup logic to avoid topic-wide
+    /// races under concurrent partition flushes.
+    fn pending_snapshot_stats_for_partition(
+        &self,
+        _topic: &str,
+        _partition: u32,
+    ) -> PendingSnapshotStats {
+        PendingSnapshotStats::default()
+    }
+
     /// Returns the current table metadata JSON for catalog registration.
     /// Only Iceberg backends return Some; S3 backends return None.
     fn table_metadata_json(&self, _topic: &str) -> Option<String> {
         None
+    }
+
+    /// Clears pending (uncommitted) data files for a topic/partition.
+    ///
+    /// Called when a flush partition fails partway through writing hour-group
+    /// segments. The already-uploaded S3 files become orphans (invisible without
+    /// a snapshot), but clearing them from `pending_data_files` prevents
+    /// duplicate rows on the next retry cycle.
+    fn clear_pending_data_files(&self, _topic: &str, _partition: u32) {}
+
+    /// Returns the highest committed sequence watermark per partition for a topic.
+    ///
+    /// Implementations should only consider files reachable from the current
+    /// committed snapshot (not orphan files). Backends without snapshot semantics
+    /// return an empty map.
+    fn committed_flush_watermarks(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<HashMap<u32, u64>, StorageError>> + Send {
+        async move { Ok(HashMap::new()) }
     }
 }
 

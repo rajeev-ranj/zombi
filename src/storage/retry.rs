@@ -125,6 +125,15 @@ pub fn is_retryable_s3_error(err: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
 
     #[test]
     fn test_default_config() {
@@ -184,6 +193,7 @@ mod tests {
 
     #[test]
     fn test_from_env_with_defaults() {
+        let _guard = env_lock();
         // Clear any env vars that might be set
         std::env::remove_var("ZOMBI_S3_MAX_RETRIES");
         std::env::remove_var("ZOMBI_S3_RETRY_INITIAL_MS");
@@ -197,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_from_env_with_custom_values() {
+        let _guard = env_lock();
         std::env::set_var("ZOMBI_S3_MAX_RETRIES", "3");
         std::env::set_var("ZOMBI_S3_RETRY_INITIAL_MS", "200");
         std::env::set_var("ZOMBI_S3_RETRY_MAX_MS", "5000");
@@ -214,6 +225,7 @@ mod tests {
 
     #[test]
     fn test_from_env_ignores_invalid_values() {
+        let _guard = env_lock();
         std::env::set_var("ZOMBI_S3_MAX_RETRIES", "not_a_number");
         std::env::set_var("ZOMBI_S3_RETRY_INITIAL_MS", "");
         std::env::set_var("ZOMBI_S3_RETRY_MAX_MS", "-100");

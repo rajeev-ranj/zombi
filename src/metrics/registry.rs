@@ -83,6 +83,8 @@ pub struct FlushMetrics {
     pub flush_events_total: AtomicU64,
     /// Total bytes flushed to cold storage
     pub flush_bytes_total: AtomicU64,
+    /// Total watermark persistence errors
+    pub watermark_persist_errors_total: AtomicU64,
     /// Histogram of flush durations in microseconds
     pub flush_duration_us: Histogram,
 }
@@ -95,6 +97,13 @@ impl FlushMetrics {
         self.flush_events_total.fetch_add(events, Ordering::Relaxed);
         self.flush_bytes_total.fetch_add(bytes, Ordering::Relaxed);
         self.flush_duration_us.observe(duration_us);
+    }
+
+    /// Records a flush watermark persistence error.
+    #[inline]
+    pub fn record_watermark_persist_error(&self) {
+        self.watermark_persist_errors_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Formats flush metrics in Prometheus exposition format.
@@ -137,6 +146,21 @@ impl FlushMetrics {
         );
         output.push('\n');
 
+        let _ = writeln!(
+            output,
+            "# HELP zombi_watermark_persist_errors_total Total flush watermark persistence errors"
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE zombi_watermark_persist_errors_total counter"
+        );
+        let _ = writeln!(
+            output,
+            "zombi_watermark_persist_errors_total {}",
+            self.watermark_persist_errors_total.load(Ordering::Relaxed)
+        );
+        output.push('\n');
+
         output.push_str(&self.flush_duration_us.format_prometheus(
             "zombi_flush_duration_us",
             "Histogram of flush durations in microseconds",
@@ -163,17 +187,17 @@ pub struct IcebergMetrics {
 }
 
 impl IcebergMetrics {
-    /// Records a Parquet file write.
+    /// Records Parquet file writes.
     #[inline]
-    pub fn record_parquet_write(&self, topic: &str, bytes: u64) {
+    pub fn record_parquet_write(&self, topic: &str, bytes: u64, files: u64) {
         self.parquet_files_written_total
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(files, Ordering::Relaxed);
 
         // Update pending files and bytes for the topic
         self.pending_snapshot_files
             .entry(topic.to_string())
-            .and_modify(|v| *v += 1)
-            .or_insert(1);
+            .and_modify(|v| *v += files)
+            .or_insert(files);
         self.pending_snapshot_bytes
             .entry(topic.to_string())
             .and_modify(|v| *v += bytes)
@@ -624,6 +648,14 @@ mod tests {
     #[test]
     fn test_flush_metrics() {
         let metrics = FlushMetrics::default();
+        assert_eq!(
+            metrics
+                .watermark_persist_errors_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        metrics.record_watermark_persist_error();
+        metrics.record_watermark_persist_error();
         metrics.record_flush(100, 10_000, 5_000);
         metrics.record_flush(200, 20_000, 10_000);
 
@@ -631,19 +663,25 @@ mod tests {
         assert_eq!(metrics.flush_events_total.load(Ordering::Relaxed), 300);
         assert_eq!(metrics.flush_bytes_total.load(Ordering::Relaxed), 30_000);
         assert_eq!(metrics.flush_duration_us.count(), 2);
+        assert_eq!(
+            metrics
+                .watermark_persist_errors_total
+                .load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
     fn test_iceberg_metrics() {
         let metrics = IcebergMetrics::default();
-        metrics.record_parquet_write("events", 1_000_000);
-        metrics.record_parquet_write("events", 2_000_000);
+        metrics.record_parquet_write("events", 1_000_000, 1);
+        metrics.record_parquet_write("events", 2_000_000, 2);
 
         assert_eq!(
             metrics.parquet_files_written_total.load(Ordering::Relaxed),
-            2
+            3
         );
-        assert_eq!(*metrics.pending_snapshot_files.get("events").unwrap(), 2);
+        assert_eq!(*metrics.pending_snapshot_files.get("events").unwrap(), 3);
         assert_eq!(
             *metrics.pending_snapshot_bytes.get("events").unwrap(),
             3_000_000
@@ -737,6 +775,7 @@ mod tests {
 
         let output = registry.format_prometheus();
         assert!(output.contains("zombi_flush_total 1"));
+        assert!(output.contains("zombi_watermark_persist_errors_total 0"));
         assert!(output.contains("zombi_write_latency_us"));
         assert!(output.contains("zombi_writes_by_topic_total{topic=\"test-topic\"}"));
     }

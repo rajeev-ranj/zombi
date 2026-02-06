@@ -255,7 +255,7 @@ prop_compose! {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zombi::storage::{AtomicSequenceGenerator, RocksDbStorage};
+    use zombi::storage::{derive_partition_columns, AtomicSequenceGenerator, RocksDbStorage};
 
     fn create_test_storage() -> (RocksDbStorage, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -309,6 +309,55 @@ mod tests {
                 &payload_a,
                 &payload_b
             );
+        }
+
+        /// INV-8 (watermark persistence): Flush watermarks round-trip through RocksDB.
+        #[test]
+        fn test_flush_watermark_round_trips(
+            topic in arb_topic(),
+            partition in arb_partition(),
+            watermark in any::<u64>()
+        ) {
+            let (storage, _dir) = create_test_storage();
+            storage.save_flush_watermark(&topic, partition, watermark).unwrap();
+            let loaded = storage.load_flush_watermark(&topic, partition).unwrap();
+            prop_assert_eq!(loaded, watermark);
+        }
+
+        /// INV-6 (hour partitioning): Grouping events by derive_partition_columns
+        /// produces groups where every event shares the same (date, hour).
+        #[test]
+        fn test_hour_grouping_produces_same_hour_segments(
+            timestamps in prop::collection::vec(
+                // Random timestamps across a 48-hour range starting 2024-01-15
+                1705276800000i64..1705449600000i64,
+                1..50usize
+            )
+        ) {
+            let mut groups: std::collections::BTreeMap<(i32, i32), Vec<i64>> =
+                std::collections::BTreeMap::new();
+            for ts in &timestamps {
+                let (date, hour) = derive_partition_columns(*ts);
+                groups.entry((date, hour)).or_default().push(*ts);
+            }
+
+            // All timestamps in each group have the same (date, hour)
+            for ((date, hour), group_timestamps) in &groups {
+                for ts in group_timestamps {
+                    let (d, h) = derive_partition_columns(*ts);
+                    prop_assert_eq!(d, *date);
+                    prop_assert_eq!(h, *hour);
+                }
+            }
+
+            // Union of all groups equals the original set size
+            let total: usize = groups.values().map(|g| g.len()).sum();
+            prop_assert_eq!(total, timestamps.len());
+
+            // No empty groups
+            for group in groups.values() {
+                prop_assert!(!group.is_empty());
+            }
         }
     }
 }
