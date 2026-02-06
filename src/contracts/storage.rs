@@ -142,6 +142,20 @@ pub trait HotStorage: Send + Sync {
     /// Loads the flush watermark for a topic/partition.
     /// Returns 0 if no watermark has been persisted.
     fn load_flush_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError>;
+
+    /// Deletes events from hot storage up to (and including) `up_to_sequence`.
+    ///
+    /// Also deletes associated idempotency keys and timestamp index entries.
+    /// High watermark keys (`hwm:*`) and flush watermark keys (`flush_wm:*`) are preserved.
+    ///
+    /// Returns the count of deleted event keys. Idempotent: calling with a sequence
+    /// at or below the last cleanup watermark returns 0.
+    fn delete_flushed_events(
+        &self,
+        topic: &str,
+        partition: u32,
+        up_to_sequence: u64,
+    ) -> Result<u64, StorageError>;
 }
 
 /// Specifies which columns to read from cold storage.
