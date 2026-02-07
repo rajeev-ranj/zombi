@@ -5,7 +5,9 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
-use zombi::api::{start_server, AppState, BackpressureConfig, Metrics, ServerConfig};
+use zombi::api::{
+    start_server, AppState, BackpressureConfig, FlushCallback, Metrics, ServerConfig,
+};
 use zombi::contracts::{Flusher, TableSchemaConfig};
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::metrics::MetricsRegistry;
@@ -224,6 +226,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Create flush callback for the /flush endpoint
+    let flush_callback: Option<FlushCallback> = flusher.as_ref().map(|f| {
+        let f = Arc::clone(f);
+        Arc::new(move || {
+            let f = Arc::clone(&f);
+            Box::pin(async move { f.flush_now().await })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<
+                                    zombi::contracts::FlushResult,
+                                    zombi::contracts::StorageError,
+                                >,
+                            > + Send,
+                    >,
+                >
+        }) as FlushCallback
+    });
+
     // Create app state with backpressure configuration
     let backpressure_config = BackpressureConfig::from_env();
     tracing::info!(
@@ -259,7 +280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             catalog_namespace,
         )
         .with_write_combiner(write_combiner)
-        .with_compactor(compactor),
+        .with_compactor(compactor)
+        .with_flusher(flush_callback),
     );
 
     // Start server

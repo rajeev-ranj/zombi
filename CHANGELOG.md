@@ -44,6 +44,12 @@ All notable changes to Zombi are documented here.
 
 - **Table Name Validation** (Issue #101) — API rejects invalid table names at boundary (must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$`)
 
+- **Arrow IPC Content Negotiation** — `GET /tables/{table}` supports `Accept: application/vnd.apache.arrow.stream` for Arrow IPC streaming format; includes column projection support
+
+- **Watermark Endpoint** — `GET /tables/{table}/watermark` returns per-partition flush watermark and high watermark
+
+- **Flush Wiring** — `POST /tables/{table}/flush` triggers immediate flush to cold storage (global; table-scoped planned for v0.4)
+
 ### Changed
 - **Cumulative Manifest Lists** — Each snapshot's manifest list now carries forward all entries from the parent snapshot, making each list a complete view of the table per the Iceberg spec
 - **Iceberg-Aware Compaction** (#106) — Compaction now produces `replace` snapshots with separate delete/add manifests, carries forward unaffected manifest references, and cleans up old S3 files after commit
@@ -66,8 +72,6 @@ All notable changes to Zombi are documented here.
   - Table name validation for safe keys/S3 paths
 - **P1 Iceberg-Native Interfaces**
   - Iceberg REST Catalog API (server-side)
-  - Arrow IPC content negotiation on read endpoint (`Accept` header)
-  - Watermark boundary endpoint
   - Watermark in snapshot summary
   - Compaction snapshot rewrite integration
   - Configurable snapshot thresholds
@@ -75,7 +79,7 @@ All notable changes to Zombi are documented here.
   - ZombiCatalog + ZombiTable + hot InputFile
   - End-to-end engine integration tests
 - **P3 Operational Maturity**
-  - Wire `/flush` and `/compact` admin endpoints
+  - Wire `/compact` admin endpoint
   - Deprecate/remove consumer offsets
   - Optional auth (token/mTLS)
 - **P4 Enhancements**
