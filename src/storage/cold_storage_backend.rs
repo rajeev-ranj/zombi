@@ -2,7 +2,7 @@
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, ColumnProjection, IcebergCatalogTable, PendingSnapshotStats,
-    SegmentInfo, StorageError, StoredEvent,
+    SegmentInfo, SnapshotCommitContext, StorageError, StoredEvent,
 };
 use crate::storage::{IcebergStorage, S3Storage};
 
@@ -118,10 +118,14 @@ impl ColdStorage for ColdStorageBackend {
         }
     }
 
-    async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
+    async fn commit_snapshot(
+        &self,
+        topic: &str,
+        context: SnapshotCommitContext,
+    ) -> Result<Option<i64>, StorageError> {
         match self {
-            Self::S3(s) => s.commit_snapshot(topic).await,
-            Self::Iceberg(s) => s.commit_snapshot(topic).await,
+            Self::S3(s) => s.commit_snapshot(topic, context).await,
+            Self::Iceberg(s) => s.commit_snapshot(topic, context).await,
         }
     }
 

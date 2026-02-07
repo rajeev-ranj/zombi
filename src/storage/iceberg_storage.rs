@@ -11,7 +11,8 @@ use bytes::Bytes;
 
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, IcebergCatalogTable, LockResultExt, PayloadFormat,
-    PendingSnapshotStats, SegmentInfo, StorageError, StoredEvent, TableSchemaConfig,
+    PendingSnapshotStats, SegmentInfo, SnapshotCommitContext, StorageError, StoredEvent,
+    TableSchemaConfig,
 };
 use crate::s3_retry;
 use crate::storage::parquet::write_parquet_to_bytes_structured_sorted;
@@ -248,6 +249,24 @@ impl IcebergStorage {
             )));
         }
         Ok((bucket.to_string(), key.to_string()))
+    }
+
+    /// Builds additional snapshot summary entries from commit context.
+    fn snapshot_summary_from_context(context: &SnapshotCommitContext) -> HashMap<String, String> {
+        let mut summary = HashMap::new();
+        for (partition, watermark) in &context.watermarks_by_partition {
+            summary.insert(
+                format!("zombi.watermark.{}", partition),
+                watermark.to_string(),
+            );
+        }
+        for (partition, high_watermark) in &context.high_watermarks_by_partition {
+            summary.insert(
+                format!("zombi.high_watermark.{}", partition),
+                high_watermark.to_string(),
+            );
+        }
+        summary
     }
 
     /// Helper: fetches a named field from an Avro record.
@@ -734,7 +753,11 @@ impl IcebergStorage {
 
     /// Commits pending data files by creating a new snapshot.
     /// This should be called after a batch of write_segment calls.
-    pub async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
+    pub async fn commit_snapshot(
+        &self,
+        topic: &str,
+        context: SnapshotCommitContext,
+    ) -> Result<Option<i64>, StorageError> {
         // Drain pending files for this topic under a write lock. This prevents
         // races where new files are added between a read snapshot and later clear.
         // New writes after this point remain in the map for the next snapshot.
@@ -763,7 +786,9 @@ impl IcebergStorage {
             .flat_map(|(_key, files)| files.iter().cloned())
             .collect();
 
-        let commit_result: Result<(i64, usize, i64), StorageError> = async {
+        let extra_summary = Self::snapshot_summary_from_context(&context);
+
+        let commit_result: Result<(i64, usize, i64), StorageError> = async move {
             let mut metadata = self.get_or_create_metadata(topic)?;
 
             // Calculate totals
@@ -819,6 +844,7 @@ impl IcebergStorage {
                 total_files,
                 total_rows,
                 SnapshotOperation::Append,
+                extra_summary,
             );
 
             // Write new metadata file
@@ -1107,8 +1133,12 @@ impl ColdStorage for IcebergStorage {
         ))
     }
 
-    async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
-        self.commit_snapshot(topic).await
+    async fn commit_snapshot(
+        &self,
+        topic: &str,
+        context: SnapshotCommitContext,
+    ) -> Result<Option<i64>, StorageError> {
+        self.commit_snapshot(topic, context).await
     }
 
     fn table_metadata_json(&self, topic: &str) -> Option<String> {
@@ -1736,10 +1766,35 @@ mod tests {
             .unwrap();
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
 
-        let result = storage.commit_snapshot("events").await;
+        let result = storage
+            .commit_snapshot("events", SnapshotCommitContext::default())
+            .await;
         assert!(result.is_err());
 
         // Pending files should still be present after a failed commit attempt.
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
+    }
+
+    #[test]
+    fn snapshot_summary_from_context_maps_watermarks() {
+        let context = SnapshotCommitContext {
+            watermarks_by_partition: HashMap::from([(0, 42), (1, 99)]),
+            high_watermarks_by_partition: HashMap::from([(0, 100), (1, 200)]),
+        };
+
+        let summary = IcebergStorage::snapshot_summary_from_context(&context);
+
+        assert_eq!(summary.get("zombi.watermark.0").unwrap(), "42");
+        assert_eq!(summary.get("zombi.watermark.1").unwrap(), "99");
+        assert_eq!(summary.get("zombi.high_watermark.0").unwrap(), "100");
+        assert_eq!(summary.get("zombi.high_watermark.1").unwrap(), "200");
+        assert_eq!(summary.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_summary_from_empty_context_is_empty() {
+        let context = SnapshotCommitContext::default();
+        let summary = IcebergStorage::snapshot_summary_from_context(&context);
+        assert!(summary.is_empty());
     }
 }
