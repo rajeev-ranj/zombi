@@ -9,6 +9,7 @@ use axum::Router;
 
 use crate::contracts::{ColdStorage, HotStorage};
 
+pub use catalog::compute_catalog_namespace;
 pub use handlers::{
     AppState, BackpressureConfig, Metrics, NoopColdStorage, WriteRecordRequest, WriteRecordResponse,
 };
@@ -20,8 +21,11 @@ pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(
     Router::new()
         // Iceberg REST Catalog API (read-only)
         .route("/v1/config", get(catalog::get_catalog_config::<H, C>))
-        .route("/v1/namespaces", get(catalog::list_namespaces))
-        .route("/v1/namespaces/:namespace", get(catalog::load_namespace))
+        .route("/v1/namespaces", get(catalog::list_namespaces::<H, C>))
+        .route(
+            "/v1/namespaces/:namespace",
+            get(catalog::load_namespace::<H, C>),
+        )
         .route(
             "/v1/namespaces/:namespace/tables",
             get(catalog::list_tables::<H, C>),

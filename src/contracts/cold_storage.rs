@@ -128,6 +128,15 @@ pub trait ColdStorage: Send + Sync {
         async move { Ok(None) }
     }
 
+    /// Checks whether an Iceberg table exists without loading its full metadata.
+    /// Efficient backends override this to avoid downloading full metadata JSON.
+    fn iceberg_table_exists(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        async move { Ok(false) }
+    }
+
     /// Clears pending (uncommitted) data files for a topic/partition.
     ///
     /// Called when a flush partition fails partway through writing hour-group

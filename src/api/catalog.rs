@@ -99,7 +99,9 @@ fn parse_namespace_config(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn configured_namespace() -> Vec<String> {
+/// Computes the catalog namespace from the `ZOMBI_CATALOG_NAMESPACE` env var.
+/// Call this once at startup and store the result in `AppState`.
+pub fn compute_catalog_namespace() -> Vec<String> {
     let raw = std::env::var("ZOMBI_CATALOG_NAMESPACE").unwrap_or_else(|_| DEFAULT_NAMESPACE.into());
     let parsed = parse_namespace_config(&raw);
     if parsed.is_empty() {
@@ -222,11 +224,12 @@ pub async fn get_catalog_config<H: HotStorage, C: ColdStorage>(
 }
 
 /// GET /v1/namespaces
-pub async fn list_namespaces(
+pub async fn list_namespaces<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
     Query(query): Query<ListNamespacesQuery>,
 ) -> Result<Json<ListNamespacesResponse>, CatalogError> {
-    let expected = configured_namespace();
-    let namespaces = list_namespaces_for_parent(&expected, query.parent.as_deref())?;
+    let expected = &state.catalog_namespace;
+    let namespaces = list_namespaces_for_parent(expected, query.parent.as_deref())?;
     Ok(Json(ListNamespacesResponse {
         next_page_token: None,
         namespaces,
@@ -234,13 +237,14 @@ pub async fn list_namespaces(
 }
 
 /// GET /v1/namespaces/{namespace}
-pub async fn load_namespace(
+pub async fn load_namespace<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
     Path(namespace): Path<String>,
 ) -> Result<Json<LoadNamespaceResponse>, CatalogError> {
-    let expected = configured_namespace();
-    validate_exact_namespace(&namespace, &expected)?;
+    let expected = &state.catalog_namespace;
+    validate_exact_namespace(&namespace, expected)?;
     Ok(Json(LoadNamespaceResponse {
-        namespace: expected,
+        namespace: expected.clone(),
         properties: HashMap::new(),
     }))
 }
@@ -250,8 +254,8 @@ pub async fn list_tables<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(namespace): Path<String>,
 ) -> Result<Json<ListTablesResponse>, CatalogError> {
-    let expected_namespace = configured_namespace();
-    validate_exact_namespace(&namespace, &expected_namespace)?;
+    let expected_namespace = &state.catalog_namespace;
+    validate_exact_namespace(&namespace, expected_namespace)?;
 
     let Some(cold) = &state.cold_storage else {
         return Ok(Json(ListTablesResponse {
@@ -273,7 +277,6 @@ pub async fn list_tables<H: HotStorage, C: ColdStorage>(
         .map_err(|e| internal_error(format!("Failed to list Iceberg tables: {}", e)))?;
 
     table_names.retain(|name| validate_table_name(name).is_ok());
-    table_names.sort();
     table_names.dedup();
 
     let identifiers = table_names
@@ -295,8 +298,8 @@ pub async fn load_table<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path((namespace, table)): Path<(String, String)>,
 ) -> Result<Json<LoadTableResponse>, CatalogError> {
-    let expected_namespace = configured_namespace();
-    validate_exact_namespace(&namespace, &expected_namespace)?;
+    let expected_namespace = &state.catalog_namespace;
+    validate_exact_namespace(&namespace, expected_namespace)?;
 
     if validate_table_name(&table).is_err() {
         return Err(no_such_table(&namespace, &table));
@@ -332,8 +335,8 @@ pub async fn table_exists<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path((namespace, table)): Path<(String, String)>,
 ) -> Result<StatusCode, CatalogError> {
-    let expected_namespace = configured_namespace();
-    validate_exact_namespace(&namespace, &expected_namespace)?;
+    let expected_namespace = &state.catalog_namespace;
+    validate_exact_namespace(&namespace, expected_namespace)?;
 
     if validate_table_name(&table).is_err() {
         return Err(no_such_table(&namespace, &table));
@@ -347,10 +350,9 @@ pub async fn table_exists<H: HotStorage, C: ColdStorage>(
     }
 
     let exists = cold
-        .load_iceberg_table(&table)
+        .iceberg_table_exists(&table)
         .await
-        .map_err(|e| internal_error(format!("Failed to check table existence: {}", e)))?
-        .is_some();
+        .map_err(|e| internal_error(format!("Failed to check table existence: {}", e)))?;
 
     if exists {
         Ok(StatusCode::NO_CONTENT)

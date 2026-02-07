@@ -149,6 +149,13 @@ impl ColdStorage for ColdStorageBackend {
         }
     }
 
+    async fn iceberg_table_exists(&self, topic: &str) -> Result<bool, StorageError> {
+        match self {
+            Self::S3(_) => Ok(false),
+            Self::Iceberg(s) => s.iceberg_table_exists(topic).await,
+        }
+    }
+
     fn pending_snapshot_stats(&self, topic: &str) -> PendingSnapshotStats {
         match self {
             Self::S3(s) => s.pending_snapshot_stats(topic),

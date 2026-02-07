@@ -405,21 +405,28 @@ impl IcebergStorage {
         Ok(per_partition)
     }
 
-    /// Lists all keys for a prefix with pagination.
+    /// Lists S3 keys or directory prefixes under a given prefix with pagination.
+    ///
+    /// When `delimiter` is `None`, returns all object keys (flat listing).
+    /// When `delimiter` is `Some("/")`, returns only common prefixes (directory listing).
     async fn list_keys_with_prefix(
         &self,
         bucket: &str,
         prefix: &str,
+        delimiter: Option<&str>,
     ) -> Result<Vec<String>, StorageError> {
         let client = &self.client;
         let mut continuation_token: Option<String> = None;
-        let mut keys = Vec::new();
+        let mut results = Vec::new();
 
         loop {
             let continuation = continuation_token.clone();
             let response = s3_retry!(
                 operation = {
                     let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+                    if let Some(d) = delimiter {
+                        request = request.delimiter(d);
+                    }
                     if let Some(token) = continuation.as_deref() {
                         request = request.continuation_token(token);
                     }
@@ -432,10 +439,18 @@ impl IcebergStorage {
             let is_truncated = response.is_truncated().unwrap_or(false);
             continuation_token = response.next_continuation_token().map(|t| t.to_string());
 
-            if let Some(contents) = response.contents {
+            if delimiter.is_some() {
+                if let Some(common_prefixes) = response.common_prefixes {
+                    for cp in common_prefixes {
+                        if let Some(p) = cp.prefix {
+                            results.push(p);
+                        }
+                    }
+                }
+            } else if let Some(contents) = response.contents {
                 for object in contents {
                     if let Some(key) = object.key {
-                        keys.push(key);
+                        results.push(key);
                     }
                 }
             }
@@ -448,7 +463,39 @@ impl IcebergStorage {
             }
         }
 
-        Ok(keys)
+        Ok(results)
+    }
+
+    /// Checks if the given metadata prefix contains at least one `v*.metadata.json` file.
+    async fn has_metadata_files(
+        &self,
+        bucket: &str,
+        metadata_prefix: &str,
+    ) -> Result<bool, StorageError> {
+        let client = &self.client;
+        let response = s3_retry!(
+            operation = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(metadata_prefix)
+                .max_keys(20)
+                .send()
+                .await,
+            retry_config = self.retry_config,
+            context = format!("LIST-EXISTS s3://{}/{}", bucket, metadata_prefix),
+        )?;
+
+        if let Some(contents) = response.contents {
+            for object in contents {
+                if let Some(key) = &object.key {
+                    if Self::parse_metadata_version_from_key(key).is_some() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Downloads an S3 object as bytes.
@@ -472,11 +519,15 @@ impl IcebergStorage {
         Ok(bytes.to_vec())
     }
 
-    /// Loads the latest committed metadata file version and payload for a topic.
+    /// Loads the latest committed metadata file version and parsed payload for a topic.
+    ///
+    /// Delegates to `load_latest_table_metadata_raw` for the S3 work, then parses.
+    /// The raw method already caches version and parsed metadata on miss.
     async fn load_latest_table_metadata_with_version(
         &self,
         topic: &str,
     ) -> Result<Option<(i64, TableMetadata)>, StorageError> {
+        // Fast path: both caches hit
         if let Some(cached) = self.get_table_metadata(topic)? {
             let version = {
                 let versions = self.metadata_versions.read().map_lock_err()?;
@@ -487,9 +538,98 @@ impl IcebergStorage {
             }
         }
 
+        // Slow path: _raw fetches from S3 and caches version + parsed metadata
+        let Some((version, raw_json)) = self.load_latest_table_metadata_raw(topic).await? else {
+            return Ok(None);
+        };
+
+        // _raw already cached the parsed metadata; read it back to avoid re-parsing
+        if let Some(cached) = self.get_table_metadata(topic)? {
+            return Ok(Some((version, cached)));
+        }
+
+        // Fallback: parse directly (shouldn't happen unless cache was evicted)
+        let metadata = TableMetadata::from_json(&raw_json)?;
+        Ok(Some((version, metadata)))
+    }
+
+    /// Loads the latest metadata file for a topic from S3, populating local caches.
+    async fn load_latest_table_metadata(
+        &self,
+        topic: &str,
+    ) -> Result<Option<TableMetadata>, StorageError> {
+        Ok(self
+            .load_latest_table_metadata_with_version(topic)
+            .await?
+            .map(|(_version, metadata)| metadata))
+    }
+
+    /// Lists table names under the configured Iceberg base path.
+    ///
+    /// Uses delimiter-based S3 listing to enumerate table directories (O(tables))
+    /// instead of listing every key under the base path (O(all-keys)).
+    pub async fn list_tables(&self) -> Result<Vec<String>, StorageError> {
+        let root_prefix = format!("{}/", self.base_path.trim_end_matches('/'));
+
+        let dir_prefixes = self
+            .list_keys_with_prefix(&self.bucket, &root_prefix, Some("/"))
+            .await?;
+
+        let mut table_names = Vec::new();
+        for dir_prefix in dir_prefixes {
+            let Some(suffix) = dir_prefix.strip_prefix(&root_prefix) else {
+                continue;
+            };
+            let table = suffix.trim_end_matches('/');
+            if table.is_empty() || table.contains('/') {
+                continue;
+            }
+
+            let metadata_prefix = format!("{}metadata/", dir_prefix);
+            if self
+                .has_metadata_files(&self.bucket, &metadata_prefix)
+                .await?
+            {
+                table_names.push(table.to_string());
+            }
+        }
+
+        table_names.sort();
+        Ok(table_names)
+    }
+
+    /// Loads the latest metadata file as raw JSON plus its version number.
+    ///
+    /// Unlike `load_latest_table_metadata_with_version`, this returns the original
+    /// JSON bytes from S3 without deserializing and re-serializing, preserving
+    /// unknown fields and formatting.
+    async fn load_latest_table_metadata_raw(
+        &self,
+        topic: &str,
+    ) -> Result<Option<(i64, String)>, StorageError> {
+        // Check version cache for a direct download path
+        let cached_version = {
+            let versions = self.metadata_versions.read().map_lock_err()?;
+            versions.get(topic).copied()
+        };
+
+        if let Some(version) = cached_version {
+            let key = format!(
+                "{}/{}/metadata/{}",
+                self.base_path.trim_end_matches('/'),
+                topic,
+                metadata_file_name(version)
+            );
+            let bytes = self.download_object_bytes(&self.bucket, &key).await?;
+            let json =
+                String::from_utf8(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+            return Ok(Some((version, json)));
+        }
+
+        // No cached version: list metadata files, find latest, download raw
         let metadata_prefix = format!("{}/{}/metadata/", self.base_path, topic);
         let keys = self
-            .list_keys_with_prefix(&self.bucket, &metadata_prefix)
+            .list_keys_with_prefix(&self.bucket, &metadata_prefix, None)
             .await?;
 
         let latest = keys
@@ -506,59 +646,18 @@ impl IcebergStorage {
         let bytes = self.download_object_bytes(&self.bucket, &key).await?;
         let json =
             String::from_utf8(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let metadata = TableMetadata::from_json(&json)?;
 
-        {
-            let mut cached = self.table_metadata.write().map_lock_err()?;
-            cached.insert(topic.to_string(), metadata.clone());
-        }
+        // Cache the version and parsed metadata for other callers
         {
             let mut versions = self.metadata_versions.write().map_lock_err()?;
             versions.insert(topic.to_string(), version);
         }
-
-        Ok(Some((version, metadata)))
-    }
-
-    /// Loads the latest metadata file for a topic from S3, populating local caches.
-    async fn load_latest_table_metadata(
-        &self,
-        topic: &str,
-    ) -> Result<Option<TableMetadata>, StorageError> {
-        Ok(self
-            .load_latest_table_metadata_with_version(topic)
-            .await?
-            .map(|(_version, metadata)| metadata))
-    }
-
-    /// Lists table names under the configured Iceberg base path.
-    pub async fn list_tables(&self) -> Result<Vec<String>, StorageError> {
-        let root_prefix = format!("{}/", self.base_path.trim_end_matches('/'));
-        let keys = self
-            .list_keys_with_prefix(&self.bucket, &root_prefix)
-            .await?;
-        let mut table_names = HashSet::new();
-
-        for key in keys {
-            let Some(suffix) = key.strip_prefix(&root_prefix) else {
-                continue;
-            };
-            let Some((table, rest)) = suffix.split_once('/') else {
-                continue;
-            };
-            if table.is_empty() || !rest.starts_with("metadata/") {
-                continue;
-            }
-            if Self::parse_metadata_version_from_key(&key).is_none() {
-                continue;
-            }
-
-            table_names.insert(table.to_string());
+        if let Ok(metadata) = TableMetadata::from_json(&json) {
+            let mut cached = self.table_metadata.write().map_lock_err()?;
+            cached.insert(topic.to_string(), metadata);
         }
 
-        let mut tables: Vec<String> = table_names.into_iter().collect();
-        tables.sort();
-        Ok(tables)
+        Ok(Some((version, json)))
     }
 
     /// Loads committed metadata payload and exact metadata file location for REST catalog load-table.
@@ -566,8 +665,7 @@ impl IcebergStorage {
         &self,
         topic: &str,
     ) -> Result<Option<IcebergCatalogTable>, StorageError> {
-        let Some((version, metadata)) = self.load_latest_table_metadata_with_version(topic).await?
-        else {
+        let Some((version, raw_json)) = self.load_latest_table_metadata_raw(topic).await? else {
             return Ok(None);
         };
 
@@ -581,7 +679,7 @@ impl IcebergStorage {
 
         Ok(Some(IcebergCatalogTable {
             metadata_location,
-            metadata_json: metadata.to_json()?,
+            metadata_json: raw_json,
         }))
     }
 
@@ -1015,6 +1113,27 @@ impl ColdStorage for IcebergStorage {
         topic: &str,
     ) -> Result<Option<IcebergCatalogTable>, StorageError> {
         self.load_table_for_catalog(topic).await
+    }
+
+    async fn iceberg_table_exists(&self, topic: &str) -> Result<bool, StorageError> {
+        // Fast path: check caches
+        {
+            let metadata = self.table_metadata.read().map_lock_err()?;
+            if metadata.contains_key(topic) {
+                return Ok(true);
+            }
+        }
+        {
+            let versions = self.metadata_versions.read().map_lock_err()?;
+            if versions.contains_key(topic) {
+                return Ok(true);
+            }
+        }
+
+        // Slow path: check S3 for at least one metadata file
+        let metadata_prefix = format!("{}/{}/metadata/", self.base_path, topic);
+        self.has_metadata_files(&self.bucket, &metadata_prefix)
+            .await
     }
 
     fn clear_pending_data_files(&self, topic: &str, partition: u32) {

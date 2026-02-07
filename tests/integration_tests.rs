@@ -159,6 +159,10 @@ impl ColdStorage for CatalogColdStorageMock {
     ) -> Result<Option<IcebergCatalogTable>, StorageError> {
         Ok(self.tables.get(topic).cloned())
     }
+
+    async fn iceberg_table_exists(&self, topic: &str) -> Result<bool, StorageError> {
+        Ok(self.tables.contains_key(topic))
+    }
 }
 
 fn create_test_app_with_backpressure(
@@ -172,6 +176,7 @@ fn create_test_app_with_backpressure(
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         config,
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -186,6 +191,7 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -207,6 +213,7 @@ fn create_test_app_with_combiner(config: WriteCombinerConfig) -> (axum::Router, 
             Arc::new(Metrics::new()),
             metrics_registry,
             BackpressureConfig::default(),
+            vec!["zombi".into()],
         )
         .with_write_combiner(Some(combiner)),
     );
@@ -223,6 +230,7 @@ fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -237,6 +245,7 @@ fn create_test_app_with_panic_cold_storage() -> (axum::Router, tempfile::TempDir
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -251,6 +260,7 @@ fn create_test_app_with_catalog_storage() -> (axum::Router, tempfile::TempDir) {
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
