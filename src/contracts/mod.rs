@@ -5,7 +5,9 @@ pub mod schema;
 pub mod sequence;
 pub mod storage;
 
-pub use cold_storage::{ColdStorage, ColdStorageInfo, PendingSnapshotStats, SegmentInfo};
+pub use cold_storage::{
+    ColdStorage, ColdStorageInfo, IcebergCatalogTable, PendingSnapshotStats, SegmentInfo,
+};
 pub use error::{LockResultExt, SequenceError, StorageError, ZombiError};
 pub use flusher::{FlushResult, Flusher};
 pub use schema::{ExtractedField, FieldType, PayloadFormat, TableSchemaConfig};

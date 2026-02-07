@@ -1,8 +1,8 @@
 //! Unified cold storage backend that supports both S3 and Iceberg modes.
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, ColumnProjection, PendingSnapshotStats, SegmentInfo,
-    StorageError, StoredEvent,
+    ColdStorage, ColdStorageInfo, ColumnProjection, IcebergCatalogTable, PendingSnapshotStats,
+    SegmentInfo, StorageError, StoredEvent,
 };
 use crate::storage::{IcebergStorage, S3Storage};
 
@@ -129,6 +129,23 @@ impl ColdStorage for ColdStorageBackend {
         match self {
             Self::S3(_) => None,
             Self::Iceberg(s) => s.table_metadata_json(topic),
+        }
+    }
+
+    async fn list_iceberg_tables(&self) -> Result<Vec<String>, StorageError> {
+        match self {
+            Self::S3(_) => Ok(Vec::new()),
+            Self::Iceberg(s) => s.list_tables().await,
+        }
+    }
+
+    async fn load_iceberg_table(
+        &self,
+        topic: &str,
+    ) -> Result<Option<IcebergCatalogTable>, StorageError> {
+        match self {
+            Self::S3(_) => Ok(None),
+            Self::Iceberg(s) => s.load_table_for_catalog(topic).await,
         }
     }
 

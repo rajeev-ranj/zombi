@@ -10,8 +10,8 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, LockResultExt, PayloadFormat, PendingSnapshotStats, SegmentInfo,
-    StorageError, StoredEvent, TableSchemaConfig,
+    ColdStorage, ColdStorageInfo, IcebergCatalogTable, LockResultExt, PayloadFormat,
+    PendingSnapshotStats, SegmentInfo, StorageError, StoredEvent, TableSchemaConfig,
 };
 use crate::s3_retry;
 use crate::storage::parquet::write_parquet_to_bytes_structured_sorted;
@@ -472,13 +472,19 @@ impl IcebergStorage {
         Ok(bytes.to_vec())
     }
 
-    /// Loads the latest metadata file for a topic from S3, populating local caches.
-    async fn load_latest_table_metadata(
+    /// Loads the latest committed metadata file version and payload for a topic.
+    async fn load_latest_table_metadata_with_version(
         &self,
         topic: &str,
-    ) -> Result<Option<TableMetadata>, StorageError> {
+    ) -> Result<Option<(i64, TableMetadata)>, StorageError> {
         if let Some(cached) = self.get_table_metadata(topic)? {
-            return Ok(Some(cached));
+            let version = {
+                let versions = self.metadata_versions.read().map_lock_err()?;
+                versions.get(topic).copied()
+            };
+            if let Some(version) = version {
+                return Ok(Some((version, cached)));
+            }
         }
 
         let metadata_prefix = format!("{}/{}/metadata/", self.base_path, topic);
@@ -511,7 +517,74 @@ impl IcebergStorage {
             versions.insert(topic.to_string(), version);
         }
 
-        Ok(Some(metadata))
+        Ok(Some((version, metadata)))
+    }
+
+    /// Loads the latest metadata file for a topic from S3, populating local caches.
+    async fn load_latest_table_metadata(
+        &self,
+        topic: &str,
+    ) -> Result<Option<TableMetadata>, StorageError> {
+        Ok(self
+            .load_latest_table_metadata_with_version(topic)
+            .await?
+            .map(|(_version, metadata)| metadata))
+    }
+
+    /// Lists table names under the configured Iceberg base path.
+    pub async fn list_tables(&self) -> Result<Vec<String>, StorageError> {
+        let root_prefix = format!("{}/", self.base_path.trim_end_matches('/'));
+        let keys = self
+            .list_keys_with_prefix(&self.bucket, &root_prefix)
+            .await?;
+        let mut table_names = HashSet::new();
+
+        for key in keys {
+            if Self::parse_metadata_version_from_key(&key).is_none() {
+                continue;
+            }
+
+            let Some(suffix) = key.strip_prefix(&root_prefix) else {
+                continue;
+            };
+            let Some((table, rest)) = suffix.split_once('/') else {
+                continue;
+            };
+
+            if table.is_empty() || !rest.starts_with("metadata/") {
+                continue;
+            }
+
+            table_names.insert(table.to_string());
+        }
+
+        let mut tables: Vec<String> = table_names.into_iter().collect();
+        tables.sort();
+        Ok(tables)
+    }
+
+    /// Loads committed metadata payload and exact metadata file location for REST catalog load-table.
+    pub async fn load_table_for_catalog(
+        &self,
+        topic: &str,
+    ) -> Result<Option<IcebergCatalogTable>, StorageError> {
+        let Some((version, metadata)) = self.load_latest_table_metadata_with_version(topic).await?
+        else {
+            return Ok(None);
+        };
+
+        let metadata_location = format!(
+            "s3://{}/{}/{}/metadata/{}",
+            self.bucket,
+            self.base_path.trim_end_matches('/'),
+            topic,
+            metadata_file_name(version)
+        );
+
+        Ok(Some(IcebergCatalogTable {
+            metadata_location,
+            metadata_json: metadata.to_json()?,
+        }))
     }
 
     /// Checks if an S3 key belongs to the specified partition.
@@ -933,6 +1006,17 @@ impl ColdStorage for IcebergStorage {
             .ok()
             .flatten()
             .and_then(|m| m.to_json().ok())
+    }
+
+    async fn list_iceberg_tables(&self) -> Result<Vec<String>, StorageError> {
+        self.list_tables().await
+    }
+
+    async fn load_iceberg_table(
+        &self,
+        topic: &str,
+    ) -> Result<Option<IcebergCatalogTable>, StorageError> {
+        self.load_table_for_catalog(topic).await
     }
 
     fn clear_pending_data_files(&self, topic: &str, partition: u32) {
