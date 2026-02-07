@@ -45,6 +45,8 @@ All notable changes to Zombi are documented here.
 - **Table Name Validation** (Issue #101) — API rejects invalid table names at boundary (must match `^[a-zA-Z][a-zA-Z0-9_-]{0,127}$`)
 
 ### Changed
+- **Cumulative Manifest Lists** — Each snapshot's manifest list now carries forward all entries from the parent snapshot, making each list a complete view of the table per the Iceberg spec
+- **Iceberg-Aware Compaction** (#106) — Compaction now produces `replace` snapshots with separate delete/add manifests, carries forward unaffected manifest references, and cleans up old S3 files after commit
 - **WAL enabled by default** — `ZOMBI_ROCKSDB_WAL_ENABLED` now defaults to `true` for crash-safe durability (set `false` to opt out)
 - **Hot-only HTTP reads** — `GET /tables/{table}` now reads from RocksDB hot buffer only; cold/historical reads go through Iceberg engines
 - RocksDB event value encoding is now compact (payload + timestamp + idempotency key only).
@@ -52,6 +54,7 @@ All notable changes to Zombi are documented here.
   - Older binaries cannot read newly written values.
 
 ### Fixed
+- Compaction endpoint (`POST /tables/{table}/compact`) now functional (was returning 501)
 - Iceberg metadata files now created after flush (snapshots + version metadata)
 
 ### Planned

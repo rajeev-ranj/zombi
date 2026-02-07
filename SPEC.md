@@ -115,7 +115,8 @@ Iceberg is the read interface. An optional Iceberg catalog plugin can merge hot 
                               │                             │
                               │  commit_snapshot():         │
                               │    1. Build manifest (Avro) │
-                              │    2. Build manifest list   │
+                              │    2. Build cumulative      │
+                              │       manifest list         │
                               │    3. Write metadata.json   │
                               │    4. Upload all to S3      │
                               │    5. Register with catalog │
@@ -531,7 +532,7 @@ GET /health/ready              # Kubernetes readiness probe
 GET /stats                     # Server statistics (JSON)
 GET /metrics                   # Prometheus metrics format
 GET /tables/{table}/metadata   # Iceberg metadata location
-POST /tables/{table}/compact   # Trigger compaction (currently not wired)
+POST /tables/{table}/compact   # Trigger compaction
 POST /tables/{table}/flush     # Force flush to Iceberg (currently not wired)
 ```
 

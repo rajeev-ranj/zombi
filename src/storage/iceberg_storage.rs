@@ -781,8 +781,7 @@ impl IcebergStorage {
         let manifest_list_filename = manifest_list_file_name(snapshot_id);
         let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
         let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
-        let manifest_list_avro =
-            manifest_list_to_avro_bytes(manifest_list_entries, &metadata)?;
+        let manifest_list_avro = manifest_list_to_avro_bytes(manifest_list_entries, &metadata)?;
         self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
             .await?;
 
@@ -871,13 +870,12 @@ impl IcebergStorage {
 
             // Carry forward manifest list entries from the parent snapshot so
             // each snapshot's manifest list is a complete view of the table.
-            let mut manifest_list_entries =
-                if let Some(parent_id) = metadata.current_snapshot_id {
-                    self.load_manifest_list_entries(&metadata, parent_id)
-                        .await?
-                } else {
-                    Vec::new()
-                };
+            let mut manifest_list_entries = if let Some(parent_id) = metadata.current_snapshot_id {
+                self.load_manifest_list_entries(&metadata, parent_id)
+                    .await?
+            } else {
+                Vec::new()
+            };
 
             manifest_list_entries.push(ManifestListEntry {
                 manifest_path: manifest_s3_path,
