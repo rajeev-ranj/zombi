@@ -19,7 +19,7 @@ use crate::contracts::{
 };
 use crate::metrics::MetricsRegistry;
 use crate::proto;
-use crate::storage::WriteCombiner;
+use crate::storage::{Compactor, WriteCombiner};
 
 /// Server metrics for monitoring.
 #[derive(Default)]
@@ -134,6 +134,8 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub max_inflight_bytes: u64,
     /// Optional write combiner for batching single writes
     pub write_combiner: Option<Arc<WriteCombiner<H>>>,
+    /// Optional compactor for Iceberg-aware compaction.
+    pub compactor: Option<Arc<Compactor>>,
     /// Catalog namespace, computed once at startup from ZOMBI_CATALOG_NAMESPACE.
     pub catalog_namespace: Vec<String>,
     /// Optional flush callback for the `/flush` endpoint
@@ -159,6 +161,7 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
             write_combiner: None,
+            compactor: None,
             catalog_namespace,
             flusher: None,
         }
@@ -166,6 +169,11 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
 
     pub fn with_write_combiner(mut self, combiner: Option<Arc<WriteCombiner<H>>>) -> Self {
         self.write_combiner = combiner;
+        self
+    }
+
+    pub fn with_compactor(mut self, compactor: Option<Arc<Compactor>>) -> Self {
+        self.compactor = compactor;
         self
     }
 
@@ -377,6 +385,27 @@ impl IntoResponse for ApiError {
                 ErrorResponse {
                     error: msg,
                     code: "SERVER_OVERLOADED".into(),
+                },
+            ),
+            ApiError::Storage(StorageError::InvalidInput(msg)) => (
+                StatusCode::BAD_REQUEST,
+                ErrorResponse {
+                    error: msg,
+                    code: "INVALID_INPUT".into(),
+                },
+            ),
+            ApiError::Storage(StorageError::CompactionInProgress(topic)) => (
+                StatusCode::CONFLICT,
+                ErrorResponse {
+                    error: format!("Compaction already in progress for table '{}'", topic),
+                    code: "COMPACTION_IN_PROGRESS".into(),
+                },
+            ),
+            ApiError::Storage(StorageError::CompactionConflict(msg)) => (
+                StatusCode::CONFLICT,
+                ErrorResponse {
+                    error: msg,
+                    code: "COMPACTION_CONFLICT".into(),
                 },
             ),
             ApiError::Storage(e) => (
@@ -1192,6 +1221,16 @@ pub struct FlushResponse {
 pub struct CompactResponse {
     pub status: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_compacted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_processed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_saved: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
 }
 
 /// GET /tables/{table}/metadata
@@ -1338,18 +1377,33 @@ pub async fn flush_table<H: HotStorage, C: ColdStorage>(
 /// Triggers compaction for the table to merge small files.
 /// Note: This endpoint requires the compactor to be wired into AppState.
 pub async fn compact_table<H: HotStorage, C: ColdStorage>(
-    State(_state): State<Arc<AppState<H, C>>>,
+    State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
 ) -> Result<Json<CompactResponse>, ApiError> {
     validate_table_name(&table)?;
-    // TODO: Wire compactor into AppState to enable this endpoint
-    // For now, return 501 Not Implemented
+
+    let compactor = state.compactor.as_ref().ok_or_else(|| {
+        ApiError::BadRequest(
+            "Compaction is unavailable: Iceberg storage or compactor is not configured".into(),
+        )
+    })?;
+
+    let result = compactor.compact_topic(&table).await?;
+
+    let message = if result.files_compacted == 0 {
+        format!("No compaction candidates found for table '{}'", table)
+    } else {
+        format!("Compaction completed for table '{}'", table)
+    };
+
     Ok(Json(CompactResponse {
-        status: "not_implemented".into(),
-        message: format!(
-            "Compaction for table '{}' is not yet wired. Add compactor to AppState to enable.",
-            table
-        ),
+        status: "ok".into(),
+        message,
+        files_compacted: Some(result.files_compacted),
+        files_created: Some(result.files_created),
+        rows_processed: Some(result.rows_processed),
+        bytes_saved: Some(result.bytes_saved),
+        snapshot_id: result.snapshot_id,
     }))
 }
 

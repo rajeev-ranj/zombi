@@ -1,4 +1,4 @@
-use std::sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
 use thiserror::Error;
 
@@ -38,6 +38,15 @@ impl<'a, T> LockResultExt<RwLockWriteGuard<'a, T>>
     }
 }
 
+impl<'a, T> LockResultExt<MutexGuard<'a, T>>
+    for Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>
+{
+    #[inline]
+    fn map_lock_err(self) -> Result<MutexGuard<'a, T>, StorageError> {
+        self.map_err(|e| StorageError::LockPoisoned(e.to_string()))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("RocksDB error: {0}")]
@@ -69,6 +78,12 @@ pub enum StorageError {
 
     #[error("Server overloaded: {0}")]
     Overloaded(String),
+
+    #[error("Compaction already in progress for topic: {0}")]
+    CompactionInProgress(String),
+
+    #[error("Compaction conflict: {0}")]
+    CompactionConflict(String),
 
     #[error("Lock poisoned: {0}")]
     LockPoisoned(String),

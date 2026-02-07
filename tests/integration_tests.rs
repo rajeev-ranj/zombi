@@ -1106,7 +1106,7 @@ async fn test_flush_table_no_flusher_returns_503() {
 }
 
 #[tokio::test]
-async fn test_compact_table_not_implemented() {
+async fn test_compact_table_without_iceberg_returns_error() {
     let (app, _dir) = create_test_app();
 
     let response = app
@@ -1120,18 +1120,18 @@ async fn test_compact_table_not_implemented() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["status"], "not_implemented");
-    assert!(json["message"]
+    assert_eq!(json["code"], "BAD_REQUEST");
+    assert!(json["error"]
         .as_str()
         .unwrap_or("")
-        .contains("not yet wired"));
+        .contains("Compaction is unavailable"));
 }
 
 #[tokio::test]

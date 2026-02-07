@@ -20,7 +20,7 @@ pub use iceberg::{
     manifest_file_name, manifest_list_file_name, manifest_list_to_avro_bytes, metadata_file_name,
     DataFile, IcebergField, IcebergSchema, IcebergTableConfig, ManifestEntry, ManifestFile,
     ManifestListEntry, PartitionField, PartitionSpec, Snapshot, SnapshotLogEntry,
-    SnapshotOperation, SortField, SortOrder, TableMetadata,
+    SnapshotOperation, SnapshotSummaryCounts, SortField, SortOrder, TableMetadata,
 };
 pub use iceberg_storage::IcebergStorage;
 pub use parquet::{
