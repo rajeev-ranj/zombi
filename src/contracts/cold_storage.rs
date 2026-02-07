@@ -29,6 +29,15 @@ pub struct PendingSnapshotStats {
     pub total_bytes: u64,
 }
 
+/// Additional context captured at snapshot commit time.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotCommitContext {
+    /// Persisted flush watermark per partition at commit time.
+    pub watermarks_by_partition: HashMap<u32, u64>,
+    /// High watermark (write head) per partition at commit time.
+    pub high_watermarks_by_partition: HashMap<u32, u64>,
+}
+
 /// Cold storage for archived events (S3).
 ///
 /// Events are written in batches as log segments.
@@ -76,6 +85,7 @@ pub trait ColdStorage: Send + Sync {
     fn commit_snapshot(
         &self,
         _topic: &str,
+        _context: SnapshotCommitContext,
     ) -> impl Future<Output = Result<Option<i64>, StorageError>> + Send {
         async move { Ok(None) }
     }

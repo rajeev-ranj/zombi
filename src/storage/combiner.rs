@@ -391,5 +391,6 @@ fn clone_storage_error(err: &StorageError) -> StorageError {
         StorageError::Io(msg) => StorageError::Io(msg.clone()),
         StorageError::Overloaded(msg) => StorageError::Overloaded(msg.clone()),
         StorageError::LockPoisoned(msg) => StorageError::LockPoisoned(msg.clone()),
+        StorageError::InvariantViolation(msg) => StorageError::InvariantViolation(msg.clone()),
     }
 }
