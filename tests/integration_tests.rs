@@ -260,23 +260,6 @@ fn configured_catalog_namespace() -> String {
     std::env::var("ZOMBI_CATALOG_NAMESPACE").unwrap_or_else(|_| "zombi".into())
 }
 
-fn configured_catalog_namespace_parts() -> Vec<String> {
-    let raw = configured_catalog_namespace();
-    if raw.contains('\u{1F}') {
-        raw.split('\u{1F}')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        raw.split('.')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    }
-}
-
 #[tokio::test]
 async fn test_health_check() {
     let (app, _dir) = create_test_app();
@@ -323,16 +306,16 @@ async fn test_catalog_config_endpoint() {
     let endpoints = json["endpoints"].as_array().unwrap();
     assert!(endpoints
         .iter()
-        .any(|v| v.as_str() == Some("GET /v1/{prefix}/namespaces")));
+        .any(|v| v.as_str() == Some("GET /v1/namespaces")));
     assert!(endpoints
         .iter()
-        .any(|v| v.as_str() == Some("GET /v1/{prefix}/namespaces/{namespace}")));
+        .any(|v| v.as_str() == Some("GET /v1/namespaces/{namespace}")));
     assert!(endpoints
         .iter()
-        .any(|v| v.as_str() == Some("GET /v1/{prefix}/namespaces/{namespace}/tables/{table}")));
-    assert!(endpoints.iter().any(|v| {
-        v.as_str() == Some("HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}")
-    }));
+        .any(|v| v.as_str() == Some("GET /v1/namespaces/{namespace}/tables/{table}")));
+    assert!(endpoints
+        .iter()
+        .any(|v| v.as_str() == Some("HEAD /v1/namespaces/{namespace}/tables/{table}")));
 }
 
 #[tokio::test]
@@ -469,7 +452,6 @@ async fn test_catalog_namespace_not_found() {
 async fn test_catalog_load_namespace() {
     let (app, _dir) = create_test_app_with_catalog_storage();
     let namespace = configured_catalog_namespace();
-    let namespace_parts = configured_catalog_namespace_parts();
 
     let response = app
         .oneshot(
@@ -488,7 +470,7 @@ async fn test_catalog_load_namespace() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["namespace"], serde_json::json!(namespace_parts));
+    assert_eq!(json["namespace"], serde_json::json!(["zombi"]));
     assert!(json["properties"].is_object());
 }
 
@@ -545,6 +527,70 @@ async fn test_catalog_table_not_exists_head() {
             Request::builder()
                 .method("HEAD")
                 .uri(format!("/v1/namespaces/{}/tables/missing", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_catalog_list_tables_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/zombi/tables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["identifiers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_catalog_load_table_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/zombi/tables/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "NoSuchTableException");
+}
+
+#[tokio::test]
+async fn test_catalog_table_exists_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/v1/namespaces/zombi/tables/events")
                 .body(Body::empty())
                 .unwrap(),
         )

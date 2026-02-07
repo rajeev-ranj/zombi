@@ -540,18 +540,16 @@ impl IcebergStorage {
         let mut table_names = HashSet::new();
 
         for key in keys {
-            if Self::parse_metadata_version_from_key(&key).is_none() {
-                continue;
-            }
-
             let Some(suffix) = key.strip_prefix(&root_prefix) else {
                 continue;
             };
             let Some((table, rest)) = suffix.split_once('/') else {
                 continue;
             };
-
             if table.is_empty() || !rest.starts_with("metadata/") {
+                continue;
+            }
+            if Self::parse_metadata_version_from_key(&key).is_none() {
                 continue;
             }
 

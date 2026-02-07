@@ -526,10 +526,12 @@ GET /consumers/{group}/offset?topic=events&partition=0
 For query-engine discovery, Zombi exposes a read-only subset of the Iceberg REST Catalog API:
 
 ```http
-GET /v1/config
-GET /v1/namespaces
-GET /v1/namespaces/{namespace}/tables
-GET /v1/namespaces/{namespace}/tables/{table}
+GET  /v1/config
+GET  /v1/namespaces
+GET  /v1/namespaces/{namespace}
+GET  /v1/namespaces/{namespace}/tables
+GET  /v1/namespaces/{namespace}/tables/{table}
+HEAD /v1/namespaces/{namespace}/tables/{table}
 ```
 
 These routes are isolated from `/tables/*` ingestion/read routes and return Iceberg-compatible

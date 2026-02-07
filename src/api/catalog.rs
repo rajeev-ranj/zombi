@@ -211,11 +211,11 @@ pub async fn get_catalog_config<H: HotStorage, C: ColdStorage>(
         overrides,
         endpoints: vec![
             "GET /v1/config".into(),
-            "GET /v1/{prefix}/namespaces".into(),
-            "GET /v1/{prefix}/namespaces/{namespace}".into(),
-            "GET /v1/{prefix}/namespaces/{namespace}/tables".into(),
-            "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}".into(),
-            "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}".into(),
+            "GET /v1/namespaces".into(),
+            "GET /v1/namespaces/{namespace}".into(),
+            "GET /v1/namespaces/{namespace}/tables".into(),
+            "GET /v1/namespaces/{namespace}/tables/{table}".into(),
+            "HEAD /v1/namespaces/{namespace}/tables/{table}".into(),
         ],
         idempotency_key_lifetime: None,
     })
@@ -385,5 +385,41 @@ mod tests {
             parse_namespace_config("accounting\u{1F}tax"),
             vec!["accounting".to_string(), "tax".to_string()]
         );
+    }
+
+    #[test]
+    fn validate_exact_namespace_multi_level() {
+        let expected = vec!["accounting".into(), "tax".into()];
+        assert!(validate_exact_namespace("accounting\u{1F}tax", &expected).is_ok());
+        assert!(validate_exact_namespace("accounting", &expected).is_err());
+        assert!(validate_exact_namespace("accounting\u{1F}tax\u{1F}extra", &expected).is_err());
+        assert!(validate_exact_namespace("other", &expected).is_err());
+    }
+
+    #[test]
+    fn list_namespaces_for_parent_multi_level() {
+        let expected = vec!["accounting".into(), "tax".into()];
+
+        // No parent returns top-level
+        let result = list_namespaces_for_parent(&expected, None).unwrap();
+        assert_eq!(result, vec![vec!["accounting".to_string()]]);
+
+        // Empty parent returns top-level
+        let result = list_namespaces_for_parent(&expected, Some("")).unwrap();
+        assert_eq!(result, vec![vec!["accounting".to_string()]]);
+
+        // Parent "accounting" returns ["accounting", "tax"]
+        let result = list_namespaces_for_parent(&expected, Some("accounting")).unwrap();
+        assert_eq!(
+            result,
+            vec![vec!["accounting".to_string(), "tax".to_string()]]
+        );
+
+        // Parent is the full namespace — no children
+        let result = list_namespaces_for_parent(&expected, Some("accounting\u{1F}tax")).unwrap();
+        assert!(result.is_empty());
+
+        // Unknown parent returns error
+        assert!(list_namespaces_for_parent(&expected, Some("other")).is_err());
     }
 }
