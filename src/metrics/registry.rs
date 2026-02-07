@@ -85,6 +85,8 @@ pub struct FlushMetrics {
     pub flush_bytes_total: AtomicU64,
     /// Total watermark persistence errors
     pub watermark_persist_errors_total: AtomicU64,
+    /// Total events cleaned up (deleted from hot storage after flush)
+    pub cleanup_events_deleted_total: AtomicU64,
     /// Histogram of flush durations in microseconds
     pub flush_duration_us: Histogram,
 }
@@ -104,6 +106,13 @@ impl FlushMetrics {
     pub fn record_watermark_persist_error(&self) {
         self.watermark_persist_errors_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records events cleaned up from hot storage.
+    #[inline]
+    pub fn record_cleanup(&self, events_deleted: u64) {
+        self.cleanup_events_deleted_total
+            .fetch_add(events_deleted, Ordering::Relaxed);
     }
 
     /// Formats flush metrics in Prometheus exposition format.
@@ -158,6 +167,18 @@ impl FlushMetrics {
             output,
             "zombi_watermark_persist_errors_total {}",
             self.watermark_persist_errors_total.load(Ordering::Relaxed)
+        );
+        output.push('\n');
+
+        let _ = writeln!(
+            output,
+            "# HELP zombi_cleanup_events_deleted_total Total events deleted from hot storage after flush"
+        );
+        let _ = writeln!(output, "# TYPE zombi_cleanup_events_deleted_total counter");
+        let _ = writeln!(
+            output,
+            "zombi_cleanup_events_deleted_total {}",
+            self.cleanup_events_deleted_total.load(Ordering::Relaxed)
         );
         output.push('\n');
 
@@ -668,6 +689,17 @@ mod tests {
                 .watermark_persist_errors_total
                 .load(Ordering::Relaxed),
             2
+        );
+
+        assert_eq!(
+            metrics.cleanup_events_deleted_total.load(Ordering::Relaxed),
+            0
+        );
+        metrics.record_cleanup(50);
+        metrics.record_cleanup(30);
+        assert_eq!(
+            metrics.cleanup_events_deleted_total.load(Ordering::Relaxed),
+            80
         );
     }
 

@@ -188,6 +188,7 @@ See [tools/README.md](tools/README.md) for more options.
 | `ZOMBI_FLUSH_BATCH_SIZE` | `1000` | `10000` | Min events before flushing |
 | `ZOMBI_TARGET_FILE_SIZE_MB` | `128` | `128` | Target Parquet file size |
 | `ZOMBI_ROCKSDB_WAL_ENABLED` | `true` | `true` | Enable WAL for durability (set `false` for max throughput at risk of data loss on crash) |
+| `ZOMBI_HOT_RETENTION_SECS` | `0` | `0` | Seconds to keep flushed events in hot storage before deletion (0 = delete immediately). Best-effort during runtime; bypassed on startup/shutdown |
 | `RUST_LOG` | `zombi=info` | `zombi=info` | Log level |
 
 ## Documentation

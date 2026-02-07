@@ -44,6 +44,10 @@ pub struct FlusherConfig {
     /// Maximum concurrent S3 uploads during flush.
     /// Default: 4. Higher values can improve throughput but increase memory usage.
     pub max_concurrent_s3_uploads: usize,
+    /// Retention window in seconds for flushed events in hot storage.
+    /// After events are flushed to cold storage and the retention window elapses,
+    /// they are deleted from RocksDB. Default: 0 (delete immediately after flush).
+    pub hot_retention_secs: u64,
 }
 
 impl Default for FlusherConfig {
@@ -58,6 +62,7 @@ impl Default for FlusherConfig {
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
             snapshot_max_age: Duration::from_secs(1800),  // 30 minutes
             max_concurrent_s3_uploads: 4,
+            hot_retention_secs: 0,
         }
     }
 }
@@ -88,6 +93,7 @@ impl FlusherConfig {
             snapshot_threshold_bytes: 1024 * 1024 * 1024, // 1GB
             snapshot_max_age: Duration::from_secs(1800), // 30 minutes
             max_concurrent_s3_uploads: 4, // Pipeline S3 writes
+            hot_retention_secs: 0,
         }
     }
 }
@@ -462,6 +468,28 @@ where
             self.reconcile_committed_watermarks_on_startup().await;
         }
 
+        // Cleanup any events that were flushed but not cleaned up before the last shutdown.
+        // None = retention bypassed (no in-flight reads after restart).
+        match self.hot_storage.list_topics() {
+            Ok(topics) => {
+                for topic in topics {
+                    record_and_cleanup(
+                        self.hot_storage.as_ref(),
+                        &topic,
+                        self.config.hot_retention_secs,
+                        None,
+                        self.flush_metrics.as_ref(),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to list topics for startup cleanup"
+                );
+            }
+        }
+
         let hot_storage = Arc::clone(&self.hot_storage);
         let cold_storage = Arc::clone(&self.cold_storage);
         let watermarks = Arc::clone(&self.watermarks);
@@ -476,6 +504,7 @@ where
         let snapshot_threshold_bytes = self.config.snapshot_threshold_bytes;
         let snapshot_max_age = self.config.snapshot_max_age;
         let max_concurrent_uploads = self.config.max_concurrent_s3_uploads;
+        let hot_retention_secs = self.config.hot_retention_secs;
         let flush_metrics = Arc::clone(&self.flush_metrics);
         let iceberg_metrics = Arc::clone(&self.iceberg_metrics);
         let catalog_client = self.catalog_client.clone();
@@ -488,6 +517,11 @@ where
                 "Flusher background task started with pipelined S3 uploads"
             );
             let mut pending_snapshot_since: HashMap<String, tokio::time::Instant> = HashMap::new();
+            // Maps (topic, partition) → (persist_time, flush_wm_at_recording).
+            // flush_wm_at_recording caps cleanup so recently-flushed events aren't
+            // deleted before their own retention window.
+            let mut watermark_persist_times: HashMap<(String, u32), (Instant, u64)> =
+                HashMap::new();
 
             loop {
                 // Wait for either timeout or explicit flush request
@@ -615,6 +649,19 @@ where
                     }
                 }
 
+                // Non-Iceberg mode: watermarks persisted immediately, cleanup now
+                if !iceberg_enabled {
+                    for topic in &topics_to_check {
+                        record_and_cleanup(
+                            hot_storage.as_ref(),
+                            topic,
+                            hot_retention_secs,
+                            Some(&mut watermark_persist_times),
+                            flush_metrics.as_ref(),
+                        );
+                    }
+                }
+
                 // Check and commit snapshots for relevant topics.
                 if iceberg_enabled {
                     // Include topics with deferred watermark state so commit retries
@@ -691,6 +738,15 @@ where
                                         .await;
                                     }
                                 }
+
+                                // Record watermark persist times and cleanup
+                                record_and_cleanup(
+                                    hot_storage.as_ref(),
+                                    &topic,
+                                    hot_retention_secs,
+                                    Some(&mut watermark_persist_times),
+                                    flush_metrics.as_ref(),
+                                );
                             } else {
                                 tracing::debug!(
                                     topic = %topic,
@@ -712,6 +768,15 @@ where
                                 hot_storage.as_ref(),
                                 &topic,
                                 pending_watermark_persists.as_ref(),
+                                flush_metrics.as_ref(),
+                            );
+
+                            // Record watermark persist times and cleanup
+                            record_and_cleanup(
+                                hot_storage.as_ref(),
+                                &topic,
+                                hot_retention_secs,
+                                Some(&mut watermark_persist_times),
                                 flush_metrics.as_ref(),
                             );
                         }
@@ -817,6 +882,19 @@ where
             }
         }
 
+        // Non-Iceberg mode: watermarks are persisted immediately, cleanup now
+        if !self.config.iceberg_enabled {
+            for topic in &topics_to_commit {
+                record_and_cleanup(
+                    self.hot_storage.as_ref(),
+                    topic,
+                    self.config.hot_retention_secs,
+                    None,
+                    self.flush_metrics.as_ref(),
+                );
+            }
+        }
+
         // Force commit all pending snapshots on flush_now (typically used for shutdown)
         if self.config.iceberg_enabled {
             if let Ok(pending) = self.pending_watermark_persists.read() {
@@ -846,6 +924,15 @@ where
                         if commit_error.is_none() {
                             commit_error = Some(e);
                         }
+                    } else {
+                        // Cleanup flushed events (flush_now = shutdown, no retention)
+                        record_and_cleanup(
+                            self.hot_storage.as_ref(),
+                            &topic,
+                            self.config.hot_retention_secs,
+                            None,
+                            self.flush_metrics.as_ref(),
+                        );
                     }
                 } else {
                     // No pending files: the data was already committed in a
@@ -854,6 +941,15 @@ where
                         self.hot_storage.as_ref(),
                         &topic,
                         self.pending_watermark_persists.as_ref(),
+                        self.flush_metrics.as_ref(),
+                    );
+
+                    // Cleanup flushed events
+                    record_and_cleanup(
+                        self.hot_storage.as_ref(),
+                        &topic,
+                        self.config.hot_retention_secs,
+                        None,
                         self.flush_metrics.as_ref(),
                     );
                 }
@@ -1209,6 +1305,161 @@ fn flush_pending_watermarks<H: HotStorage>(
     }
 }
 
+/// Records current flush watermarks for retention tracking, then runs cleanup.
+///
+/// When `watermark_persist_times` is `None`, retention is bypassed (used on
+/// startup and shutdown where there are no in-flight reads).
+#[allow(clippy::type_complexity)]
+fn record_and_cleanup<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    hot_retention_secs: u64,
+    watermark_persist_times: Option<&mut HashMap<(String, u32), (Instant, u64)>>,
+    flush_metrics: &FlushMetrics,
+) {
+    match watermark_persist_times {
+        Some(times) => {
+            match hot_storage.list_partitions(topic) {
+                Ok(partitions) => {
+                    let now = Instant::now();
+                    for p in partitions {
+                        match hot_storage.load_flush_watermark(topic, p) {
+                            Ok(wm) => {
+                                if wm > 0 {
+                                    times.entry((topic.to_string(), p)).or_insert((now, wm));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    topic = %topic,
+                                    partition = p,
+                                    error = %e,
+                                    "Failed to load flush watermark for retention tracking"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        topic = %topic,
+                        error = %e,
+                        "Failed to list partitions for retention tracking"
+                    );
+                }
+            }
+            cleanup_flushed_events(hot_storage, topic, hot_retention_secs, times, flush_metrics);
+        }
+        None => {
+            let mut empty = HashMap::new();
+            cleanup_flushed_events(
+                hot_storage,
+                topic,
+                hot_retention_secs,
+                &mut empty,
+                flush_metrics,
+            );
+        }
+    }
+}
+
+/// Deletes flushed events from hot storage for all partitions of a topic.
+///
+/// For each partition, deletes events up to the flush watermark (subject to
+/// the retention window). When retention is enabled, cleanup is capped to the
+/// flush_wm recorded when the timer was set, so events flushed after that
+/// point are not deleted prematurely. Failures are non-fatal and logged.
+fn cleanup_flushed_events<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    hot_retention_secs: u64,
+    watermark_persist_times: &mut HashMap<(String, u32), (Instant, u64)>,
+    flush_metrics: &FlushMetrics,
+) {
+    let partitions = match hot_storage.list_partitions(topic) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                topic = %topic,
+                error = %e,
+                "Failed to list partitions for cleanup"
+            );
+            return;
+        }
+    };
+
+    for partition in partitions {
+        let flush_wm = match hot_storage.load_flush_watermark(topic, partition) {
+            Ok(wm) => wm,
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to load flush watermark for cleanup"
+                );
+                continue;
+            }
+        };
+
+        if flush_wm == 0 {
+            continue;
+        }
+
+        // Determine the cleanup target watermark.
+        // When retention is enabled and we have a recorded entry, use the
+        // flush_wm snapshot from recording time so recently-flushed events
+        // (with higher sequences) are not deleted before their own window.
+        // When retention=0 or no entry (restart/flush_now), use current flush_wm.
+        let key = (topic.to_string(), partition);
+        let cleanup_target = if hot_retention_secs > 0 {
+            if let Some(&(persist_time, recorded_wm)) = watermark_persist_times.get(&key) {
+                if persist_time.elapsed() < Duration::from_secs(hot_retention_secs) {
+                    continue; // Retention window not elapsed
+                }
+                recorded_wm
+            } else {
+                // No entry (e.g., after restart) — proceed with current flush_wm
+                flush_wm
+            }
+        } else {
+            flush_wm
+        };
+
+        if cleanup_target == 0 {
+            // Remove stale entry so or_insert can refresh with a non-zero
+            // flush_wm on the next cycle (partition may have been flushed since).
+            watermark_persist_times.remove(&key);
+            continue;
+        }
+
+        match hot_storage.delete_flushed_events(topic, partition, cleanup_target) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(
+                        topic = %topic,
+                        partition = partition,
+                        deleted = count,
+                        up_to = cleanup_target,
+                        "Cleaned up flushed events from hot storage"
+                    );
+                    flush_metrics.record_cleanup(count);
+                }
+                // Remove persist time so the next flush records a fresh retention window
+                watermark_persist_times.remove(&key);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic,
+                    partition = partition,
+                    error = %e,
+                    "Failed to cleanup flushed events (will retry next cycle)"
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn clear_failed_partition_state<H: HotStorage, C: ColdStorage>(
     hot_storage: &H,
@@ -1357,6 +1608,10 @@ mod tests {
         save_failures_remaining: Mutex<u32>,
         /// When > 0, high_watermark() will fail and decrement.
         high_watermark_failures: Mutex<u32>,
+        /// Tracks calls to delete_flushed_events: (topic, partition, up_to_sequence).
+        delete_calls: Mutex<Vec<(String, u32, u64)>>,
+        /// Cleanup watermarks (tracks last cleanup position per partition).
+        cleanup_watermarks: Mutex<HashMap<(String, u32), u64>>,
     }
 
     impl TestHotStorage {
@@ -1509,7 +1764,7 @@ mod tests {
                 let mut remaining = self
                     .save_failures_remaining
                     .lock()
-                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                    .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
                 if *remaining > 0 {
                     *remaining -= 1;
                     return Err(StorageError::S3("injected watermark failure".into()));
@@ -1518,7 +1773,7 @@ mod tests {
             let mut wm = self
                 .flush_watermarks
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             wm.insert((topic.to_string(), partition), watermark);
             Ok(())
         }
@@ -1527,11 +1782,39 @@ mod tests {
             let wm = self
                 .flush_watermarks
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             Ok(wm
                 .get(&(topic.to_string(), partition))
                 .copied()
                 .unwrap_or(0))
+        }
+
+        fn delete_flushed_events(
+            &self,
+            topic: &str,
+            partition: u32,
+            up_to_sequence: u64,
+        ) -> Result<u64, StorageError> {
+            let key = (topic.to_string(), partition);
+            let cleanup_wm = {
+                let wm = self
+                    .cleanup_watermarks
+                    .lock()
+                    .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
+                wm.get(&key).copied().unwrap_or(0)
+            };
+            if up_to_sequence <= cleanup_wm {
+                return Ok(0);
+            }
+            if let Ok(mut calls) = self.delete_calls.lock() {
+                calls.push((topic.to_string(), partition, up_to_sequence));
+            }
+            let mut wm = self
+                .cleanup_watermarks
+                .lock()
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
+            wm.insert(key, up_to_sequence);
+            Ok(up_to_sequence - cleanup_wm)
         }
     }
 
@@ -1558,12 +1841,12 @@ mod tests {
             let mut writes = self
                 .writes
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             let call_index = writes.len();
             let fail_on = self
                 .fail_on_call
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             if *fail_on == Some(call_index) {
                 return Err(StorageError::S3("injected failure".into()));
             }
@@ -1571,7 +1854,7 @@ mod tests {
             let mut pending = self
                 .pending_stats
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             let stats = pending.entry((topic.to_string(), partition)).or_default();
             stats.file_count += 1;
             stats.total_bytes += events.iter().map(|e| e.payload.len() as u64).sum::<u64>();
@@ -1627,7 +1910,7 @@ mod tests {
                 let mut attempts = self
                     .commit_attempts
                     .lock()
-                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                    .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
                 let call_index = *attempts;
                 *attempts += 1;
                 call_index
@@ -1635,7 +1918,7 @@ mod tests {
             let fail_on_commit = *self
                 .fail_commit_on_call
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             if fail_on_commit == Some(commit_call_index) {
                 return Err(StorageError::S3("injected commit failure".into()));
             }
@@ -1643,7 +1926,7 @@ mod tests {
             let mut pending = self
                 .pending_stats
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             let mut had_pending = false;
             for ((pending_topic, _partition), stats) in pending.iter_mut() {
                 if pending_topic == topic && stats.file_count > 0 {
@@ -1656,7 +1939,7 @@ mod tests {
                 let mut counter = self
                     .commit_counter
                     .lock()
-                    .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                    .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
                 *counter += 1;
                 return Ok(Some(*counter));
             }
@@ -1693,7 +1976,7 @@ mod tests {
             let committed = self
                 .committed_watermarks
                 .lock()
-                .map_err(|e| StorageError::S3(format!("Lock error: {}", e)))?;
+                .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
             Ok(committed.get(topic).cloned().unwrap_or_default())
         }
     }
@@ -3086,5 +3369,223 @@ mod tests {
             0,
             "Partition 1 pending files should be cleaned up based on its own stats"
         );
+    }
+
+    // ---- Retention-window tests for cleanup_flushed_events ----
+
+    /// Helper: create a TestHotStorage with a single partition and a set flush watermark.
+    fn hot_with_flush_wm(topic: &str, partition: u32, flush_wm: u64) -> TestHotStorage {
+        let mut hot = TestHotStorage::default();
+        // Insert a dummy event so list_partitions discovers this partition
+        hot.insert(
+            topic,
+            partition,
+            vec![StoredEvent {
+                sequence: 1,
+                topic: topic.to_string(),
+                partition,
+                payload: vec![],
+                timestamp_ms: 0,
+                idempotency_key: None,
+            }],
+        );
+        hot.save_flush_watermark(topic, partition, flush_wm)
+            .unwrap();
+        hot
+    }
+
+    #[test]
+    fn retention_defers_cleanup_until_window_expires() {
+        let hot = hot_with_flush_wm("t", 0, 100);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        // Record persist time just now — window has NOT elapsed
+        persist_times.insert(("t".to_string(), 0), (Instant::now(), 100));
+
+        cleanup_flushed_events(
+            &hot,
+            "t",
+            3600,
+            &mut persist_times,
+            &FlushMetrics::default(),
+        );
+
+        // Should NOT have deleted anything (window not elapsed)
+        let calls = hot.delete_calls.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "Cleanup should be deferred during retention window"
+        );
+        // Entry should still be present
+        assert!(persist_times.contains_key(&("t".to_string(), 0)));
+    }
+
+    #[test]
+    fn retention_allows_cleanup_after_window_expires() {
+        let hot = hot_with_flush_wm("t", 0, 100);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        // Record persist time in the past (window already elapsed)
+        let past = Instant::now() - Duration::from_secs(200);
+        persist_times.insert(("t".to_string(), 0), (past, 100));
+
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+
+        let calls = hot.delete_calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "Cleanup should proceed after retention window"
+        );
+        assert_eq!(calls[0], ("t".to_string(), 0, 100));
+        // Entry should be removed after successful cleanup
+        assert!(!persist_times.contains_key(&("t".to_string(), 0)));
+    }
+
+    #[test]
+    fn retention_caps_cleanup_to_recorded_wm_not_current() {
+        // Simulate: recorded_wm=50, but flush_wm has since advanced to 200
+        let hot = hot_with_flush_wm("t", 0, 200);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        let past = Instant::now() - Duration::from_secs(200);
+        persist_times.insert(("t".to_string(), 0), (past, 50));
+
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+
+        let calls = hot.delete_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // Should delete up to recorded_wm=50, NOT current flush_wm=200
+        assert_eq!(
+            calls[0],
+            ("t".to_string(), 0, 50),
+            "Cleanup must be capped to recorded watermark, not current flush watermark"
+        );
+    }
+
+    #[test]
+    fn retention_recorded_wm_zero_does_not_block_future_cleanup() {
+        // Scenario: entry was recorded when flush_wm=0 (partition hadn't been
+        // flushed yet). Later flush_wm advances to 100. The stale entry with
+        // recorded_wm=0 should be removed so cleanup can proceed.
+
+        // Phase 1: flush_wm has now advanced to 100 but the stale entry still
+        // has recorded_wm=0 (recorded before any flush happened).
+        let hot = hot_with_flush_wm("t", 0, 100);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        let past = Instant::now() - Duration::from_secs(200);
+        persist_times.insert(("t".to_string(), 0), (past, 0));
+
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+
+        // cleanup_target = recorded_wm = 0, so stale entry should be removed
+        // but no actual deletion occurs
+        let calls = hot.delete_calls.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "Should not delete when cleanup_target is 0"
+        );
+        drop(calls);
+        assert!(
+            !persist_times.contains_key(&("t".to_string(), 0)),
+            "Stale wm=0 entry should be removed to unblock future cleanup"
+        );
+
+        // Phase 2: next cycle — no entry, so cleanup uses current flush_wm=100
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+
+        let calls = hot.delete_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("t".to_string(), 0, 100),
+            "Partition should be cleanable after stale entry removal"
+        );
+    }
+
+    #[test]
+    fn retention_zero_means_immediate_cleanup() {
+        let hot = hot_with_flush_wm("t", 0, 100);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        // Even with a recent entry, retention=0 should bypass the window
+        persist_times.insert(("t".to_string(), 0), (Instant::now(), 50));
+
+        cleanup_flushed_events(&hot, "t", 0, &mut persist_times, &FlushMetrics::default());
+
+        let calls = hot.delete_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // With retention=0, uses current flush_wm directly
+        assert_eq!(calls[0], ("t".to_string(), 0, 100));
+    }
+
+    #[test]
+    fn retention_entry_removed_after_cleanup_enables_fresh_window() {
+        let hot = hot_with_flush_wm("t", 0, 100);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+        let past = Instant::now() - Duration::from_secs(200);
+        persist_times.insert(("t".to_string(), 0), (past, 100));
+
+        // First cleanup succeeds and removes the entry
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+        assert!(!persist_times.contains_key(&("t".to_string(), 0)));
+
+        // Simulate: new flush advances watermark
+        hot.save_flush_watermark("t", 0, 250).unwrap();
+
+        // Re-insert entry (as the background loop would via or_insert)
+        let now = Instant::now();
+        persist_times.insert(("t".to_string(), 0), (now, 250));
+
+        // This should NOT cleanup yet (fresh window just started)
+        cleanup_flushed_events(&hot, "t", 60, &mut persist_times, &FlushMetrics::default());
+        let calls = hot.delete_calls.lock().unwrap();
+        // Only the first cleanup call should be present
+        assert_eq!(
+            calls.len(),
+            1,
+            "Second call should be deferred (fresh window)"
+        );
+        assert_eq!(calls[0], ("t".to_string(), 0, 100));
+    }
+
+    #[test]
+    fn retention_no_double_window_for_zero_wm() {
+        // Scenario: partition exists but flush_wm is 0 (no flush yet).
+        // record_and_cleanup should NOT insert an entry into persist_times
+        // for wm=0, because that stale entry would waste a full retention
+        // window before being discarded (effectively doubling the delay).
+
+        // Phase 1: flush_wm = 0 — nothing to track
+        let hot = hot_with_flush_wm("t", 0, 0);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+
+        record_and_cleanup(
+            &hot,
+            "t",
+            60,
+            Some(&mut persist_times),
+            &FlushMetrics::default(),
+        );
+
+        assert!(
+            persist_times.is_empty(),
+            "Should not insert entry when flush_wm is 0"
+        );
+
+        // Phase 2: flush happens, flush_wm advances to 5
+        hot.save_flush_watermark("t", 0, 5).unwrap();
+
+        record_and_cleanup(
+            &hot,
+            "t",
+            60,
+            Some(&mut persist_times),
+            &FlushMetrics::default(),
+        );
+
+        // Now the entry should be recorded with wm=5
+        assert!(
+            persist_times.contains_key(&("t".to_string(), 0)),
+            "Should insert entry once flush_wm is non-zero"
+        );
+        let &(_, recorded_wm) = persist_times.get(&("t".to_string(), 0)).unwrap();
+        assert_eq!(recorded_wm, 5, "Recorded watermark should be 5, not 0");
     }
 }

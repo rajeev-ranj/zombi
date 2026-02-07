@@ -23,6 +23,8 @@ const CONSUMER_PREFIX: &str = "consumer";
 const TIMESTAMP_INDEX_PREFIX: &str = "ts";
 /// Key prefix for flush watermarks (flusher progress tracking)
 const FLUSH_WM_PREFIX: &str = "flush_wm";
+/// Key prefix for cleanup watermarks (last deleted sequence per partition)
+const CLEANUP_WM_PREFIX: &str = "cleanup_wm";
 const EVENT_VALUE_MAGIC: &[u8; 4] = b"ZEV1";
 const KB: usize = 1024;
 const MB: usize = 1024 * 1024;
@@ -923,25 +925,29 @@ impl HotStorage for RocksDbStorage {
         }
 
         // Cache miss - fall back to scan (populates cache for next time)
+        // Scan both evt: and hwm: prefixes. After cleanup deletes events,
+        // hwm: keys remain and are needed to discover partitions.
         let mut partitions = HashSet::new();
-        let prefix = format!("{}:{}:", EVENT_PREFIX, topic);
 
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        for scan_prefix in &[EVENT_PREFIX, HWM_PREFIX] {
+            let prefix = format!("{}:{}:", scan_prefix, topic);
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
-            let key_str = String::from_utf8_lossy(&key);
+            for item in iter {
+                let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+                let key_str = String::from_utf8_lossy(&key);
 
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
 
-            if let Some(rest) = key_str.strip_prefix(&prefix) {
-                if let Some(partition) = Self::parse_partition_from_key_suffix(rest) {
-                    partitions.insert(partition);
+                if let Some(rest) = key_str.strip_prefix(&prefix) {
+                    if let Some(partition) = Self::parse_partition_from_key_suffix(rest) {
+                        partitions.insert(partition);
+                    }
                 }
             }
         }
@@ -968,25 +974,29 @@ impl HotStorage for RocksDbStorage {
         }
 
         // Cache miss - fall back to scan (populates cache for next time)
+        // Scan both evt: and hwm: prefixes. After cleanup deletes events,
+        // hwm: keys remain and are needed to discover topics.
         let mut topics = HashSet::new();
-        let prefix = format!("{}:", EVENT_PREFIX);
 
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        for scan_prefix in &[EVENT_PREFIX, HWM_PREFIX] {
+            let prefix = format!("{}:", scan_prefix);
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
-            let key_str = String::from_utf8_lossy(&key);
+            for item in iter {
+                let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+                let key_str = String::from_utf8_lossy(&key);
 
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
 
-            if let Some(rest) = key_str.strip_prefix(&prefix) {
-                if let Some(topic) = Self::parse_topic_from_key_suffix(rest) {
-                    topics.insert(topic.to_string());
+                if let Some(rest) = key_str.strip_prefix(&prefix) {
+                    if let Some(topic) = Self::parse_topic_from_key_suffix(rest) {
+                        topics.insert(topic.to_string());
+                    }
                 }
             }
         }
@@ -1136,9 +1146,123 @@ impl HotStorage for RocksDbStorage {
         let key = format!("{}:{}:{}", FLUSH_WM_PREFIX, topic, partition);
         Ok(self.get_u64(&key)?.unwrap_or(0))
     }
+
+    fn delete_flushed_events(
+        &self,
+        topic: &str,
+        partition: u32,
+        up_to_sequence: u64,
+    ) -> Result<u64, StorageError> {
+        let cleanup_wm = self.load_cleanup_watermark(topic, partition)?;
+        if up_to_sequence <= cleanup_wm {
+            return Ok(0); // Idempotent: already cleaned up to this point
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut deleted_count: u64 = 0;
+
+        // 1. Delete event keys using delete_range (O(1) tombstone for contiguous keys)
+        let range_start = Self::event_key(topic, partition, cleanup_wm.saturating_add(1));
+        let range_end = Self::event_key(topic, partition, up_to_sequence.saturating_add(1));
+        batch.delete_range(range_start.as_bytes(), range_end.as_bytes());
+        deleted_count += up_to_sequence - cleanup_wm;
+
+        // 2. Delete idempotency keys: prefix-scan idem:{topic}:{partition}:*
+        let idem_prefix = format!("{}:{}:{}:", IDEM_PREFIX, topic, partition);
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            idem_prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        for item in iter {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Error scanning idempotency keys during cleanup");
+                    break;
+                }
+            };
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&idem_prefix) {
+                break;
+            }
+            // Value is the sequence number (u64 BE)
+            if value.len() == 8 {
+                if let Ok(seq) = Self::parse_u64_be(&value) {
+                    if seq <= up_to_sequence {
+                        batch.delete(&*key);
+                    }
+                }
+            }
+        }
+
+        // 3. Delete timestamp index keys if enabled
+        if self.timestamp_index_enabled {
+            let ts_prefix = format!("{}:{}:{}:", TIMESTAMP_INDEX_PREFIX, topic, partition);
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                ts_prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
+            for item in iter {
+                let (key, _) = match item {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Error scanning timestamp index during cleanup");
+                        break;
+                    }
+                };
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with(&ts_prefix) {
+                    break;
+                }
+                if let Some(seq) = Self::parse_timestamp_index_key(&key_str) {
+                    if seq <= up_to_sequence {
+                        batch.delete(&*key);
+                    }
+                }
+            }
+        }
+
+        // 4. Update cleanup watermark in the same batch (atomic)
+        self.save_cleanup_watermark(topic, partition, up_to_sequence, &mut batch);
+
+        // 5. Write batch atomically with durable options
+        self.db
+            .write_opt(batch, &self.write_options_durable())
+            .map_err(|e| StorageError::RocksDb(e.to_string()))?;
+
+        // 6. Invalidate bloom filter for this partition (conservative: forces rebuild)
+        self.bloom_invalidate(topic, partition);
+
+        Ok(deleted_count)
+    }
 }
 
 impl RocksDbStorage {
+    /// Saves the cleanup watermark for a topic/partition.
+    fn save_cleanup_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        watermark: u64,
+        batch: &mut WriteBatch,
+    ) {
+        let key = format!("{}:{}:{}", CLEANUP_WM_PREFIX, topic, partition);
+        batch.put(key.as_bytes(), watermark.to_be_bytes());
+    }
+
+    /// Loads the cleanup watermark for a topic/partition.
+    /// Returns 0 if no watermark has been persisted.
+    fn load_cleanup_watermark(&self, topic: &str, partition: u32) -> Result<u64, StorageError> {
+        let key = format!("{}:{}:{}", CLEANUP_WM_PREFIX, topic, partition);
+        Ok(self.get_u64(&key)?.unwrap_or(0))
+    }
+
+    /// Invalidates the Bloom filter for a (topic, partition).
+    /// Conservative: absent filter means all lookups fall through to RocksDB until rebuilt.
+    fn bloom_invalidate(&self, topic: &str, partition: u32) {
+        self.bloom_filters.remove(&(topic.to_string(), partition));
+    }
+
     /// Fallback for read_by_timestamp when index is not enabled.
     fn read_by_timestamp_fallback(
         &self,
@@ -1841,6 +1965,225 @@ mod tests {
                 let storage = RocksDbStorage::open(dir.path()).unwrap();
                 assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 55);
                 assert_eq!(storage.load_flush_watermark("events", 1).unwrap(), 77);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Delete Flushed Events Tests (Issue #103)
+    // =========================================================================
+
+    mod delete_flushed_events_tests {
+        use super::*;
+
+        #[test]
+        fn delete_flushed_events_removes_event_keys() {
+            let (storage, _dir) = create_test_storage();
+
+            // Write 10 events
+            for i in 0..10 {
+                storage
+                    .write(
+                        "events",
+                        0,
+                        format!("payload-{}", i).as_bytes(),
+                        1000 + i,
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(storage.read("events", 0, 1, 100).unwrap().len(), 10);
+
+            // Delete first 5
+            let deleted = storage.delete_flushed_events("events", 0, 5).unwrap();
+            assert_eq!(deleted, 5);
+
+            // Events 1-5 should be gone, 6-10 should remain
+            let remaining = storage.read("events", 0, 1, 100).unwrap();
+            assert_eq!(remaining.len(), 5);
+            assert_eq!(remaining[0].sequence, 6);
+            assert_eq!(remaining[4].sequence, 10);
+        }
+
+        #[test]
+        fn delete_flushed_events_is_idempotent() {
+            let (storage, _dir) = create_test_storage();
+
+            for i in 0..10 {
+                storage
+                    .write("events", 0, format!("payload-{}", i).as_bytes(), 0, None)
+                    .unwrap();
+            }
+
+            // First call deletes 5
+            let deleted1 = storage.delete_flushed_events("events", 0, 5).unwrap();
+            assert_eq!(deleted1, 5);
+
+            // Second call with same watermark returns 0
+            let deleted2 = storage.delete_flushed_events("events", 0, 5).unwrap();
+            assert_eq!(deleted2, 0);
+
+            // Events 6-10 should still be there
+            let remaining = storage.read("events", 0, 1, 100).unwrap();
+            assert_eq!(remaining.len(), 5);
+        }
+
+        #[test]
+        fn delete_flushed_events_removes_idempotency_keys() {
+            let (storage, _dir) = create_test_storage();
+
+            // Write with idempotency keys
+            storage
+                .write("events", 0, b"data-1", 0, Some("key-1"))
+                .unwrap();
+            storage
+                .write("events", 0, b"data-2", 0, Some("key-2"))
+                .unwrap();
+            storage
+                .write("events", 0, b"data-3", 0, Some("key-3"))
+                .unwrap();
+
+            // Verify idempotency keys exist
+            assert!(storage
+                .get_idempotency_offset("events", 0, "key-1")
+                .unwrap()
+                .is_some());
+            assert!(storage
+                .get_idempotency_offset("events", 0, "key-2")
+                .unwrap()
+                .is_some());
+
+            // Delete first 2 events
+            storage.delete_flushed_events("events", 0, 2).unwrap();
+
+            // Idempotency keys for deleted events should be gone
+            assert!(storage
+                .get_idempotency_offset("events", 0, "key-1")
+                .unwrap()
+                .is_none());
+            assert!(storage
+                .get_idempotency_offset("events", 0, "key-2")
+                .unwrap()
+                .is_none());
+
+            // key-3 (sequence 3) should still exist
+            assert!(storage
+                .get_idempotency_offset("events", 0, "key-3")
+                .unwrap()
+                .is_some());
+        }
+
+        #[test]
+        fn delete_flushed_events_preserves_hwm_and_flush_wm() {
+            let (storage, _dir) = create_test_storage();
+
+            for _ in 0..10 {
+                storage.write("events", 0, b"data", 0, None).unwrap();
+            }
+
+            // Set flush watermark
+            storage.save_flush_watermark("events", 0, 10).unwrap();
+
+            // Delete events
+            storage.delete_flushed_events("events", 0, 10).unwrap();
+
+            // hwm should still be 10
+            assert_eq!(storage.high_watermark("events", 0).unwrap(), 10);
+
+            // flush_wm should still be 10
+            assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 10);
+
+            // New writes should continue from seq 11
+            let new_seq = storage.write("events", 0, b"new", 0, None).unwrap();
+            assert_eq!(new_seq, 11);
+        }
+
+        #[test]
+        fn delete_flushed_events_partition_isolation() {
+            let (storage, _dir) = create_test_storage();
+
+            // Write to partition 0 and partition 1
+            for _ in 0..5 {
+                storage.write("events", 0, b"p0", 0, None).unwrap();
+                storage.write("events", 1, b"p1", 0, None).unwrap();
+            }
+
+            // Delete partition 0 events
+            storage.delete_flushed_events("events", 0, 5).unwrap();
+
+            // Partition 0 should be empty
+            let p0_events = storage.read("events", 0, 1, 100).unwrap();
+            assert!(p0_events.is_empty());
+
+            // Partition 1 should be unaffected
+            let p1_events = storage.read("events", 1, 1, 100).unwrap();
+            assert_eq!(p1_events.len(), 5);
+        }
+
+        #[test]
+        fn delete_flushed_events_removes_timestamp_index() {
+            let dir = TempDir::new().unwrap();
+            let storage = RocksDbStorage::open_with_timestamp_index(dir.path(), true).unwrap();
+
+            // Write events with timestamps
+            storage.write("events", 0, b"a", 1000, None).unwrap();
+            storage.write("events", 0, b"b", 2000, None).unwrap();
+            storage.write("events", 0, b"c", 3000, None).unwrap();
+
+            // Verify timestamp index works before delete
+            let events = storage
+                .read_by_timestamp("events", 0, Some(500), Some(1500), 10)
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].payload, b"a");
+
+            // Delete first 2 events
+            storage.delete_flushed_events("events", 0, 2).unwrap();
+
+            // Timestamp index for deleted events should return empty
+            let events = storage
+                .read_by_timestamp("events", 0, Some(500), Some(2500), 10)
+                .unwrap();
+            assert!(events.is_empty());
+
+            // Event 3 should still be findable via timestamp index
+            let events = storage
+                .read_by_timestamp("events", 0, Some(2500), Some(3500), 10)
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].payload, b"c");
+        }
+
+        #[test]
+        fn cleanup_watermark_persists_across_reopen() {
+            let dir = TempDir::new().unwrap();
+            {
+                let storage = RocksDbStorage::open(dir.path()).unwrap();
+                for _ in 0..10 {
+                    storage.write("events", 0, b"data", 0, None).unwrap();
+                }
+                storage.delete_flushed_events("events", 0, 5).unwrap();
+
+                // Verify cleanup watermark is persisted
+                assert_eq!(storage.load_cleanup_watermark("events", 0).unwrap(), 5);
+            }
+            {
+                let storage = RocksDbStorage::open(dir.path()).unwrap();
+                // Cleanup watermark should survive reopen
+                assert_eq!(storage.load_cleanup_watermark("events", 0).unwrap(), 5);
+
+                // Calling delete with same or lower sequence should be idempotent
+                let deleted = storage.delete_flushed_events("events", 0, 5).unwrap();
+                assert_eq!(deleted, 0);
+
+                // Can continue deleting more
+                let deleted = storage.delete_flushed_events("events", 0, 8).unwrap();
+                assert_eq!(deleted, 3);
+
+                // Only events 9, 10 should remain
+                let remaining = storage.read("events", 0, 1, 100).unwrap();
+                assert_eq!(remaining.len(), 2);
+                assert_eq!(remaining[0].sequence, 9);
             }
         }
     }

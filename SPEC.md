@@ -271,8 +271,11 @@ See API section for full parameter reference.
 - `ZOMBI_ROCKSDB_WAL_ENABLED` controls WAL usage for event writes and consumer offset commits.
 - WAL is enabled by default for durability. Disabling WAL (`ZOMBI_ROCKSDB_WAL_ENABLED=false`) is a
   performance mode with potential data loss on crash.
-- **(Planned — P0)** Flush watermarks will be persisted in RocksDB per (topic, partition) to prevent duplicate Iceberg writes on restart.
-- **(Planned — P0)** Hot data will be deleted after successful Iceberg commit, with an optional retention window for in-flight reads.
+- Flush watermarks are persisted in RocksDB per (topic, partition) to prevent duplicate Iceberg writes on restart.
+- Hot data is deleted after successful Iceberg commit (or direct flush in non-Iceberg mode), with an optional retention window
+  (`ZOMBI_HOT_RETENTION_SECS`, default 0) for in-flight reads. Cleanup is idempotent and retried on next cycle if it fails.
+  Note: the retention window is best-effort during normal runtime only; on startup and shutdown, retention
+  is bypassed since there are no in-flight reads.
 - RocksDB tuning env vars (defaults in parentheses): `ZOMBI_ROCKSDB_WRITE_BUFFER_MB` (64),
   `ZOMBI_ROCKSDB_MAX_WRITE_BUFFERS` (3), `ZOMBI_ROCKSDB_L0_COMPACTION_TRIGGER` (4),
   `ZOMBI_ROCKSDB_TARGET_FILE_SIZE_MB` (64), `ZOMBI_ROCKSDB_BLOCK_CACHE_MB` (128),

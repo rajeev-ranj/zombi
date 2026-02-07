@@ -156,6 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(base_config.max_concurrent_s3_uploads),
+            hot_retention_secs: std::env::var("ZOMBI_HOT_RETENTION_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(base_config.hot_retention_secs),
         };
 
         if iceberg_enabled {
@@ -168,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 snapshot_threshold_gb = config.snapshot_threshold_bytes / (1024 * 1024 * 1024),
                 snapshot_max_age_secs = config.snapshot_max_age.as_secs(),
                 max_concurrent_s3_uploads = config.max_concurrent_s3_uploads,
+                hot_retention_secs = config.hot_retention_secs,
                 "Iceberg mode enabled - using optimized flush settings with pipelined S3 uploads"
             );
         }

@@ -940,7 +940,7 @@ async fn mixed_hot_cold_recovery() {
         // Drop storages - simulates crash before second batch is flushed
     }
 
-    // Phase 2: Verify cold storage has first batch, hot storage has all events
+    // Phase 2: Verify cold storage has first batch, hot storage has only unflushed events
     {
         let hot_storage = create_storage_at(hot_dir.path());
         let cold_storage = FileColdStorage::new(cold_dir.path());
@@ -965,24 +965,24 @@ async fn mixed_hot_cold_recovery() {
             flushed_count
         );
 
-        // Hot storage should have ALL events (including unflushed)
+        // Hot storage should have only unflushed events (flushed events cleaned up)
         let hot_events = hot_storage
             .read("test-topic", 0, 0, 1000)
             .expect("hot read should succeed");
         assert_eq!(
             hot_events.len(),
-            total_count,
-            "Hot storage should have all {} events",
-            total_count
+            unflushed_count,
+            "Hot storage should have {} unflushed events (flushed events cleaned up)",
+            unflushed_count
         );
 
-        // Verify continuity - all events present and in order
+        // Verify unflushed events are correct and in order
         for (i, event) in hot_events.iter().enumerate() {
-            let expected = format!("event-{}", i);
+            let expected = format!("event-{}", flushed_count + i);
             assert_eq!(
                 String::from_utf8_lossy(&event.payload),
                 expected,
-                "Event {} should be correct after mixed recovery",
+                "Unflushed event {} should be correct after mixed recovery",
                 i
             );
         }
@@ -1159,5 +1159,156 @@ fn multi_partition_crash_recovery() {
                 partition, events_per_partition
             );
         }
+    }
+}
+
+// =============================================================================
+// CP-6: Crash After Flush Watermark But Before Cleanup (Issue #103)
+// =============================================================================
+
+/// Test that events are cleaned up on recovery when a crash occurs after
+/// watermark persistence but before event deletion.
+///
+/// Scenario:
+/// 1. Write 50 events
+/// 2. Persist flush watermark to 50 (simulates successful flush + watermark persist)
+/// 3. Do NOT call delete_flushed_events (simulates crash before cleanup)
+/// 4. Verify crash state: flush_wm=50, events still present, cleanup_wm=0
+/// 5. Create new flusher on same storage — startup cleanup detects flush_wm > cleanup_wm
+/// 6. Verify: events cleaned up, hwm=50 preserved, new writes continue from seq 51
+#[tokio::test]
+async fn cp6_crash_after_watermark_before_cleanup() {
+    let hot_dir = TempDir::new().unwrap();
+    let cold_dir = TempDir::new().unwrap();
+    let events_count = 50;
+
+    // Phase 1: Write events, simulate flush + watermark persist, crash before cleanup
+    {
+        let storage = create_storage_at(hot_dir.path());
+
+        for i in 0..events_count {
+            storage
+                .write(
+                    "test-topic",
+                    0,
+                    format!("event-{}", i).as_bytes(),
+                    i as i64 * 1000,
+                    None,
+                )
+                .expect("write should succeed");
+        }
+
+        // Simulate successful flush + watermark persistence
+        storage
+            .save_flush_watermark("test-topic", 0, events_count as u64)
+            .expect("save flush watermark should succeed");
+
+        // DO NOT call delete_flushed_events — simulates crash before cleanup
+
+        // Verify crash state
+        assert_eq!(
+            storage.load_flush_watermark("test-topic", 0).unwrap(),
+            events_count as u64,
+            "flush_wm should be {}",
+            events_count
+        );
+        let events = storage.read("test-topic", 0, 1, 1000).unwrap();
+        assert_eq!(
+            events.len(),
+            events_count,
+            "Events should still be present (cleanup didn't run)"
+        );
+
+        // Drop without cleanup — simulates crash
+    }
+
+    // Phase 2: Recovery — create new flusher which runs startup cleanup
+    {
+        let hot_storage = Arc::new(create_storage_at(hot_dir.path()));
+        let cold_storage = Arc::new(FileColdStorage::new(cold_dir.path()));
+
+        let config = FlusherConfig::default();
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot_storage),
+            Arc::clone(&cold_storage),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        // Start runs startup cleanup (reconcile + cleanup_flushed_events)
+        flusher.start().await.expect("start should succeed");
+
+        // Events should be cleaned up
+        let events = hot_storage.read("test-topic", 0, 1, 1000).unwrap();
+        assert!(
+            events.is_empty(),
+            "Events should be cleaned up after recovery, but found {}",
+            events.len()
+        );
+
+        // hwm should be preserved
+        assert_eq!(
+            hot_storage.high_watermark("test-topic", 0).unwrap(),
+            events_count as u64,
+            "High watermark should be preserved after cleanup"
+        );
+
+        // New writes should continue from seq 51
+        let new_seq = hot_storage
+            .write("test-topic", 0, b"new-event", 0, None)
+            .expect("write should succeed");
+        assert_eq!(
+            new_seq,
+            events_count as u64 + 1,
+            "New writes should continue from the correct sequence"
+        );
+
+        flusher.stop().await.expect("stop should succeed");
+    }
+}
+
+/// Storage-layer unit test for direct delete_flushed_events after reopen.
+#[test]
+fn cp6_storage_layer_cleanup_after_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: Write events, save flush watermark, crash
+    {
+        let storage = create_storage_at(dir.path());
+        for i in 0..50 {
+            storage
+                .write("events", 0, format!("event-{}", i).as_bytes(), 0, None)
+                .expect("write should succeed");
+        }
+        storage.save_flush_watermark("events", 0, 50).unwrap();
+        // Crash before cleanup
+    }
+
+    // Phase 2: Reopen and manually call delete_flushed_events
+    {
+        let storage = create_storage_at(dir.path());
+
+        // Verify state after crash
+        assert_eq!(storage.load_flush_watermark("events", 0).unwrap(), 50);
+        assert_eq!(storage.read("events", 0, 1, 1000).unwrap().len(), 50);
+
+        // Run cleanup
+        let deleted = storage
+            .delete_flushed_events("events", 0, 50)
+            .expect("delete should succeed");
+        assert_eq!(deleted, 50);
+
+        // Events should be gone
+        assert!(storage.read("events", 0, 1, 1000).unwrap().is_empty());
+
+        // hwm should be preserved
+        assert_eq!(storage.high_watermark("events", 0).unwrap(), 50);
+
+        // New writes continue
+        let new_seq = storage
+            .write("events", 0, b"new", 0, None)
+            .expect("write should succeed");
+        assert_eq!(new_seq, 51);
     }
 }
