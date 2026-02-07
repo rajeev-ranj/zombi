@@ -98,7 +98,11 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
     get:
       summary: Read records (hot buffer; use Iceberg for analytics)
-      description: Reads from the RocksDB hot buffer only. For production analytics, query Iceberg tables directly via Spark/Trino/DuckDB.
+      description: >
+        Reads from the RocksDB hot buffer only. For production analytics, query
+        Iceberg tables directly via Spark/Trino/DuckDB. Supports content
+        negotiation via Accept header: application/json (default) or
+        application/vnd.apache.arrow.stream (Arrow IPC).
       parameters:
         - $ref: "#/components/parameters/TableParam"
         - name: since
@@ -114,6 +118,12 @@ paths:
           schema:
             type: integer
             default: 100
+        - name: fields
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of columns to project (e.g. "payload,timestamp_ms")
       responses:
         "200":
           description: OK
@@ -121,6 +131,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadRecordsResponse"
+            application/vnd.apache.arrow.stream:
+              schema:
+                type: string
+                format: binary
+        "406":
+          description: Not Acceptable (unsupported Accept header)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /tables/{table}/bulk:
     post:
       summary: Bulk write records
@@ -200,15 +220,40 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TableMetadataResponse"
-  /tables/{table}/flush:
-    post:
-      summary: Force flush to cold storage
-      description: Currently returns status "not_implemented" until the flusher is wired.
+  /tables/{table}/watermark:
+    get:
+      summary: Get partition watermarks
+      description: >
+        Returns the flush watermark (last sequence flushed to cold storage) and
+        high watermark (current write head) for each partition of the table.
+        Returns 200 with empty partitions for unknown tables (lazy creation model).
       parameters:
         - $ref: "#/components/parameters/TableParam"
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WatermarkResponse"
+  /tables/{table}/flush:
+    post:
+      summary: Force flush to cold storage
+      description: >
+        Triggers an immediate flush of pending events to cold storage.
+        Note: The current implementation performs a global flush across all topics;
+        table-scoped flush is planned for v0.4.
+      parameters:
+        - $ref: "#/components/parameters/TableParam"
+      responses:
+        "200":
+          description: Flush completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlushResponse"
+        "503":
+          description: Flusher not configured (no cold storage)
           content:
             application/json:
               schema:
@@ -380,6 +425,26 @@ components:
         base_path:
           type: string
           nullable: true
+    WatermarkResponse:
+      type: object
+      properties:
+        topic:
+          type: string
+        partitions:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/PartitionWatermark"
+    PartitionWatermark:
+      type: object
+      properties:
+        watermark:
+          type: integer
+          format: int64
+          description: Last sequence number flushed to cold storage
+        high_watermark:
+          type: integer
+          format: int64
+          description: Highest sequence number written to hot storage
     FlushResponse:
       type: object
       properties:
@@ -387,6 +452,12 @@ components:
           type: string
         message:
           type: string
+        events_flushed:
+          type: integer
+          nullable: true
+        segments_written:
+          type: integer
+          nullable: true
     CompactResponse:
       type: object
       properties:
