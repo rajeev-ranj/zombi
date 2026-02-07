@@ -20,6 +20,15 @@ pub struct ColdStorageInfo {
     pub base_path: String,
 }
 
+/// Committed Iceberg table details used by the REST catalog API.
+#[derive(Debug, Clone)]
+pub struct IcebergCatalogTable {
+    /// Full metadata file location (e.g. s3://bucket/path/table/metadata/v3.metadata.json).
+    pub metadata_location: String,
+    /// Iceberg table metadata JSON payload.
+    pub metadata_json: String,
+}
+
 /// Statistics about pending files for a topic, awaiting snapshot commit.
 #[derive(Debug, Clone, Default)]
 pub struct PendingSnapshotStats {
@@ -112,6 +121,30 @@ pub trait ColdStorage: Send + Sync {
     /// Only Iceberg backends return Some; S3 backends return None.
     fn table_metadata_json(&self, _topic: &str) -> Option<String> {
         None
+    }
+
+    /// Lists committed table names visible to the local Iceberg catalog.
+    fn list_iceberg_tables(
+        &self,
+    ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send {
+        async move { Ok(Vec::new()) }
+    }
+
+    /// Loads committed Iceberg table metadata for catalog responses.
+    fn load_iceberg_table(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<Option<IcebergCatalogTable>, StorageError>> + Send {
+        async move { Ok(None) }
+    }
+
+    /// Checks whether an Iceberg table exists without loading its full metadata.
+    /// Efficient backends override this to avoid downloading full metadata JSON.
+    fn iceberg_table_exists(
+        &self,
+        _topic: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        async move { Ok(false) }
     }
 
     /// Clears pending (uncommitted) data files for a topic/partition.

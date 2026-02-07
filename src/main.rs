@@ -248,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    let catalog_namespace = zombi::api::compute_catalog_namespace();
     let state = Arc::new(
         AppState::new(
             storage,
@@ -255,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::new(Metrics::new()),
             Arc::clone(&metrics_registry),
             backpressure_config,
+            catalog_namespace,
         )
         .with_write_combiner(write_combiner)
         .with_compactor(compactor),

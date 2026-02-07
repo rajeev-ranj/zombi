@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use apache_avro::types::{Record, Value as AvroValue};
 use apache_avro::{Schema as AvroSchema, Writer as AvroWriter};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 use crate::contracts::{StorageError, TableSchemaConfig};
@@ -430,6 +430,29 @@ pub struct SnapshotSummaryCounts {
     pub total_rows: i64,
 }
 
+/// Serializes `Option<i64>` as `-1` for `None` (Iceberg v2 convention).
+fn serialize_snapshot_id<S: Serializer>(
+    value: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(id) => serializer.serialize_i64(*id),
+        None => serializer.serialize_i64(-1),
+    }
+}
+
+/// Deserializes `Option<i64>` treating negative values as `None` (Iceberg v2 convention).
+fn deserialize_snapshot_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    let v = i64::deserialize(deserializer)?;
+    if v < 0 {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
+}
+
 /// Iceberg table metadata (v2 format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {
@@ -456,7 +479,8 @@ pub struct TableMetadata {
     pub properties: HashMap<String, String>,
     #[serde(
         rename = "current-snapshot-id",
-        skip_serializing_if = "Option::is_none"
+        serialize_with = "serialize_snapshot_id",
+        deserialize_with = "deserialize_snapshot_id"
     )]
     pub current_snapshot_id: Option<i64>,
     #[serde(default)]
@@ -1318,6 +1342,33 @@ mod tests {
 
         assert_eq!(parsed.table_uuid, metadata.table_uuid);
         assert_eq!(parsed.location, metadata.location);
+    }
+
+    #[test]
+    fn test_current_snapshot_id_serializes_as_minus_one_when_none() {
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+        assert!(metadata.current_snapshot_id.is_none());
+
+        let json = metadata.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["current-snapshot-id"], -1);
+
+        // Round-trip: -1 deserializes back to None
+        let round_tripped = TableMetadata::from_json(&json).unwrap();
+        assert!(round_tripped.current_snapshot_id.is_none());
+    }
+
+    #[test]
+    fn test_current_snapshot_id_serializes_positive_value() {
+        let mut metadata = TableMetadata::new("s3://bucket/tables/events");
+        metadata.current_snapshot_id = Some(42);
+
+        let json = metadata.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["current-snapshot-id"], 42);
+
+        let round_tripped = TableMetadata::from_json(&json).unwrap();
+        assert_eq!(round_tripped.current_snapshot_id, Some(42));
     }
 
     #[test]

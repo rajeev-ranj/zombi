@@ -1,3 +1,4 @@
+mod catalog;
 mod handlers;
 
 use std::future::Future;
@@ -8,6 +9,7 @@ use axum::Router;
 
 use crate::contracts::{ColdStorage, HotStorage};
 
+pub use catalog::compute_catalog_namespace;
 pub use handlers::{
     AppState, BackpressureConfig, Metrics, NoopColdStorage, WriteRecordRequest, WriteRecordResponse,
 };
@@ -17,6 +19,21 @@ pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(
     state: Arc<AppState<H, C>>,
 ) -> Router {
     Router::new()
+        // Iceberg REST Catalog API (read-only)
+        .route("/v1/config", get(catalog::get_catalog_config::<H, C>))
+        .route("/v1/namespaces", get(catalog::list_namespaces::<H, C>))
+        .route(
+            "/v1/namespaces/:namespace",
+            get(catalog::load_namespace::<H, C>),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables",
+            get(catalog::list_tables::<H, C>),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables/:table",
+            get(catalog::load_table::<H, C>).head(catalog::table_exists::<H, C>),
+        )
         .route("/health", get(handlers::health_check))
         .route("/health/live", get(handlers::health_live))
         .route("/health/ready", get(handlers::health_ready::<H, C>))
