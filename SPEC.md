@@ -496,7 +496,7 @@ Response 200:
 | Accept Header | Format | Status |
 |---------------|--------|--------|
 | `application/json` (default) | JSON object with `records`, `count`, `has_more` | Implemented |
-| `application/vnd.apache.arrow.stream` | Arrow IPC stream bytes | Planned (P1) |
+| `application/vnd.apache.arrow.stream` | Arrow IPC stream bytes | Implemented |
 
 The Arrow IPC format is designed for the ZombiCatalog plugin, which presents hot buffer data
 as Iceberg-compatible "virtual files" to query engines.
@@ -515,11 +515,6 @@ POST /consumers/{group}/commit
 GET /consumers/{group}/offset?topic=events&partition=0
 {"offset": 2000}
 ```
-
-### Planned Endpoints (Not Yet Implemented)
-
-- **Arrow IPC response format** — `Accept: application/vnd.apache.arrow.stream` on `GET /tables/{table}` for plugin reads
-- **Watermark boundary** — per-partition committed flush watermark
 
 ### Iceberg REST Catalog API (Read-Only)
 

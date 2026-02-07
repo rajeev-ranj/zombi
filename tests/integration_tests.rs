@@ -2738,6 +2738,7 @@ fn create_test_app_with_failing_flusher() -> (axum::Router, tempfile::TempDir) {
             Arc::new(Metrics::new()),
             Arc::new(MetricsRegistry::new()),
             BackpressureConfig::default(),
+            vec!["zombi".into()],
         )
         .with_flusher(Some(failing_flusher)),
     );
