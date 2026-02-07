@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::contracts::{
     ColdStorage, FlushResult, Flusher, HotStorage, LockResultExt, PendingSnapshotStats,
-    StorageError, StoredEvent,
+    SnapshotCommitContext, StorageError, StoredEvent,
 };
 use crate::metrics::{FlushMetrics, IcebergMetrics};
 use crate::storage::{derive_partition_columns, CatalogClient};
@@ -1088,7 +1088,26 @@ async fn commit_snapshot_for_topic<H: HotStorage, C: ColdStorage>(
     no_snapshot_log: &'static str,
     error_log: &'static str,
 ) -> Result<Option<i64>, StorageError> {
-    let snapshot_id = match cold_storage.commit_snapshot(topic).await {
+    let context = match snapshot_commit_context_for_topic(
+        hot_storage,
+        topic,
+        stats.file_count,
+        pending_watermark_persists,
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            flush_metrics.record_watermark_persist_error();
+            tracing::error!(
+                topic = %topic,
+                pending_files = stats.file_count,
+                error = %e,
+                "Failed to build snapshot commit context"
+            );
+            return Err(e);
+        }
+    };
+
+    let snapshot_id = match cold_storage.commit_snapshot(topic, context).await {
         Ok(snapshot_id) => snapshot_id,
         Err(e) => {
             iceberg_metrics.record_s3_error();
@@ -1125,6 +1144,41 @@ async fn commit_snapshot_for_topic<H: HotStorage, C: ColdStorage>(
     );
 
     Ok(snapshot_id)
+}
+
+fn snapshot_commit_context_for_topic<H: HotStorage>(
+    hot_storage: &H,
+    topic: &str,
+    pending_files: usize,
+    pending_watermark_persists: &RwLock<DeferredWatermarks>,
+) -> Result<SnapshotCommitContext, StorageError> {
+    let watermarks_by_partition = {
+        let pending = pending_watermark_persists.read().map_lock_err()?;
+        pending.get(topic).cloned().ok_or_else(|| {
+            StorageError::InvalidInput(format!(
+                "missing deferred flush watermark state for topic '{}' with {} pending files",
+                topic, pending_files
+            ))
+        })?
+    };
+
+    if watermarks_by_partition.is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "empty deferred flush watermark state for topic '{}' with {} pending files",
+            topic, pending_files
+        )));
+    }
+
+    let mut high_watermarks_by_partition = HashMap::new();
+    for &partition in watermarks_by_partition.keys() {
+        let high_watermark = hot_storage.high_watermark(topic, partition)?;
+        high_watermarks_by_partition.insert(partition, high_watermark);
+    }
+
+    Ok(SnapshotCommitContext {
+        watermarks_by_partition,
+        high_watermarks_by_partition,
+    })
 }
 
 async fn update_catalog_registration<C: ColdStorage>(
@@ -1826,6 +1880,7 @@ mod tests {
         /// If set, the Nth commit_snapshot call (0-indexed) will fail.
         fail_commit_on_call: Mutex<Option<usize>>,
         commit_attempts: Mutex<usize>,
+        commit_contexts: Mutex<Vec<(String, SnapshotCommitContext)>>,
         pending_stats: Mutex<HashMap<(String, u32), PendingSnapshotStats>>,
         commit_counter: Mutex<i64>,
         committed_watermarks: Mutex<HashMap<String, HashMap<u32, u64>>>,
@@ -1905,7 +1960,19 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        async fn commit_snapshot(&self, topic: &str) -> Result<Option<i64>, StorageError> {
+        async fn commit_snapshot(
+            &self,
+            topic: &str,
+            context: SnapshotCommitContext,
+        ) -> Result<Option<i64>, StorageError> {
+            {
+                let mut contexts = self
+                    .commit_contexts
+                    .lock()
+                    .map_err(|e| StorageError::LockPoisoned(format!("{}", e)))?;
+                contexts.push((topic.to_string(), context));
+            }
+
             let commit_call_index = {
                 let mut attempts = self
                     .commit_attempts
@@ -3152,6 +3219,98 @@ mod tests {
             "Watermark should persist after age-triggered commit"
         );
         assert_eq!(cold.pending_snapshot_stats("events").file_count, 0);
+
+        flusher.stop().await.unwrap();
+    }
+
+    /// flush_now commits a snapshot and the commit context contains the
+    /// correct flush watermarks and high watermarks for each partition.
+    #[tokio::test]
+    async fn flush_now_passes_watermark_context_to_commit() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+        hot.insert("events", 1, vec![make_event(1, TS_HOUR_0_MID)]);
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            FlusherConfig {
+                iceberg_enabled: true,
+                ..Default::default()
+            },
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.flush_now().await.unwrap();
+
+        let contexts = cold.commit_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1, "Expected exactly one commit");
+
+        let (topic, ctx) = &contexts[0];
+        assert_eq!(topic, "events");
+
+        // Flush watermarks should match what was flushed (1 event per partition).
+        assert_eq!(ctx.watermarks_by_partition.get(&0), Some(&1));
+        assert_eq!(ctx.watermarks_by_partition.get(&1), Some(&1));
+
+        // High watermarks should match the write head in hot storage.
+        assert_eq!(ctx.high_watermarks_by_partition.get(&0), Some(&1));
+        assert_eq!(ctx.high_watermarks_by_partition.get(&1), Some(&1));
+    }
+
+    /// Age-triggered snapshot commit propagates watermark context.
+    #[tokio::test(start_paused = true)]
+    async fn age_triggered_commit_includes_watermark_context() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+
+        let hot = Arc::new(hot);
+        let cold = Arc::new(TestColdStorage::default());
+        let config = FlusherConfig {
+            iceberg_enabled: true,
+            interval: Duration::from_millis(10),
+            snapshot_threshold_files: 100,
+            snapshot_threshold_bytes: usize::MAX,
+            snapshot_max_age: Duration::from_millis(35),
+            ..Default::default()
+        };
+        let flusher = BackgroundFlusher::new(
+            Arc::clone(&hot),
+            Arc::clone(&cold),
+            config,
+            Arc::new(FlushMetrics::default()),
+            Arc::new(IcebergMetrics::default()),
+        );
+
+        flusher.start().await.unwrap();
+
+        // Wait for flush + age-triggered commit.
+        for _ in 0..15 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if hot.load_flush_watermark("events", 0).unwrap() == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            hot.load_flush_watermark("events", 0).unwrap(),
+            1,
+            "Age-triggered commit should persist watermark"
+        );
+
+        let contexts = cold.commit_contexts.lock().unwrap();
+        assert!(
+            !contexts.is_empty(),
+            "At least one commit should have been made"
+        );
+
+        let (topic, ctx) = &contexts[0];
+        assert_eq!(topic, "events");
+        assert_eq!(ctx.watermarks_by_partition.get(&0), Some(&1));
+        assert_eq!(ctx.high_watermarks_by_partition.get(&0), Some(&1));
 
         flusher.stop().await.unwrap();
     }

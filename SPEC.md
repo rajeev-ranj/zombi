@@ -218,7 +218,7 @@ All integer values are stored big-endian for correct lexicographic ordering in R
 4. Background flusher splits batches by (event_date, event_hour) and target file size
 5. Writes Parquet files to S3
 6. Commits Iceberg metadata (atomic)
-7. Persists flush watermark (and records boundary in snapshot summary — planned)
+7. Persists flush watermark and records boundary in snapshot summary (`zombi.watermark.{partition}`, `zombi.high_watermark.{partition}`)
 8. Deletes hot data up to watermark (configurable retention window)
 9. Optional: Register/update with external REST catalog
 ```
@@ -674,6 +674,7 @@ and **not** required for v1 of the ingestion-gateway identity.
 | `ZOMBI_COMPACTED_FILE_SIZE_MB` | `512` | Target file size after compaction |
 | `ZOMBI_SNAPSHOT_THRESHOLD_FILES` | `10` | Min files before snapshot commit |
 | `ZOMBI_SNAPSHOT_THRESHOLD_GB` | `1` | Min GB before snapshot commit |
+| `ZOMBI_SNAPSHOT_MAX_AGE_SECS` | `1800` | Max seconds before forcing snapshot commit (ensures low-throughput tables commit). Per-table overrides not yet supported |
 | `ZOMBI_MAX_CONCURRENT_S3_UPLOADS` | `4` | Max concurrent S3 uploads |
 | `ZOMBI_FLUSH_INTERVAL_SECS` | `300` | Flush interval (Iceberg mode) |
 | `ZOMBI_FLUSH_MAX_SEGMENT` | `10000` | Max events per flush segment |
