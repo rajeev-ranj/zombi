@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use tracing;
+
 use crate::api::handlers::{validate_table_name, AppState};
 use crate::contracts::{ColdStorage, HotStorage};
 
@@ -271,10 +273,10 @@ pub async fn list_tables<H: HotStorage, C: ColdStorage>(
         }));
     }
 
-    let mut table_names = cold
-        .list_iceberg_tables()
-        .await
-        .map_err(|e| internal_error(format!("Failed to list Iceberg tables: {}", e)))?;
+    let mut table_names = cold.list_iceberg_tables().await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to list Iceberg tables");
+        internal_error("Failed to list tables")
+    })?;
 
     table_names.retain(|name| validate_table_name(name).is_ok());
     table_names.dedup();
@@ -312,16 +314,18 @@ pub async fn load_table<H: HotStorage, C: ColdStorage>(
         return Err(no_such_table(&namespace, &table));
     }
 
-    let loaded = cold
-        .load_iceberg_table(&table)
-        .await
-        .map_err(|e| internal_error(format!("Failed to load table metadata: {}", e)))?;
+    let loaded = cold.load_iceberg_table(&table).await.map_err(|e| {
+        tracing::error!(error = %e, table = %table, "Failed to load table metadata");
+        internal_error("Failed to load table metadata")
+    })?;
     let Some(loaded) = loaded else {
         return Err(no_such_table(&namespace, &table));
     };
 
-    let metadata: serde_json::Value = serde_json::from_str(&loaded.metadata_json)
-        .map_err(|e| internal_error(format!("Invalid table metadata JSON: {}", e)))?;
+    let metadata: serde_json::Value = serde_json::from_str(&loaded.metadata_json).map_err(|e| {
+        tracing::error!(error = %e, table = %table, "Invalid table metadata JSON");
+        internal_error("Invalid table metadata")
+    })?;
 
     Ok(Json(LoadTableResponse {
         metadata_location: loaded.metadata_location,
@@ -349,10 +353,10 @@ pub async fn table_exists<H: HotStorage, C: ColdStorage>(
         return Err(no_such_table(&namespace, &table));
     }
 
-    let exists = cold
-        .iceberg_table_exists(&table)
-        .await
-        .map_err(|e| internal_error(format!("Failed to check table existence: {}", e)))?;
+    let exists = cold.iceberg_table_exists(&table).await.map_err(|e| {
+        tracing::error!(error = %e, table = %table, "Failed to check table existence");
+        internal_error("Failed to check table existence")
+    })?;
 
     if exists {
         Ok(StatusCode::NO_CONTENT)

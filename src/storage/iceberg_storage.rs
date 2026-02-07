@@ -25,6 +25,9 @@ use crate::storage::{
 
 type PendingDataFiles = HashMap<(String, u32), Vec<(DataFile, ParquetFileMetadata)>>;
 
+/// Maximum S3 object size we will download into memory (10 MB).
+const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
 pub struct IcebergStorage {
     client: Client,
@@ -498,7 +501,7 @@ impl IcebergStorage {
         Ok(false)
     }
 
-    /// Downloads an S3 object as bytes.
+    /// Downloads an S3 object as bytes, rejecting objects larger than [`MAX_DOWNLOAD_BYTES`].
     async fn download_object_bytes(
         &self,
         bucket: &str,
@@ -510,6 +513,17 @@ impl IcebergStorage {
             retry_config = self.retry_config,
             context = format!("GET s3://{}/{}", bucket, key),
         )?;
+        if let Some(len) = response
+            .content_length()
+            .and_then(|l| u64::try_from(l).ok())
+        {
+            if len > MAX_DOWNLOAD_BYTES {
+                return Err(StorageError::S3(format!(
+                    "Object too large ({} bytes, max {}): s3://{}/{}",
+                    len, MAX_DOWNLOAD_BYTES, bucket, key
+                )));
+            }
+        }
         let bytes = response
             .body
             .collect()
