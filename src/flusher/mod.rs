@@ -3301,16 +3301,18 @@ mod tests {
             "Age-triggered commit should persist watermark"
         );
 
-        let contexts = cold.commit_contexts.lock().unwrap();
-        assert!(
-            !contexts.is_empty(),
-            "At least one commit should have been made"
-        );
+        {
+            let contexts = cold.commit_contexts.lock().unwrap();
+            assert!(
+                !contexts.is_empty(),
+                "At least one commit should have been made"
+            );
 
-        let (topic, ctx) = &contexts[0];
-        assert_eq!(topic, "events");
-        assert_eq!(ctx.watermarks_by_partition.get(&0), Some(&1));
-        assert_eq!(ctx.high_watermarks_by_partition.get(&0), Some(&1));
+            let (topic, ctx) = &contexts[0];
+            assert_eq!(topic, "events");
+            assert_eq!(ctx.watermarks_by_partition.get(&0), Some(&1));
+            assert_eq!(ctx.high_watermarks_by_partition.get(&0), Some(&1));
+        }
 
         flusher.stop().await.unwrap();
     }
