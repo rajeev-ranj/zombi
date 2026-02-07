@@ -10,8 +10,8 @@ use zombi::contracts::{Flusher, TableSchemaConfig};
 use zombi::flusher::{BackgroundFlusher, FlusherConfig};
 use zombi::metrics::MetricsRegistry;
 use zombi::storage::{
-    CatalogClient, CatalogConfig, ColdStorageBackend, IcebergStorage, RetryConfig, RocksDbStorage,
-    S3Storage, WriteCombiner, WriteCombinerConfig,
+    CatalogClient, CatalogConfig, ColdStorageBackend, CompactionConfig, Compactor, IcebergStorage,
+    RetryConfig, RocksDbStorage, S3Storage, WriteCombiner, WriteCombinerConfig,
 };
 
 #[tokio::main]
@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    let mut compactor: Option<Arc<Compactor>> = None;
 
     let cold_storage = if let Some(bucket) = s3_bucket {
         let endpoint = std::env::var("ZOMBI_S3_ENDPOINT").ok();
@@ -78,6 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 iceberg.set_schema_configs(schema_configs);
             }
+
+            let iceberg = Arc::new(iceberg);
+            compactor = Some(Arc::new(Compactor::new(
+                Arc::clone(&iceberg),
+                CompactionConfig::from_env(),
+            )));
 
             ColdStorageBackend::iceberg(iceberg)
         } else {
@@ -249,7 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&metrics_registry),
             backpressure_config,
         )
-        .with_write_combiner(write_combiner),
+        .with_write_combiner(write_combiner)
+        .with_compactor(compactor),
     );
 
     // Start server

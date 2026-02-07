@@ -419,6 +419,17 @@ impl SnapshotOperation {
     }
 }
 
+/// Snapshot summary counts used for Iceberg metadata summaries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SnapshotSummaryCounts {
+    pub added_files: usize,
+    pub added_rows: i64,
+    pub deleted_files: usize,
+    pub deleted_rows: i64,
+    pub total_files: usize,
+    pub total_rows: i64,
+}
+
 /// Iceberg table metadata (v2 format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {
@@ -526,21 +537,50 @@ impl TableMetadata {
     /// Adds a new snapshot to the table.
     pub fn add_snapshot(
         &mut self,
+        snapshot_id: i64,
         manifest_list_path: &str,
-        added_files: usize,
-        added_rows: i64,
         operation: SnapshotOperation,
+        counts: SnapshotSummaryCounts,
     ) -> i64 {
-        let snapshot_id = generate_snapshot_id();
+        self.add_snapshot_with_counts(snapshot_id, manifest_list_path, operation, counts)
+    }
+
+    /// Adds a replace snapshot used by compaction.
+    pub fn add_compaction_snapshot(
+        &mut self,
+        snapshot_id: i64,
+        manifest_list_path: &str,
+        counts: SnapshotSummaryCounts,
+    ) -> i64 {
+        self.add_snapshot_with_counts(
+            snapshot_id,
+            manifest_list_path,
+            SnapshotOperation::Replace,
+            counts,
+        )
+    }
+
+    fn add_snapshot_with_counts(
+        &mut self,
+        snapshot_id: i64,
+        manifest_list_path: &str,
+        operation: SnapshotOperation,
+        counts: SnapshotSummaryCounts,
+    ) -> i64 {
         let now = current_timestamp_ms();
 
         let mut summary = HashMap::new();
         summary.insert("operation".into(), operation.as_str().into());
         summary.insert("added-files-size".into(), "0".into());
-        summary.insert("added-data-files".into(), added_files.to_string());
-        summary.insert("added-records".into(), added_rows.to_string());
-        summary.insert("total-records".into(), added_rows.to_string());
-        summary.insert("total-data-files".into(), added_files.to_string());
+        summary.insert("added-data-files".into(), counts.added_files.to_string());
+        summary.insert("added-records".into(), counts.added_rows.to_string());
+        summary.insert(
+            "deleted-data-files".into(),
+            counts.deleted_files.to_string(),
+        );
+        summary.insert("deleted-records".into(), counts.deleted_rows.to_string());
+        summary.insert("total-records".into(), counts.total_rows.to_string());
+        summary.insert("total-data-files".into(), counts.total_files.to_string());
 
         let snapshot = Snapshot {
             snapshot_id,
@@ -697,6 +737,22 @@ impl ManifestFile {
     pub fn add_data_file(&mut self, data_file: DataFile) {
         self.entries.push(ManifestEntry {
             status: 1, // Added
+            snapshot_id: self.snapshot_id,
+            data_file,
+        });
+    }
+
+    pub fn add_existing_data_file(&mut self, data_file: DataFile) {
+        self.entries.push(ManifestEntry {
+            status: 0, // Existing
+            snapshot_id: self.snapshot_id,
+            data_file,
+        });
+    }
+
+    pub fn add_deleted_data_file(&mut self, data_file: DataFile) {
+        self.entries.push(ManifestEntry {
+            status: 2, // Deleted
             snapshot_id: self.snapshot_id,
             data_file,
         });
@@ -1109,19 +1165,116 @@ mod tests {
     #[test]
     fn test_add_snapshot() {
         let mut metadata = TableMetadata::new("s3://bucket/tables/events");
+        let snapshot_id = 42;
 
-        let snapshot_id = metadata.add_snapshot(
+        let created = metadata.add_snapshot(
+            snapshot_id,
             "s3://bucket/tables/events/metadata/snap-123.avro",
-            1,
-            100,
             SnapshotOperation::Append,
+            SnapshotSummaryCounts {
+                added_files: 1,
+                added_rows: 100,
+                deleted_files: 0,
+                deleted_rows: 0,
+                total_files: 1,
+                total_rows: 100,
+            },
         );
 
-        assert!(snapshot_id > 0);
+        assert_eq!(created, snapshot_id);
         assert_eq!(metadata.current_snapshot_id, Some(snapshot_id));
         assert_eq!(metadata.snapshots.len(), 1);
         assert_eq!(metadata.snapshot_log.len(), 1);
         assert_eq!(metadata.last_sequence_number, 1);
+        let summary = &metadata.snapshots[0].summary;
+        assert_eq!(summary.get("operation"), Some(&"append".to_string()));
+        assert_eq!(summary.get("deleted-data-files"), Some(&"0".to_string()));
+    }
+
+    #[test]
+    fn test_compaction_snapshot_has_replace_operation() {
+        let mut metadata = TableMetadata::new("s3://bucket/tables/events");
+        let snapshot_id = 99;
+
+        let created = metadata.add_compaction_snapshot(
+            snapshot_id,
+            "s3://bucket/tables/events/metadata/snap-99.avro",
+            SnapshotSummaryCounts {
+                added_files: 2,
+                added_rows: 200,
+                deleted_files: 5,
+                deleted_rows: 500,
+                total_files: 12,
+                total_rows: 1200,
+            },
+        );
+
+        assert_eq!(created, snapshot_id);
+        let summary = &metadata.snapshots[0].summary;
+        assert_eq!(summary.get("operation"), Some(&"replace".to_string()));
+        assert_eq!(summary.get("added-data-files"), Some(&"2".to_string()));
+        assert_eq!(summary.get("deleted-data-files"), Some(&"5".to_string()));
+        assert_eq!(summary.get("total-data-files"), Some(&"12".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_with_deleted_and_added_entries() {
+        use apache_avro::types::Value as AvroValue;
+        use apache_avro::Reader as AvroReader;
+
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+        let parquet_meta = crate::storage::ParquetFileMetadata {
+            path: "tables/events/data/event_date=2024-01-01/event_hour=0/partition=0/f.parquet"
+                .into(),
+            row_count: 1,
+            min_sequence: 1,
+            max_sequence: 1,
+            min_timestamp_ms: 1,
+            max_timestamp_ms: 1,
+            file_size_bytes: 10,
+            partition_values: crate::storage::PartitionValues::default(),
+            column_stats: crate::storage::ColumnStatistics {
+                sequence_min: 1,
+                sequence_max: 1,
+                partition_min: 0,
+                partition_max: 0,
+                timestamp_min: 1,
+                timestamp_max: 1,
+                event_date_min: 0,
+                event_date_max: 0,
+                event_hour_min: 0,
+                event_hour_max: 0,
+            },
+        };
+        let data_file = DataFile::from_parquet_metadata(
+            &parquet_meta,
+            "s3://bucket/tables/events/data/event_date=2024-01-01/event_hour=0/partition=0/f.parquet",
+        );
+        let mut manifest = ManifestFile::new(7, 1);
+        manifest.add_existing_data_file(data_file.clone());
+        manifest.add_data_file(data_file.clone());
+        manifest.add_deleted_data_file(data_file);
+
+        let bytes = manifest.to_avro_bytes(&metadata).unwrap();
+        let reader = AvroReader::new(bytes.as_slice()).unwrap();
+        let mut statuses = Vec::new();
+
+        for value in reader {
+            let value = value.unwrap();
+            if let AvroValue::Record(fields) = value {
+                let status = fields
+                    .iter()
+                    .find(|(name, _)| name == "status")
+                    .and_then(|(_, v)| match v {
+                        AvroValue::Int(i) => Some(*i),
+                        _ => None,
+                    })
+                    .unwrap();
+                statuses.push(status);
+            }
+        }
+
+        assert_eq!(statuses, vec![0, 1, 2]);
     }
 
     #[test]

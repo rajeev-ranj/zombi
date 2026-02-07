@@ -1,5 +1,7 @@
 //! Unified cold storage backend that supports both S3 and Iceberg modes.
 
+use std::sync::Arc;
+
 use crate::contracts::{
     ColdStorage, ColdStorageInfo, ColumnProjection, PendingSnapshotStats, SegmentInfo,
     StorageError, StoredEvent,
@@ -11,7 +13,7 @@ pub enum ColdStorageBackend {
     /// Plain S3 storage (JSON segments)
     S3(S3Storage),
     /// Iceberg-compatible storage (Parquet + metadata)
-    Iceberg(IcebergStorage),
+    Iceberg(Arc<IcebergStorage>),
 }
 
 impl ColdStorageBackend {
@@ -21,7 +23,7 @@ impl ColdStorageBackend {
     }
 
     /// Creates an Iceberg backend.
-    pub fn iceberg(storage: IcebergStorage) -> Self {
+    pub fn iceberg(storage: Arc<IcebergStorage>) -> Self {
         Self::Iceberg(storage)
     }
 
@@ -197,7 +199,7 @@ mod tests {
             .insert_pending_data_files_for_test("events", 1, 1)
             .unwrap();
 
-        let backend = ColdStorageBackend::iceberg(storage);
+        let backend = ColdStorageBackend::iceberg(Arc::new(storage));
         assert_eq!(backend.pending_snapshot_stats("events").file_count, 2);
         assert_eq!(
             backend

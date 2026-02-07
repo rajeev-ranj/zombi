@@ -67,6 +67,12 @@ pub enum StorageError {
     #[error("Server overloaded: {0}")]
     Overloaded(String),
 
+    #[error("Compaction already in progress for topic: {0}")]
+    CompactionInProgress(String),
+
+    #[error("Compaction conflict: {0}")]
+    CompactionConflict(String),
+
     #[error("Lock poisoned: {0}")]
     LockPoisoned(String),
 }

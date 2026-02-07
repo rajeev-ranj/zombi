@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use apache_avro::types::Value as AvroValue;
 use apache_avro::Reader as AvroReader;
@@ -19,11 +19,24 @@ use crate::storage::retry::RetryConfig;
 use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_file_name,
     manifest_list_file_name, manifest_list_to_avro_bytes, metadata_file_name,
-    write_parquet_to_bytes_sorted, DataFile, ManifestFile, ManifestListEntry, ParquetFileMetadata,
-    SnapshotOperation, TableMetadata,
+    write_parquet_to_bytes_sorted, DataFile, ManifestEntry, ManifestFile, ManifestListEntry,
+    ParquetFileMetadata, SnapshotOperation, TableMetadata,
 };
 
 type PendingDataFiles = HashMap<(String, u32), Vec<(DataFile, ParquetFileMetadata)>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveDataFile {
+    pub data_file: DataFile,
+    pub s3_key: String,
+    pub partition_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveSnapshotFiles {
+    pub snapshot_id: i64,
+    pub files: Vec<ActiveDataFile>,
+}
 
 /// Iceberg-compatible cold storage that writes Parquet files with metadata.
 pub struct IcebergStorage {
@@ -36,6 +49,8 @@ pub struct IcebergStorage {
     metadata_versions: RwLock<HashMap<String, i64>>,
     /// Accumulated data files per (topic, partition) for manifest generation.
     pending_data_files: RwLock<PendingDataFiles>,
+    /// Per-topic mutexes to serialize metadata commits (flush vs compaction).
+    commit_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Retry configuration for S3 operations
     retry_config: RetryConfig,
     /// Schema configs for structured column extraction, keyed by table/topic name.
@@ -68,6 +83,7 @@ impl IcebergStorage {
             table_metadata: RwLock::new(HashMap::new()),
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
+            commit_locks: RwLock::new(HashMap::new()),
             retry_config,
             schema_configs: HashMap::new(),
         })
@@ -114,6 +130,7 @@ impl IcebergStorage {
             table_metadata: RwLock::new(HashMap::new()),
             metadata_versions: RwLock::new(HashMap::new()),
             pending_data_files: RwLock::new(HashMap::new()),
+            commit_locks: RwLock::new(HashMap::new()),
             retry_config,
             schema_configs: HashMap::new(),
         })
@@ -135,6 +152,19 @@ impl IcebergStorage {
     /// Returns the base path.
     pub fn base_path(&self) -> &str {
         &self.base_path
+    }
+
+    /// Returns the underlying S3 client.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Returns whether this topic uses structured extraction schema.
+    pub fn is_structured_schema_enabled(&self, topic: &str) -> bool {
+        self.schema_configs
+            .get(topic)
+            .map(|c| c.payload_format == PayloadFormat::Json && !c.fields.is_empty())
+            .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -305,6 +335,22 @@ impl IcebergStorage {
         Some(i32::from_be_bytes(arr))
     }
 
+    /// Returns (or creates) the per-topic commit mutex.
+    fn commit_mutex_for_topic(
+        &self,
+        topic: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, StorageError> {
+        if let Some(lock) = self.commit_locks.read().map_lock_err()?.get(topic).cloned() {
+            return Ok(lock);
+        }
+
+        let mut locks = self.commit_locks.write().map_lock_err()?;
+        Ok(locks
+            .entry(topic.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
+    }
+
     /// Extracts data-manifest paths from a manifest-list Avro file.
     fn extract_manifest_paths_from_manifest_list_avro(
         bytes: &[u8],
@@ -332,6 +378,47 @@ impl IcebergStorage {
         }
 
         Ok(manifest_paths)
+    }
+
+    /// Extracts full `ManifestListEntry` structs from a manifest-list Avro file.
+    fn extract_manifest_list_entries_from_avro(
+        bytes: &[u8],
+    ) -> Result<Vec<ManifestListEntry>, StorageError> {
+        let reader =
+            AvroReader::new(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut entries = Vec::new();
+
+        for value in reader {
+            let value = value.map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let entry: ManifestListEntry = apache_avro::from_value(&value)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    /// Downloads and extracts manifest list entries for a given snapshot.
+    async fn load_manifest_list_entries(
+        &self,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+    ) -> Result<Vec<ManifestListEntry>, StorageError> {
+        let manifest_list_uri = metadata
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == snapshot_id)
+            .map(|s| s.manifest_list.clone())
+            .ok_or_else(|| {
+                StorageError::CompactionConflict(format!(
+                    "Snapshot {} not found in metadata",
+                    snapshot_id
+                ))
+            })?;
+
+        let (bucket, key) = Self::parse_s3_uri(&manifest_list_uri)?;
+        let bytes = self.download_object_bytes(&bucket, &key).await?;
+        Self::extract_manifest_list_entries_from_avro(&bytes)
     }
 
     /// Extracts max committed sequence watermark per partition from one manifest file.
@@ -403,6 +490,123 @@ impl IcebergStorage {
         }
 
         Ok(per_partition)
+    }
+
+    /// Extracts full manifest entries from one manifest Avro file.
+    fn extract_manifest_entries_from_manifest_avro(
+        bytes: &[u8],
+    ) -> Result<Vec<ManifestEntry>, StorageError> {
+        let reader =
+            AvroReader::new(bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut entries = Vec::new();
+
+        for value in reader {
+            let value = value.map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let entry: ManifestEntry = apache_avro::from_value(&value)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    fn partition_path_from_key(key: &str) -> Result<String, StorageError> {
+        key.rsplit_once('/')
+            .map(|(dir, _)| dir.to_string())
+            .ok_or_else(|| StorageError::InvalidInput(format!("Invalid data file key: {}", key)))
+    }
+
+    /// Builds active data files for a specific snapshot from manifest metadata.
+    async fn active_data_files_from_metadata(
+        &self,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+    ) -> Result<Vec<ActiveDataFile>, StorageError> {
+        let manifest_list_uri = metadata
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id == snapshot_id)
+            .map(|snapshot| snapshot.manifest_list.clone())
+            .ok_or_else(|| {
+                StorageError::CompactionConflict(format!(
+                    "Snapshot {} not found in metadata",
+                    snapshot_id
+                ))
+            })?;
+
+        let (manifest_list_bucket, manifest_list_key) = Self::parse_s3_uri(&manifest_list_uri)?;
+        let manifest_list_bytes = self
+            .download_object_bytes(&manifest_list_bucket, &manifest_list_key)
+            .await?;
+        let manifest_paths =
+            Self::extract_manifest_paths_from_manifest_list_avro(&manifest_list_bytes)?;
+
+        let mut seen_manifest_paths = HashSet::new();
+        let mut active_by_path: HashMap<String, DataFile> = HashMap::new();
+
+        for manifest_uri in manifest_paths {
+            if !seen_manifest_paths.insert(manifest_uri.clone()) {
+                continue;
+            }
+
+            let (bucket, key) = Self::parse_s3_uri(&manifest_uri)?;
+            let manifest_bytes = self.download_object_bytes(&bucket, &key).await?;
+            let entries = Self::extract_manifest_entries_from_manifest_avro(&manifest_bytes)?;
+
+            for entry in entries {
+                let path = entry.data_file.file_path.clone();
+                match entry.status {
+                    2 => {
+                        active_by_path.remove(&path);
+                    }
+                    0 | 1 => {
+                        active_by_path.insert(path, entry.data_file);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut files = Vec::with_capacity(active_by_path.len());
+        for data_file in active_by_path.into_values() {
+            let (bucket, key) = Self::parse_s3_uri(&data_file.file_path)?;
+            if bucket != self.bucket {
+                return Err(StorageError::InvalidInput(format!(
+                    "Data file bucket mismatch: expected {}, got {}",
+                    self.bucket, bucket
+                )));
+            }
+            let partition_path = Self::partition_path_from_key(&key)?;
+            files.push(ActiveDataFile {
+                data_file,
+                s3_key: key,
+                partition_path,
+            });
+        }
+
+        files.sort_by(|a, b| a.s3_key.cmp(&b.s3_key));
+        Ok(files)
+    }
+
+    /// Loads active data files referenced by the current snapshot for a topic.
+    pub(crate) async fn active_data_files(
+        &self,
+        topic: &str,
+    ) -> Result<Option<ActiveSnapshotFiles>, StorageError> {
+        let metadata = match self.load_latest_table_metadata(topic).await? {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+
+        let snapshot_id = match metadata.current_snapshot_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let files = self
+            .active_data_files_from_metadata(&metadata, snapshot_id)
+            .await?;
+        Ok(Some(ActiveSnapshotFiles { snapshot_id, files }))
     }
 
     /// Lists all keys for a prefix with pagination.
@@ -580,8 +784,14 @@ impl IcebergStorage {
             .flat_map(|(_key, files)| files.iter().cloned())
             .collect();
 
+        let commit_mutex = self.commit_mutex_for_topic(topic)?;
+        let _commit_guard = commit_mutex.lock().await;
+
         let commit_result: Result<(i64, usize, i64), StorageError> = async {
-            let mut metadata = self.get_or_create_metadata(topic)?;
+            let mut metadata = match self.load_latest_table_metadata(topic).await? {
+                Some(metadata) => metadata,
+                None => self.get_or_create_metadata(topic)?,
+            };
 
             // Calculate totals
             let total_files = pending.len();
@@ -604,8 +814,28 @@ impl IcebergStorage {
             self.upload_bytes(&manifest_key, manifest_avro_bytes, "application/avro")
                 .await?;
 
-            // Build manifest list entry pointing to the real manifest
-            let manifest_list_entries = vec![ManifestListEntry {
+            // Carry forward manifest list entries from the parent snapshot so
+            // each snapshot's manifest list is a complete view of the table.
+            let mut inherited_entries = if let Some(parent_id) = metadata.current_snapshot_id {
+                self.load_manifest_list_entries(&metadata, parent_id)
+                    .await?
+            } else {
+                Vec::new()
+            };
+
+            let inherited_total_files: i64 = inherited_entries
+                .iter()
+                .map(|e| {
+                    (e.added_files_count + e.existing_files_count - e.deleted_files_count) as i64
+                })
+                .sum();
+            let inherited_total_rows: i64 = inherited_entries
+                .iter()
+                .map(|e| e.added_rows_count + e.existing_rows_count - e.deleted_rows_count)
+                .sum();
+
+            // Build manifest list: inherited entries first, then the new manifest entry.
+            let new_entry = ManifestListEntry {
                 manifest_path: manifest_s3_path,
                 manifest_length,
                 partition_spec_id: 0,
@@ -619,23 +849,33 @@ impl IcebergStorage {
                 added_rows_count: total_rows,
                 existing_rows_count: 0,
                 deleted_rows_count: 0,
-            }];
+            };
+            inherited_entries.push(new_entry);
 
             // Serialize manifest list to Avro and upload
             let manifest_list_filename = manifest_list_file_name(snapshot_id);
             let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
             let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
-            let manifest_list_avro =
-                manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
+            let manifest_list_avro = manifest_list_to_avro_bytes(&inherited_entries, &metadata)?;
             self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
                 .await?;
 
+            let cumulative_total_files = inherited_total_files.max(0) as usize + total_files;
+            let cumulative_total_rows = inherited_total_rows.max(0) + total_rows;
+
             // Add snapshot to metadata
             metadata.add_snapshot(
+                snapshot_id,
                 &manifest_list_s3_path,
-                total_files,
-                total_rows,
                 SnapshotOperation::Append,
+                crate::storage::SnapshotSummaryCounts {
+                    added_files: total_files,
+                    added_rows: total_rows,
+                    deleted_files: 0,
+                    deleted_rows: 0,
+                    total_files: cumulative_total_files,
+                    total_rows: cumulative_total_rows,
+                },
             );
 
             // Write new metadata file
@@ -692,6 +932,189 @@ impl IcebergStorage {
                 Err(error)
             }
         }
+    }
+
+    /// Commits an Iceberg replace snapshot for compaction by atomically
+    /// removing old files and adding compacted files.
+    pub async fn commit_compaction_snapshot(
+        &self,
+        topic: &str,
+        expected_base_snapshot_id: i64,
+        deleted_file_paths: Vec<String>,
+        added_files: Vec<(DataFile, ParquetFileMetadata)>,
+    ) -> Result<i64, StorageError> {
+        if deleted_file_paths.is_empty() || added_files.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "Compaction snapshot requires both deleted and added files".into(),
+            ));
+        }
+
+        let commit_mutex = self.commit_mutex_for_topic(topic)?;
+        let _commit_guard = commit_mutex.lock().await;
+
+        let mut metadata = self
+            .load_latest_table_metadata(topic)
+            .await?
+            .ok_or_else(|| StorageError::TopicNotFound(topic.to_string()))?;
+
+        let current_snapshot_id = metadata.current_snapshot_id.ok_or_else(|| {
+            StorageError::CompactionConflict(format!("Table '{}' has no committed snapshot", topic))
+        })?;
+
+        if current_snapshot_id != expected_base_snapshot_id {
+            return Err(StorageError::CompactionConflict(format!(
+                "Stale compaction base snapshot: expected {}, current {}",
+                expected_base_snapshot_id, current_snapshot_id
+            )));
+        }
+
+        let active_files = self
+            .active_data_files_from_metadata(&metadata, current_snapshot_id)
+            .await?;
+
+        let deleted_set: HashSet<String> = deleted_file_paths.into_iter().collect();
+        let active_paths: HashSet<String> = active_files
+            .iter()
+            .map(|f| f.data_file.file_path.clone())
+            .collect();
+
+        if !deleted_set.is_subset(&active_paths) {
+            return Err(StorageError::CompactionConflict(
+                "Compaction delete set contains non-active files".into(),
+            ));
+        }
+
+        let snapshot_id = crate::storage::generate_snapshot_id();
+        let next_seq = metadata.last_sequence_number + 1;
+
+        // Count deleted files/rows from the active file set.
+        let mut deleted_files_count = 0usize;
+        let mut deleted_rows_count = 0i64;
+        for active in &active_files {
+            if deleted_set.contains(&active.data_file.file_path) {
+                deleted_files_count += 1;
+                deleted_rows_count += active.data_file.record_count;
+            }
+        }
+
+        // Build delete manifest (status=2 entries only).
+        let mut delete_manifest = ManifestFile::new(snapshot_id, next_seq);
+        for active in active_files {
+            if deleted_set.contains(&active.data_file.file_path) {
+                delete_manifest.add_deleted_data_file(active.data_file);
+            }
+        }
+        let del_manifest_filename = manifest_file_name();
+        let del_manifest_key = self.metadata_key(topic, &del_manifest_filename);
+        let del_manifest_s3_path = format!("s3://{}/{}", self.bucket, del_manifest_key);
+        let del_manifest_avro = delete_manifest.to_avro_bytes(&metadata)?;
+        let del_manifest_length = del_manifest_avro.len() as i64;
+        self.upload_bytes(&del_manifest_key, del_manifest_avro, "application/avro")
+            .await?;
+
+        // Build add manifest (status=1 entries for new compacted files).
+        let mut add_manifest = ManifestFile::new(snapshot_id, next_seq);
+        let mut added_files_count = 0usize;
+        let mut added_rows_count = 0i64;
+        for (data_file, parquet_meta) in &added_files {
+            added_files_count += 1;
+            added_rows_count += parquet_meta.row_count as i64;
+            add_manifest.add_data_file(data_file.clone());
+        }
+        let add_manifest_filename = manifest_file_name();
+        let add_manifest_key = self.metadata_key(topic, &add_manifest_filename);
+        let add_manifest_s3_path = format!("s3://{}/{}", self.bucket, add_manifest_key);
+        let add_manifest_avro = add_manifest.to_avro_bytes(&metadata)?;
+        let add_manifest_length = add_manifest_avro.len() as i64;
+        self.upload_bytes(&add_manifest_key, add_manifest_avro, "application/avro")
+            .await?;
+
+        // Carry forward inherited manifest list entries from the parent snapshot,
+        // then append the delete and add manifest entries.
+        let mut manifest_list_entries = self
+            .load_manifest_list_entries(&metadata, current_snapshot_id)
+            .await?;
+
+        manifest_list_entries.push(ManifestListEntry {
+            manifest_path: del_manifest_s3_path,
+            manifest_length: del_manifest_length,
+            partition_spec_id: 0,
+            content: 0,
+            sequence_number: next_seq,
+            min_sequence_number: next_seq,
+            added_snapshot_id: snapshot_id,
+            added_files_count: 0,
+            existing_files_count: 0,
+            deleted_files_count: deleted_files_count as i32,
+            added_rows_count: 0,
+            existing_rows_count: 0,
+            deleted_rows_count,
+        });
+
+        manifest_list_entries.push(ManifestListEntry {
+            manifest_path: add_manifest_s3_path,
+            manifest_length: add_manifest_length,
+            partition_spec_id: 0,
+            content: 0,
+            sequence_number: next_seq,
+            min_sequence_number: next_seq,
+            added_snapshot_id: snapshot_id,
+            added_files_count: added_files_count as i32,
+            existing_files_count: 0,
+            deleted_files_count: 0,
+            added_rows_count,
+            existing_rows_count: 0,
+            deleted_rows_count: 0,
+        });
+
+        // Compute cumulative totals from the full manifest list.
+        let total_files_count: i64 = manifest_list_entries
+            .iter()
+            .map(|e| (e.added_files_count + e.existing_files_count - e.deleted_files_count) as i64)
+            .sum();
+        let total_rows_count: i64 = manifest_list_entries
+            .iter()
+            .map(|e| e.added_rows_count + e.existing_rows_count - e.deleted_rows_count)
+            .sum();
+
+        let manifest_list_filename = manifest_list_file_name(snapshot_id);
+        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
+        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
+        let manifest_list_avro = manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
+        self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
+            .await?;
+
+        metadata.add_compaction_snapshot(
+            snapshot_id,
+            &manifest_list_s3_path,
+            crate::storage::SnapshotSummaryCounts {
+                added_files: added_files_count,
+                added_rows: added_rows_count,
+                deleted_files: deleted_files_count,
+                deleted_rows: deleted_rows_count,
+                total_files: total_files_count.max(0) as usize,
+                total_rows: total_rows_count.max(0),
+            },
+        );
+
+        let version = {
+            let mut versions = self.metadata_versions.write().map_lock_err()?;
+            let v = versions.entry(topic.to_string()).or_insert(0);
+            *v += 1;
+            *v
+        };
+        let metadata_filename = metadata_file_name(version);
+        let metadata_key = self.metadata_key(topic, &metadata_filename);
+        let metadata_json = metadata.to_json()?.into_bytes();
+        self.upload_bytes(&metadata_key, metadata_json, "application/json")
+            .await?;
+
+        {
+            let mut cached = self.table_metadata.write().map_lock_err()?;
+            cached.insert(topic.to_string(), metadata);
+        }
+
+        Ok(snapshot_id)
     }
 
     /// Returns the current table metadata for a topic.
@@ -1526,5 +1949,92 @@ mod tests {
 
         // Pending files should still be present after a failed commit attempt.
         assert_eq!(storage.pending_snapshot_stats("events").file_count, 1);
+    }
+
+    #[test]
+    fn manifest_list_entries_round_trip_through_avro() {
+        let metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        let entries = vec![
+            ManifestListEntry {
+                manifest_path: "s3://bucket/metadata/snap-1-m0.avro".into(),
+                manifest_length: 1234,
+                partition_spec_id: 0,
+                content: 0,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 100,
+                added_files_count: 3,
+                existing_files_count: 0,
+                deleted_files_count: 0,
+                added_rows_count: 300,
+                existing_rows_count: 0,
+                deleted_rows_count: 0,
+            },
+            ManifestListEntry {
+                manifest_path: "s3://bucket/metadata/snap-2-m0.avro".into(),
+                manifest_length: 5678,
+                partition_spec_id: 0,
+                content: 0,
+                sequence_number: 2,
+                min_sequence_number: 2,
+                added_snapshot_id: 200,
+                added_files_count: 2,
+                existing_files_count: 1,
+                deleted_files_count: 1,
+                added_rows_count: 200,
+                existing_rows_count: 50,
+                deleted_rows_count: 100,
+            },
+        ];
+
+        let avro_bytes = crate::storage::manifest_list_to_avro_bytes(&entries, &metadata).unwrap();
+        let round_tripped =
+            IcebergStorage::extract_manifest_list_entries_from_avro(&avro_bytes).unwrap();
+
+        assert_eq!(round_tripped.len(), 2);
+
+        assert_eq!(round_tripped[0].manifest_path, entries[0].manifest_path);
+        assert_eq!(round_tripped[0].manifest_length, entries[0].manifest_length);
+        assert_eq!(
+            round_tripped[0].added_files_count,
+            entries[0].added_files_count
+        );
+        assert_eq!(
+            round_tripped[0].added_rows_count,
+            entries[0].added_rows_count
+        );
+        assert_eq!(round_tripped[0].sequence_number, entries[0].sequence_number);
+        assert_eq!(
+            round_tripped[0].added_snapshot_id,
+            entries[0].added_snapshot_id
+        );
+
+        assert_eq!(round_tripped[1].manifest_path, entries[1].manifest_path);
+        assert_eq!(round_tripped[1].manifest_length, entries[1].manifest_length);
+        assert_eq!(
+            round_tripped[1].added_files_count,
+            entries[1].added_files_count
+        );
+        assert_eq!(
+            round_tripped[1].deleted_files_count,
+            entries[1].deleted_files_count
+        );
+        assert_eq!(
+            round_tripped[1].existing_files_count,
+            entries[1].existing_files_count
+        );
+        assert_eq!(
+            round_tripped[1].added_rows_count,
+            entries[1].added_rows_count
+        );
+        assert_eq!(
+            round_tripped[1].deleted_rows_count,
+            entries[1].deleted_rows_count
+        );
+        assert_eq!(
+            round_tripped[1].existing_rows_count,
+            entries[1].existing_rows_count
+        );
     }
 }
