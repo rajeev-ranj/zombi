@@ -393,5 +393,6 @@ fn clone_storage_error(err: &StorageError) -> StorageError {
         StorageError::CompactionInProgress(msg) => StorageError::CompactionInProgress(msg.clone()),
         StorageError::CompactionConflict(msg) => StorageError::CompactionConflict(msg.clone()),
         StorageError::LockPoisoned(msg) => StorageError::LockPoisoned(msg.clone()),
+        StorageError::InvariantViolation(msg) => StorageError::InvariantViolation(msg.clone()),
     }
 }

@@ -541,6 +541,7 @@ impl TableMetadata {
         manifest_list_path: &str,
         operation: SnapshotOperation,
         counts: SnapshotSummaryCounts,
+        extra_summary: HashMap<String, String>,
     ) -> i64 {
         let now = current_timestamp_ms();
 
@@ -556,6 +557,12 @@ impl TableMetadata {
         summary.insert("deleted-records".into(), counts.deleted_rows.to_string());
         summary.insert("total-records".into(), counts.total_rows.to_string());
         summary.insert("total-data-files".into(), counts.total_files.to_string());
+        for (key, value) in extra_summary {
+            if !key.starts_with("zombi.") {
+                continue;
+            }
+            summary.entry(key).or_insert(value);
+        }
 
         let snapshot = Snapshot {
             snapshot_id,
@@ -1154,6 +1161,7 @@ mod tests {
                 total_files: 1,
                 total_rows: 100,
             },
+            HashMap::new(),
         );
 
         assert_eq!(created, snapshot_id);
@@ -1183,6 +1191,7 @@ mod tests {
                 total_files: 12,
                 total_rows: 1200,
             },
+            HashMap::new(),
         );
 
         assert_eq!(created, snapshot_id);
@@ -1251,6 +1260,53 @@ mod tests {
         }
 
         assert_eq!(statuses, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn add_snapshot_merges_extra_summary_and_drops_non_zombi_keys() {
+        let mut metadata = TableMetadata::new("s3://bucket/tables/events");
+
+        let mut extra = HashMap::new();
+        extra.insert("zombi.watermark.0".to_string(), "42".to_string());
+        extra.insert("zombi.high_watermark.0".to_string(), "100".to_string());
+        extra.insert("not_zombi_key".to_string(), "should_be_dropped".to_string());
+
+        let snapshot_id = metadata.add_snapshot(
+            0, // auto-generated
+            "s3://bucket/tables/events/metadata/snap-1.avro",
+            SnapshotOperation::Append,
+            SnapshotSummaryCounts {
+                added_files: 2,
+                added_rows: 50,
+                total_files: 2,
+                total_rows: 50,
+                ..Default::default()
+            },
+            extra,
+        );
+
+        let snapshot = metadata
+            .snapshots
+            .iter()
+            .find(|s| s.snapshot_id == snapshot_id)
+            .expect("snapshot should exist");
+
+        // Zombi keys are present
+        assert_eq!(snapshot.summary.get("zombi.watermark.0").unwrap(), "42");
+        assert_eq!(
+            snapshot.summary.get("zombi.high_watermark.0").unwrap(),
+            "100"
+        );
+
+        // Non-zombi key was dropped
+        assert!(!snapshot.summary.contains_key("not_zombi_key"));
+
+        // Standard Iceberg keys are intact
+        assert_eq!(snapshot.summary.get("operation").unwrap(), "append");
+        assert_eq!(snapshot.summary.get("added-data-files").unwrap(), "2");
+        assert_eq!(snapshot.summary.get("added-records").unwrap(), "50");
+        assert_eq!(snapshot.summary.get("total-records").unwrap(), "50");
+        assert_eq!(snapshot.summary.get("total-data-files").unwrap(), "2");
     }
 
     #[test]

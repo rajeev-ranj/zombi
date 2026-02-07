@@ -8,7 +8,8 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 
 use crate::contracts::{
-    ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, StorageError, StoredEvent,
+    ColdStorage, ColdStorageInfo, LockResultExt, SegmentInfo, SnapshotCommitContext, StorageError,
+    StoredEvent,
 };
 use crate::s3_retry;
 use crate::storage::retry::RetryConfig;
@@ -299,7 +300,11 @@ impl ColdStorage for S3Storage {
         None
     }
 
-    async fn commit_snapshot(&self, _topic: &str) -> Result<Option<i64>, StorageError> {
+    async fn commit_snapshot(
+        &self,
+        _topic: &str,
+        _context: SnapshotCommitContext,
+    ) -> Result<Option<i64>, StorageError> {
         // S3 storage doesn't create Iceberg metadata
         Ok(None)
     }
