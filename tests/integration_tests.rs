@@ -2719,3 +2719,92 @@ async fn test_read_accept_with_quality_params() {
         content_type
     );
 }
+
+// ============================================================================
+// Edge-case tests: flush error path and invalid table names
+// ============================================================================
+
+fn create_test_app_with_failing_flusher() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let failing_flusher: FlushCallback = Arc::new(|| {
+        Box::pin(async { Err(StorageError::Io("simulated flush failure".into())) })
+            as Pin<Box<dyn std::future::Future<Output = Result<FlushResult, StorageError>> + Send>>
+    });
+    let state = Arc::new(
+        AppState::new(
+            Arc::new(storage),
+            None::<Arc<NoopColdStorage>>,
+            Arc::new(Metrics::new()),
+            Arc::new(MetricsRegistry::new()),
+            BackpressureConfig::default(),
+        )
+        .with_flusher(Some(failing_flusher)),
+    );
+    let router = create_router(state);
+    (router, dir)
+}
+
+#[tokio::test]
+async fn test_flush_table_flusher_error_returns_500() {
+    let (app, _dir) = create_test_app_with_failing_flusher();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events/flush")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["code"], "STORAGE_ERROR");
+    assert!(json["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("simulated flush failure"));
+}
+
+#[tokio::test]
+async fn test_watermark_rejects_invalid_table_name() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/123invalid/watermark")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_flush_rejects_invalid_table_name() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/123invalid/flush")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
