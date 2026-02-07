@@ -20,7 +20,7 @@ use crate::storage::{
     data_file_name, derive_partition_columns, format_partition_date, manifest_file_name,
     manifest_list_file_name, manifest_list_to_avro_bytes, metadata_file_name,
     write_parquet_to_bytes_sorted, DataFile, ManifestEntry, ManifestFile, ManifestListEntry,
-    ParquetFileMetadata, SnapshotOperation, TableMetadata,
+    ParquetFileMetadata, SnapshotOperation, SnapshotSummaryCounts, TableMetadata,
 };
 
 type PendingDataFiles = HashMap<(String, u32), Vec<(DataFile, ParquetFileMetadata)>>;
@@ -656,7 +656,7 @@ impl IcebergStorage {
     }
 
     /// Downloads an S3 object as bytes.
-    async fn download_object_bytes(
+    pub(crate) async fn download_object_bytes(
         &self,
         bucket: &str,
         key: &str,
@@ -727,7 +727,7 @@ impl IcebergStorage {
     }
 
     /// Uploads bytes to S3 with retry.
-    async fn upload_bytes(
+    pub(crate) async fn upload_bytes(
         &self,
         key: &str,
         data: Vec<u8>,
@@ -751,6 +751,61 @@ impl IcebergStorage {
             context = format!("PUT {}", key),
         )?;
         Ok(())
+    }
+
+    /// Shared tail for both flush and compaction snapshot commits.
+    ///
+    /// Takes a fully assembled manifest list, uploads it, adds the snapshot
+    /// to metadata, writes a new metadata version file, and updates the cache.
+    async fn finalize_snapshot(
+        &self,
+        topic: &str,
+        mut metadata: TableMetadata,
+        snapshot_id: i64,
+        manifest_list_entries: &[ManifestListEntry],
+        operation: SnapshotOperation,
+        mut counts: SnapshotSummaryCounts,
+    ) -> Result<TableMetadata, StorageError> {
+        // Compute cumulative totals from the full manifest list.
+        counts.total_files = manifest_list_entries
+            .iter()
+            .map(|e| (e.added_files_count + e.existing_files_count - e.deleted_files_count) as i64)
+            .sum::<i64>()
+            .max(0) as usize;
+        counts.total_rows = manifest_list_entries
+            .iter()
+            .map(|e| e.added_rows_count + e.existing_rows_count - e.deleted_rows_count)
+            .sum::<i64>()
+            .max(0);
+
+        let manifest_list_filename = manifest_list_file_name(snapshot_id);
+        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
+        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
+        let manifest_list_avro =
+            manifest_list_to_avro_bytes(manifest_list_entries, &metadata)?;
+        self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
+            .await?;
+
+        metadata.add_snapshot(snapshot_id, &manifest_list_s3_path, operation, counts);
+
+        let version = {
+            let mut versions = self.metadata_versions.write().map_lock_err()?;
+            let v = versions.entry(topic.to_string()).or_insert(0);
+            *v += 1;
+            *v
+        };
+        let metadata_filename = metadata_file_name(version);
+        let metadata_key = self.metadata_key(topic, &metadata_filename);
+        let metadata_json = metadata.to_json()?.into_bytes();
+        self.upload_bytes(&metadata_key, metadata_json, "application/json")
+            .await?;
+
+        {
+            let mut cached = self.table_metadata.write().map_lock_err()?;
+            cached.insert(topic.to_string(), metadata.clone());
+        }
+
+        Ok(metadata)
     }
 
     /// Commits pending data files by creating a new snapshot.
@@ -788,7 +843,7 @@ impl IcebergStorage {
         let _commit_guard = commit_mutex.lock().await;
 
         let commit_result: Result<(i64, usize, i64), StorageError> = async {
-            let mut metadata = match self.load_latest_table_metadata(topic).await? {
+            let metadata = match self.load_latest_table_metadata(topic).await? {
                 Some(metadata) => metadata,
                 None => self.get_or_create_metadata(topic)?,
             };
@@ -816,26 +871,15 @@ impl IcebergStorage {
 
             // Carry forward manifest list entries from the parent snapshot so
             // each snapshot's manifest list is a complete view of the table.
-            let mut inherited_entries = if let Some(parent_id) = metadata.current_snapshot_id {
-                self.load_manifest_list_entries(&metadata, parent_id)
-                    .await?
-            } else {
-                Vec::new()
-            };
+            let mut manifest_list_entries =
+                if let Some(parent_id) = metadata.current_snapshot_id {
+                    self.load_manifest_list_entries(&metadata, parent_id)
+                        .await?
+                } else {
+                    Vec::new()
+                };
 
-            let inherited_total_files: i64 = inherited_entries
-                .iter()
-                .map(|e| {
-                    (e.added_files_count + e.existing_files_count - e.deleted_files_count) as i64
-                })
-                .sum();
-            let inherited_total_rows: i64 = inherited_entries
-                .iter()
-                .map(|e| e.added_rows_count + e.existing_rows_count - e.deleted_rows_count)
-                .sum();
-
-            // Build manifest list: inherited entries first, then the new manifest entry.
-            let new_entry = ManifestListEntry {
+            manifest_list_entries.push(ManifestListEntry {
                 manifest_path: manifest_s3_path,
                 manifest_length,
                 partition_spec_id: 0,
@@ -849,54 +893,21 @@ impl IcebergStorage {
                 added_rows_count: total_rows,
                 existing_rows_count: 0,
                 deleted_rows_count: 0,
-            };
-            inherited_entries.push(new_entry);
+            });
 
-            // Serialize manifest list to Avro and upload
-            let manifest_list_filename = manifest_list_file_name(snapshot_id);
-            let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
-            let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
-            let manifest_list_avro = manifest_list_to_avro_bytes(&inherited_entries, &metadata)?;
-            self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
-                .await?;
-
-            let cumulative_total_files = inherited_total_files.max(0) as usize + total_files;
-            let cumulative_total_rows = inherited_total_rows.max(0) + total_rows;
-
-            // Add snapshot to metadata
-            metadata.add_snapshot(
+            self.finalize_snapshot(
+                topic,
+                metadata,
                 snapshot_id,
-                &manifest_list_s3_path,
+                &manifest_list_entries,
                 SnapshotOperation::Append,
-                crate::storage::SnapshotSummaryCounts {
+                SnapshotSummaryCounts {
                     added_files: total_files,
                     added_rows: total_rows,
-                    deleted_files: 0,
-                    deleted_rows: 0,
-                    total_files: cumulative_total_files,
-                    total_rows: cumulative_total_rows,
+                    ..Default::default()
                 },
-            );
-
-            // Write new metadata file
-            let version = {
-                let mut versions = self.metadata_versions.write().map_lock_err()?;
-                let v = versions.entry(topic.to_string()).or_insert(0);
-                *v += 1;
-                *v
-            };
-
-            let metadata_filename = metadata_file_name(version);
-            let metadata_key = self.metadata_key(topic, &metadata_filename);
-            let metadata_json = metadata.to_json()?.into_bytes();
-            self.upload_bytes(&metadata_key, metadata_json, "application/json")
-                .await?;
-
-            // Update cached metadata
-            {
-                let mut cached = self.table_metadata.write().map_lock_err()?;
-                cached.insert(topic.to_string(), metadata);
-            }
+            )
+            .await?;
 
             Ok((snapshot_id, total_files, total_rows))
         }
@@ -952,7 +963,7 @@ impl IcebergStorage {
         let commit_mutex = self.commit_mutex_for_topic(topic)?;
         let _commit_guard = commit_mutex.lock().await;
 
-        let mut metadata = self
+        let metadata = self
             .load_latest_table_metadata(topic)
             .await?
             .ok_or_else(|| StorageError::TopicNotFound(topic.to_string()))?;
@@ -987,20 +998,14 @@ impl IcebergStorage {
         let snapshot_id = crate::storage::generate_snapshot_id();
         let next_seq = metadata.last_sequence_number + 1;
 
-        // Count deleted files/rows from the active file set.
+        // Build delete manifest and count deleted files/rows in a single pass.
+        let mut delete_manifest = ManifestFile::new(snapshot_id, next_seq);
         let mut deleted_files_count = 0usize;
         let mut deleted_rows_count = 0i64;
-        for active in &active_files {
+        for active in active_files {
             if deleted_set.contains(&active.data_file.file_path) {
                 deleted_files_count += 1;
                 deleted_rows_count += active.data_file.record_count;
-            }
-        }
-
-        // Build delete manifest (status=2 entries only).
-        let mut delete_manifest = ManifestFile::new(snapshot_id, next_seq);
-        for active in active_files {
-            if deleted_set.contains(&active.data_file.file_path) {
                 delete_manifest.add_deleted_data_file(active.data_file);
             }
         }
@@ -1067,52 +1072,21 @@ impl IcebergStorage {
             deleted_rows_count: 0,
         });
 
-        // Compute cumulative totals from the full manifest list.
-        let total_files_count: i64 = manifest_list_entries
-            .iter()
-            .map(|e| (e.added_files_count + e.existing_files_count - e.deleted_files_count) as i64)
-            .sum();
-        let total_rows_count: i64 = manifest_list_entries
-            .iter()
-            .map(|e| e.added_rows_count + e.existing_rows_count - e.deleted_rows_count)
-            .sum();
-
-        let manifest_list_filename = manifest_list_file_name(snapshot_id);
-        let manifest_list_key = self.metadata_key(topic, &manifest_list_filename);
-        let manifest_list_s3_path = format!("s3://{}/{}", self.bucket, manifest_list_key);
-        let manifest_list_avro = manifest_list_to_avro_bytes(&manifest_list_entries, &metadata)?;
-        self.upload_bytes(&manifest_list_key, manifest_list_avro, "application/avro")
-            .await?;
-
-        metadata.add_compaction_snapshot(
+        self.finalize_snapshot(
+            topic,
+            metadata,
             snapshot_id,
-            &manifest_list_s3_path,
-            crate::storage::SnapshotSummaryCounts {
+            &manifest_list_entries,
+            SnapshotOperation::Replace,
+            SnapshotSummaryCounts {
                 added_files: added_files_count,
                 added_rows: added_rows_count,
                 deleted_files: deleted_files_count,
                 deleted_rows: deleted_rows_count,
-                total_files: total_files_count.max(0) as usize,
-                total_rows: total_rows_count.max(0),
+                ..Default::default()
             },
-        );
-
-        let version = {
-            let mut versions = self.metadata_versions.write().map_lock_err()?;
-            let v = versions.entry(topic.to_string()).or_insert(0);
-            *v += 1;
-            *v
-        };
-        let metadata_filename = metadata_file_name(version);
-        let metadata_key = self.metadata_key(topic, &metadata_filename);
-        let metadata_json = metadata.to_json()?.into_bytes();
-        self.upload_bytes(&metadata_key, metadata_json, "application/json")
-            .await?;
-
-        {
-            let mut cached = self.table_metadata.write().map_lock_err()?;
-            cached.insert(topic.to_string(), metadata);
-        }
+        )
+        .await?;
 
         Ok(snapshot_id)
     }

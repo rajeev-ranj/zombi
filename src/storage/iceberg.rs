@@ -542,31 +542,6 @@ impl TableMetadata {
         operation: SnapshotOperation,
         counts: SnapshotSummaryCounts,
     ) -> i64 {
-        self.add_snapshot_with_counts(snapshot_id, manifest_list_path, operation, counts)
-    }
-
-    /// Adds a replace snapshot used by compaction.
-    pub fn add_compaction_snapshot(
-        &mut self,
-        snapshot_id: i64,
-        manifest_list_path: &str,
-        counts: SnapshotSummaryCounts,
-    ) -> i64 {
-        self.add_snapshot_with_counts(
-            snapshot_id,
-            manifest_list_path,
-            SnapshotOperation::Replace,
-            counts,
-        )
-    }
-
-    fn add_snapshot_with_counts(
-        &mut self,
-        snapshot_id: i64,
-        manifest_list_path: &str,
-        operation: SnapshotOperation,
-        counts: SnapshotSummaryCounts,
-    ) -> i64 {
         let now = current_timestamp_ms();
 
         let mut summary = HashMap::new();
@@ -1196,9 +1171,10 @@ mod tests {
         let mut metadata = TableMetadata::new("s3://bucket/tables/events");
         let snapshot_id = 99;
 
-        let created = metadata.add_compaction_snapshot(
+        let created = metadata.add_snapshot(
             snapshot_id,
             "s3://bucket/tables/events/metadata/snap-99.avro",
+            SnapshotOperation::Replace,
             SnapshotSummaryCounts {
                 added_files: 2,
                 added_rows: 200,

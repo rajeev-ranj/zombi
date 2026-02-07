@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::contracts::{LockResultExt, StorageError, StoredEvent};
 use crate::storage::{
@@ -55,7 +55,7 @@ impl CompactionConfig {
 }
 
 /// Result of a compaction operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompactionResult {
     /// Number of input files compacted.
     pub files_compacted: usize,
@@ -92,16 +92,17 @@ struct PartitionCompactionResult {
     deleted_file_paths: Vec<String>,
     deleted_s3_keys: Vec<String>,
     added_files: Vec<(DataFile, ParquetFileMetadata)>,
+    added_s3_keys: Vec<String>,
 }
 
 struct CompactionGuard<'a> {
     topic: String,
-    compacting: &'a RwLock<HashSet<String>>,
+    compacting: &'a Mutex<HashSet<String>>,
 }
 
 impl Drop for CompactionGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut in_progress) = self.compacting.write() {
+        if let Ok(mut in_progress) = self.compacting.lock() {
             in_progress.remove(&self.topic);
         }
     }
@@ -111,7 +112,7 @@ impl Drop for CompactionGuard<'_> {
 pub struct Compactor {
     iceberg_storage: Arc<IcebergStorage>,
     config: CompactionConfig,
-    compacting: RwLock<HashSet<String>>,
+    compacting: Mutex<HashSet<String>>,
 }
 
 impl Compactor {
@@ -120,12 +121,12 @@ impl Compactor {
         Self {
             iceberg_storage,
             config,
-            compacting: RwLock::new(HashSet::new()),
+            compacting: Mutex::new(HashSet::new()),
         }
     }
 
     fn try_start_compaction(&self, topic: &str) -> Result<CompactionGuard<'_>, StorageError> {
-        let mut in_progress = self.compacting.write().map_lock_err()?;
+        let mut in_progress = self.compacting.lock().map_lock_err()?;
         if !in_progress.insert(topic.to_string()) {
             return Err(StorageError::CompactionInProgress(topic.to_string()));
         }
@@ -185,6 +186,7 @@ impl Compactor {
                 deleted_file_paths: Vec::new(),
                 deleted_s3_keys: Vec::new(),
                 added_files: Vec::new(),
+                added_s3_keys: Vec::new(),
             });
         }
 
@@ -210,6 +212,7 @@ impl Compactor {
                 deleted_file_paths: Vec::new(),
                 deleted_s3_keys: Vec::new(),
                 added_files: Vec::new(),
+                added_s3_keys: Vec::new(),
             });
         }
 
@@ -219,6 +222,7 @@ impl Compactor {
         let mut current_batch = Vec::new();
         let mut current_size_estimate = 0usize;
         let mut added_files = Vec::new();
+        let mut added_s3_keys = Vec::new();
 
         for event in all_events {
             let event_size = event.payload.len() + 100;
@@ -234,6 +238,7 @@ impl Compactor {
                 let s3_path = format!("s3://{}/{}", self.iceberg_storage.bucket(), key);
                 let data_file = DataFile::from_parquet_metadata(&parquet_metadata, &s3_path);
                 added_files.push((data_file, parquet_metadata));
+                added_s3_keys.push(key);
 
                 current_batch.clear();
                 current_size_estimate = 0;
@@ -249,6 +254,7 @@ impl Compactor {
             let s3_path = format!("s3://{}/{}", self.iceberg_storage.bucket(), key);
             let data_file = DataFile::from_parquet_metadata(&parquet_metadata, &s3_path);
             added_files.push((data_file, parquet_metadata));
+            added_s3_keys.push(key);
         }
 
         let output_bytes: u64 = added_files.iter().map(|(_, m)| m.file_size_bytes).sum();
@@ -268,6 +274,7 @@ impl Compactor {
             deleted_file_paths,
             deleted_s3_keys,
             added_files,
+            added_s3_keys,
         })
     }
 
@@ -283,27 +290,16 @@ impl Compactor {
         let _guard = self.try_start_compaction(topic)?;
 
         let Some(plan) = self.find_compaction_candidates(topic).await? else {
-            return Ok(CompactionResult {
-                files_compacted: 0,
-                files_created: 0,
-                rows_processed: 0,
-                bytes_saved: 0,
-                snapshot_id: None,
-            });
+            return Ok(CompactionResult::default());
         };
 
         if plan.groups.is_empty() {
-            return Ok(CompactionResult {
-                files_compacted: 0,
-                files_created: 0,
-                rows_processed: 0,
-                bytes_saved: 0,
-                snapshot_id: None,
-            });
+            return Ok(CompactionResult::default());
         }
 
         let mut group_keys: Vec<String> = plan.groups.keys().cloned().collect();
         group_keys.sort();
+        let mut groups = plan.groups;
 
         let mut files_compacted = 0usize;
         let mut files_created = 0usize;
@@ -313,9 +309,10 @@ impl Compactor {
         let mut deleted_file_paths = Vec::new();
         let mut deleted_s3_keys = Vec::new();
         let mut added_files = Vec::new();
+        let mut added_s3_keys = Vec::new();
 
         for key in group_keys {
-            let candidates = plan.groups.get(&key).cloned().unwrap_or_default();
+            let candidates = groups.remove(&key).unwrap_or_default();
             let result = self.compact_partition_group(&key, candidates).await?;
 
             files_compacted += result.files_compacted;
@@ -326,6 +323,7 @@ impl Compactor {
             deleted_file_paths.extend(result.deleted_file_paths);
             deleted_s3_keys.extend(result.deleted_s3_keys);
             added_files.extend(result.added_files);
+            added_s3_keys.extend(result.added_s3_keys);
         }
 
         if files_compacted == 0 || files_created == 0 || added_files.is_empty() {
@@ -338,7 +336,7 @@ impl Compactor {
             });
         }
 
-        let snapshot_id = self
+        let snapshot_id = match self
             .iceberg_storage
             .commit_compaction_snapshot(
                 topic,
@@ -346,7 +344,36 @@ impl Compactor {
                 deleted_file_paths,
                 added_files,
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                // Best-effort cleanup of newly uploaded compacted files.
+                for key in &added_s3_keys {
+                    if let Err(del_err) = self.delete_file(key).await {
+                        tracing::warn!(
+                            topic = topic,
+                            key = key,
+                            error = %del_err,
+                            "Failed to clean up orphaned compacted file after commit failure"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        tracing::info!(
+            topic = topic,
+            snapshot_id = snapshot_id,
+            files_compacted = files_compacted,
+            files_created = files_created,
+            rows_processed = rows_processed,
+            input_bytes = input_bytes_total,
+            output_bytes = output_bytes_total,
+            bytes_saved = input_bytes_total as i64 - output_bytes_total as i64,
+            "Compaction committed"
+        );
 
         for key in deleted_s3_keys {
             if let Err(error) = self.delete_file(&key).await {
@@ -368,43 +395,20 @@ impl Compactor {
         })
     }
 
-    /// Reads events from a Parquet file in S3.
+    /// Reads events from a Parquet file in S3 (with retry).
     async fn read_parquet_file(&self, key: &str) -> Result<Vec<StoredEvent>, StorageError> {
-        let response = self
+        let bytes = self
             .iceberg_storage
-            .client()
-            .get_object()
-            .bucket(self.iceberg_storage.bucket())
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
-
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?
-            .into_bytes();
-
+            .download_object_bytes(self.iceberg_storage.bucket(), key)
+            .await?;
         read_parquet_events(&bytes)
     }
 
-    /// Uploads bytes to S3.
+    /// Uploads bytes to S3 (with retry).
     async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
-        use aws_sdk_s3::primitives::ByteStream;
-
         self.iceberg_storage
-            .client()
-            .put_object()
-            .bucket(self.iceberg_storage.bucket())
-            .key(key)
-            .body(ByteStream::from(data))
-            .content_type("application/octet-stream")
-            .send()
+            .upload_bytes(key, data, "application/octet-stream")
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
-        Ok(())
     }
 
     /// Deletes a file from S3.

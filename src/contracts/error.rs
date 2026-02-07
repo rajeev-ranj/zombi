@@ -1,4 +1,4 @@
-use std::sync::{PoisonError, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
 use thiserror::Error;
 
@@ -34,6 +34,15 @@ impl<'a, T> LockResultExt<RwLockWriteGuard<'a, T>>
 {
     #[inline]
     fn map_lock_err(self) -> Result<RwLockWriteGuard<'a, T>, StorageError> {
+        self.map_err(|e| StorageError::LockPoisoned(e.to_string()))
+    }
+}
+
+impl<'a, T> LockResultExt<MutexGuard<'a, T>>
+    for Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>
+{
+    #[inline]
+    fn map_lock_err(self) -> Result<MutexGuard<'a, T>, StorageError> {
         self.map_err(|e| StorageError::LockPoisoned(e.to_string()))
     }
 }
