@@ -11,7 +11,8 @@ use crate::contracts::{ColdStorage, HotStorage};
 
 pub use catalog::compute_catalog_namespace;
 pub use handlers::{
-    AppState, BackpressureConfig, Metrics, NoopColdStorage, WriteRecordRequest, WriteRecordResponse,
+    AppState, BackpressureConfig, FlushCallback, Metrics, NoopColdStorage, WriteRecordRequest,
+    WriteRecordResponse,
 };
 
 /// Creates the API router.
@@ -46,6 +47,10 @@ pub fn create_router<H: HotStorage + 'static, C: ColdStorage + 'static>(
         .route(
             "/tables/:table/metadata",
             get(handlers::get_table_metadata::<H, C>),
+        )
+        .route(
+            "/tables/:table/watermark",
+            get(handlers::get_watermark::<H, C>),
         )
         .route("/tables/:table/flush", post(handlers::flush_table::<H, C>))
         .route(

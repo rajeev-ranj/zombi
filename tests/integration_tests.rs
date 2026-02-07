@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -7,8 +8,10 @@ use futures::future::join_all;
 use prost::Message;
 use tower::ServiceExt;
 
-use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
-use zombi::contracts::{ColdStorage, IcebergCatalogTable, StorageError};
+use zombi::api::{
+    create_router, AppState, BackpressureConfig, FlushCallback, Metrics, NoopColdStorage,
+};
+use zombi::contracts::{ColdStorage, FlushResult, IcebergCatalogTable, StorageError};
 use zombi::metrics::MetricsRegistry;
 use zombi::proto;
 use zombi::storage::{RocksDbStorage, WriteCombiner, WriteCombinerConfig};
@@ -1074,7 +1077,7 @@ async fn test_table_metadata_with_cold_storage() {
 }
 
 #[tokio::test]
-async fn test_flush_table_not_implemented() {
+async fn test_flush_table_no_flusher_returns_503() {
     let (app, _dir) = create_test_app();
 
     let response = app
@@ -1088,18 +1091,18 @@ async fn test_flush_table_not_implemented() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["status"], "not_implemented");
+    assert_eq!(json["status"], "not_available");
     assert!(json["message"]
         .as_str()
         .unwrap_or("")
-        .contains("not yet wired"));
+        .contains("not configured"));
 }
 
 #[tokio::test]
@@ -2238,4 +2241,481 @@ async fn test_bulk_write_rejects_invalid_table_name() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ============================================================================
+// Flush wiring tests (#112)
+// ============================================================================
+
+fn create_test_app_with_flusher() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let mock_flusher: FlushCallback = Arc::new(|| {
+        Box::pin(async {
+            Ok(FlushResult {
+                events_flushed: 42,
+                segments_written: 3,
+                new_watermark: 100,
+            })
+        })
+            as Pin<Box<dyn std::future::Future<Output = Result<FlushResult, StorageError>> + Send>>
+    });
+    let state = Arc::new(
+        AppState::new(
+            Arc::new(storage),
+            None::<Arc<NoopColdStorage>>,
+            Arc::new(Metrics::new()),
+            Arc::new(MetricsRegistry::new()),
+            BackpressureConfig::default(),
+            vec!["zombi".into()],
+        )
+        .with_flusher(Some(mock_flusher)),
+    );
+    let router = create_router(state);
+    (router, dir)
+}
+
+#[tokio::test]
+async fn test_flush_table_with_flusher_returns_result() {
+    let (app, _dir) = create_test_app_with_flusher();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/user_events/flush")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["events_flushed"], 42);
+    assert_eq!(json["segments_written"], 3);
+}
+
+// ============================================================================
+// Watermark endpoint tests (#108)
+// ============================================================================
+
+#[tokio::test]
+async fn test_watermark_after_writes() {
+    let (app, _dir) = create_test_app();
+
+    // Write events to partition 0
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "test1", "partition": 0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Write to partition 1
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "test2", "partition": 1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Get watermarks
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events/watermark")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["topic"], "events");
+    let partitions = json["partitions"].as_object().unwrap();
+    assert_eq!(partitions.len(), 2);
+
+    // Flush watermark should be 0 (no flusher in test)
+    assert_eq!(partitions["0"]["watermark"], 0);
+    assert_eq!(partitions["1"]["watermark"], 0);
+
+    // High watermarks should be > 0
+    assert!(partitions["0"]["high_watermark"].as_u64().unwrap() > 0);
+    assert!(partitions["1"]["high_watermark"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_watermark_unknown_table_returns_empty() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/nonexistent/watermark")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["topic"], "nonexistent");
+    assert_eq!(json["partitions"].as_object().unwrap().len(), 0);
+}
+
+// ============================================================================
+// Arrow IPC response format tests (#105)
+// ============================================================================
+
+#[tokio::test]
+async fn test_read_default_still_returns_json() {
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Read without Accept header -> JSON
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("application/json"),
+        "Expected JSON content type, got: {}",
+        content_type
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 1);
+}
+
+#[tokio::test]
+async fn test_read_accept_arrow_returns_ipc() {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "arrow test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Read with Arrow IPC Accept header
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10")
+                .header("accept", "application/vnd.apache.arrow.stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/vnd.apache.arrow.stream");
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // Deserialize Arrow IPC stream and verify
+    let cursor = Cursor::new(body.to_vec());
+    let reader = StreamReader::try_new(cursor, None).unwrap();
+    let schema = reader.schema();
+
+    // Default schema: all 6 columns
+    assert_eq!(schema.fields().len(), 6);
+    assert!(schema.field_with_name("sequence").is_ok());
+    assert!(schema.field_with_name("topic").is_ok());
+    assert!(schema.field_with_name("partition").is_ok());
+    assert!(schema.field_with_name("timestamp_ms").is_ok());
+    assert!(schema.field_with_name("payload").is_ok());
+    assert!(schema.field_with_name("idempotency_key").is_ok());
+
+    let batches: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_read_accept_arrow_with_projection() {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "projected"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Read with projection
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10&fields=payload,timestamp_ms")
+                .header("accept", "application/vnd.apache.arrow.stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let cursor = Cursor::new(body.to_vec());
+    let reader = StreamReader::try_new(cursor, None).unwrap();
+    let schema = reader.schema();
+
+    // Only projected columns
+    assert_eq!(schema.fields().len(), 2);
+    assert!(schema.field_with_name("payload").is_ok());
+    assert!(schema.field_with_name("timestamp_ms").is_ok());
+    assert!(schema.field_with_name("sequence").is_err());
+}
+
+#[tokio::test]
+async fn test_read_accept_arrow_empty() {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let (app, _dir) = create_test_app();
+
+    // Read from table with no matching data (high since filter)
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10&since=99999999999999")
+                .header("accept", "application/vnd.apache.arrow.stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.apache.arrow.stream"
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let cursor = Cursor::new(body.to_vec());
+    let reader = StreamReader::try_new(cursor, None).unwrap();
+    let schema = reader.schema();
+    assert_eq!(schema.fields().len(), 6);
+
+    let batches: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.len(), 0); // No data batches for empty result
+}
+
+#[tokio::test]
+async fn test_read_unsupported_accept_returns_406() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10")
+                .header("accept", "text/xml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "NOT_ACCEPTABLE");
+}
+
+#[tokio::test]
+async fn test_read_accept_with_quality_params() {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let (app, _dir) = create_test_app();
+
+    // Write a record
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tables/events")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": "quality test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    // Arrow higher quality → Arrow response
+    let app_clone = app.clone();
+    let response = app_clone
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10")
+                .header(
+                    "accept",
+                    "application/vnd.apache.arrow.stream; q=1.0, application/json; q=0.8",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.apache.arrow.stream"
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cursor = Cursor::new(body.to_vec());
+    let reader = StreamReader::try_new(cursor, None).unwrap();
+    let batches: Vec<_> = reader.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+
+    // JSON higher quality → JSON response
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tables/events?limit=10")
+                .header(
+                    "accept",
+                    "application/json; q=1.0, application/vnd.apache.arrow.stream; q=0.1",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("application/json"),
+        "Expected JSON when q=1.0 for JSON, got: {}",
+        content_type
+    );
 }
