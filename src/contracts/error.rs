@@ -49,6 +49,9 @@ pub enum StorageError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("Invariant violation: {0}")]
+    InvariantViolation(String),
+
     #[error("Topic not found: {0}")]
     TopicNotFound(String),
 

@@ -1155,7 +1155,7 @@ fn snapshot_commit_context_for_topic<H: HotStorage>(
     let watermarks_by_partition = {
         let pending = pending_watermark_persists.read().map_lock_err()?;
         pending.get(topic).cloned().ok_or_else(|| {
-            StorageError::InvalidInput(format!(
+            StorageError::InvariantViolation(format!(
                 "missing deferred flush watermark state for topic '{}' with {} pending files",
                 topic, pending_files
             ))
@@ -1163,7 +1163,7 @@ fn snapshot_commit_context_for_topic<H: HotStorage>(
     };
 
     if watermarks_by_partition.is_empty() {
-        return Err(StorageError::InvalidInput(format!(
+        return Err(StorageError::InvariantViolation(format!(
             "empty deferred flush watermark state for topic '{}' with {} pending files",
             topic, pending_files
         )));
@@ -3313,6 +3313,57 @@ mod tests {
         assert_eq!(ctx.high_watermarks_by_partition.get(&0), Some(&1));
 
         flusher.stop().await.unwrap();
+    }
+
+    /// Missing topic in deferred watermarks returns InvariantViolation.
+    #[test]
+    fn snapshot_context_errors_when_topic_missing_from_deferred_watermarks() {
+        let hot = TestHotStorage::default();
+        let deferred: RwLock<DeferredWatermarks> = RwLock::new(HashMap::new());
+
+        let result = snapshot_commit_context_for_topic(&hot, "events", 5, &deferred);
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), StorageError::InvariantViolation(_)),
+            "Expected InvariantViolation for missing topic"
+        );
+    }
+
+    /// Empty partition map for topic returns InvariantViolation.
+    #[test]
+    fn snapshot_context_errors_when_partition_map_is_empty() {
+        let hot = TestHotStorage::default();
+        let mut map: HashMap<String, HashMap<u32, u64>> = HashMap::new();
+        map.insert("events".to_string(), HashMap::new());
+        let deferred: RwLock<DeferredWatermarks> = RwLock::new(map);
+
+        let result = snapshot_commit_context_for_topic(&hot, "events", 3, &deferred);
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), StorageError::InvariantViolation(_)),
+            "Expected InvariantViolation for empty partition map"
+        );
+    }
+
+    /// high_watermark failure propagates through snapshot context builder.
+    #[test]
+    fn snapshot_context_errors_when_high_watermark_fails() {
+        let mut hot = TestHotStorage::default();
+        hot.insert("events", 0, vec![make_event(1, TS_HOUR_0_START)]);
+        *hot.high_watermark_failures.lock().unwrap() = 1;
+
+        let mut map: HashMap<String, HashMap<u32, u64>> = HashMap::new();
+        map.insert("events".to_string(), HashMap::from([(0, 42)]));
+        let deferred: RwLock<DeferredWatermarks> = RwLock::new(map);
+
+        let result = snapshot_commit_context_for_topic(&hot, "events", 1, &deferred);
+
+        assert!(
+            result.is_err(),
+            "Expected high_watermark failure to propagate"
+        );
     }
 
     /// P2 regression: a pre-write failure (e.g., high_watermark read error)
