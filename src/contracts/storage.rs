@@ -149,7 +149,9 @@ pub trait HotStorage: Send + Sync {
     /// High watermark keys (`hwm:*`), flush watermark keys (`flush_wm:*`), and
     /// cleanup watermark keys (`cleanup_wm:*`) are preserved.
     ///
-    /// Returns the count of deleted event keys. Idempotent: calling with a sequence
+    /// Returns the approximate count of event keys in the deleted range.
+    /// The count is derived from the range width (not an enumeration of actual keys),
+    /// so it may overcount if sequences are sparse. Idempotent: calling with a sequence
     /// at or below the last cleanup watermark returns 0.
     fn delete_flushed_events(
         &self,

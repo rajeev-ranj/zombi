@@ -1325,7 +1325,9 @@ fn record_and_cleanup<H: HotStorage>(
                     for p in partitions {
                         match hot_storage.load_flush_watermark(topic, p) {
                             Ok(wm) => {
-                                times.entry((topic.to_string(), p)).or_insert((now, wm));
+                                if wm > 0 {
+                                    times.entry((topic.to_string(), p)).or_insert((now, wm));
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -3541,5 +3543,49 @@ mod tests {
             "Second call should be deferred (fresh window)"
         );
         assert_eq!(calls[0], ("t".to_string(), 0, 100));
+    }
+
+    #[test]
+    fn retention_no_double_window_for_zero_wm() {
+        // Scenario: partition exists but flush_wm is 0 (no flush yet).
+        // record_and_cleanup should NOT insert an entry into persist_times
+        // for wm=0, because that stale entry would waste a full retention
+        // window before being discarded (effectively doubling the delay).
+
+        // Phase 1: flush_wm = 0 — nothing to track
+        let hot = hot_with_flush_wm("t", 0, 0);
+        let mut persist_times: HashMap<(String, u32), (Instant, u64)> = HashMap::new();
+
+        record_and_cleanup(
+            &hot,
+            "t",
+            60,
+            Some(&mut persist_times),
+            &FlushMetrics::default(),
+        );
+
+        assert!(
+            persist_times.is_empty(),
+            "Should not insert entry when flush_wm is 0"
+        );
+
+        // Phase 2: flush happens, flush_wm advances to 5
+        hot.save_flush_watermark("t", 0, 5).unwrap();
+
+        record_and_cleanup(
+            &hot,
+            "t",
+            60,
+            Some(&mut persist_times),
+            &FlushMetrics::default(),
+        );
+
+        // Now the entry should be recorded with wm=5
+        assert!(
+            persist_times.contains_key(&("t".to_string(), 0)),
+            "Should insert entry once flush_wm is non-zero"
+        );
+        let &(_, recorded_wm) = persist_times.get(&("t".to_string(), 0)).unwrap();
+        assert_eq!(recorded_wm, 5, "Recorded watermark should be 5, not 0");
     }
 }
