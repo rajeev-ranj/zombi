@@ -791,7 +791,7 @@ fn events_to_arrow_ipc(
     events: &[crate::contracts::StoredEvent],
     projection: &ColumnProjection,
 ) -> Result<Vec<u8>, StorageError> {
-    use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray, UInt32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -806,9 +806,9 @@ fn events_to_arrow_ipc(
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
     if include("sequence") {
-        schema_fields.push(Field::new("sequence", DataType::Int64, false));
-        let values: Vec<i64> = events.iter().map(|e| e.sequence as i64).collect();
-        arrays.push(Arc::new(Int64Array::from(values)));
+        schema_fields.push(Field::new("sequence", DataType::UInt64, false));
+        let values: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+        arrays.push(Arc::new(UInt64Array::from(values)));
     }
 
     if include("topic") {
@@ -818,9 +818,9 @@ fn events_to_arrow_ipc(
     }
 
     if include("partition") {
-        schema_fields.push(Field::new("partition", DataType::Int32, false));
-        let values: Vec<i32> = events.iter().map(|e| e.partition as i32).collect();
-        arrays.push(Arc::new(Int32Array::from(values)));
+        schema_fields.push(Field::new("partition", DataType::UInt32, false));
+        let values: Vec<u32> = events.iter().map(|e| e.partition).collect();
+        arrays.push(Arc::new(UInt32Array::from(values)));
     }
 
     if include("timestamp_ms") {
