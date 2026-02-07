@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -7,7 +8,7 @@ use prost::Message;
 use tower::ServiceExt;
 
 use zombi::api::{create_router, AppState, BackpressureConfig, Metrics, NoopColdStorage};
-use zombi::contracts::{ColdStorage, StorageError};
+use zombi::contracts::{ColdStorage, IcebergCatalogTable, StorageError};
 use zombi::metrics::MetricsRegistry;
 use zombi::proto;
 use zombi::storage::{RocksDbStorage, WriteCombiner, WriteCombinerConfig};
@@ -57,6 +58,113 @@ impl ColdStorage for PanicOnReadColdStorage {
     }
 }
 
+/// Iceberg catalog mock used by /v1 REST catalog integration tests.
+struct CatalogColdStorageMock {
+    tables: HashMap<String, IcebergCatalogTable>,
+}
+
+impl CatalogColdStorageMock {
+    fn new() -> Self {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "events".into(),
+            IcebergCatalogTable {
+                metadata_location: "s3://test-bucket/tables/events/metadata/v7.metadata.json"
+                    .into(),
+                metadata_json: serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "4f5f45df-fa40-4f44-b95d-f3ae6f2f68d0",
+                    "location": "s3://test-bucket/tables/events",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 1700000000000_i64,
+                    "last-column-id": 8,
+                    "schemas": [{
+                        "type": "struct",
+                        "schema-id": 0,
+                        "fields": []
+                    }],
+                    "current-schema-id": 0,
+                    "partition-specs": [{
+                        "spec-id": 0,
+                        "fields": []
+                    }],
+                    "default-spec-id": 0,
+                    "last-partition-id": 999,
+                    "properties": {},
+                    "current-snapshot-id": serde_json::Value::Null,
+                    "snapshots": [],
+                    "snapshot-log": [],
+                    "sort-orders": [{
+                        "order-id": 0,
+                        "fields": []
+                    }],
+                    "default-sort-order-id": 0
+                })
+                .to_string(),
+            },
+        );
+        Self { tables }
+    }
+}
+
+impl ColdStorage for CatalogColdStorageMock {
+    async fn write_segment(
+        &self,
+        _topic: &str,
+        _partition: u32,
+        _events: &[zombi::contracts::StoredEvent],
+    ) -> Result<String, StorageError> {
+        Err(StorageError::S3("not configured".into()))
+    }
+
+    async fn read_events(
+        &self,
+        _topic: &str,
+        _partition: u32,
+        _start_offset: u64,
+        _limit: usize,
+        _since_ms: Option<i64>,
+        _until_ms: Option<i64>,
+        _projection: &zombi::contracts::ColumnProjection,
+    ) -> Result<Vec<zombi::contracts::StoredEvent>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_segments(
+        &self,
+        _topic: &str,
+        _partition: u32,
+    ) -> Result<Vec<zombi::contracts::SegmentInfo>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    fn storage_info(&self) -> zombi::contracts::ColdStorageInfo {
+        zombi::contracts::ColdStorageInfo {
+            storage_type: "iceberg".into(),
+            iceberg_enabled: true,
+            bucket: "test-bucket".into(),
+            base_path: "tables".into(),
+        }
+    }
+
+    async fn list_iceberg_tables(&self) -> Result<Vec<String>, StorageError> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        Ok(names)
+    }
+
+    async fn load_iceberg_table(
+        &self,
+        topic: &str,
+    ) -> Result<Option<IcebergCatalogTable>, StorageError> {
+        Ok(self.tables.get(topic).cloned())
+    }
+
+    async fn iceberg_table_exists(&self, topic: &str) -> Result<bool, StorageError> {
+        Ok(self.tables.contains_key(topic))
+    }
+}
+
 fn create_test_app_with_backpressure(
     config: BackpressureConfig,
 ) -> (axum::Router, tempfile::TempDir) {
@@ -68,6 +176,7 @@ fn create_test_app_with_backpressure(
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         config,
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -82,6 +191,7 @@ fn create_test_app() -> (axum::Router, tempfile::TempDir) {
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -103,6 +213,7 @@ fn create_test_app_with_combiner(config: WriteCombinerConfig) -> (axum::Router, 
             Arc::new(Metrics::new()),
             metrics_registry,
             BackpressureConfig::default(),
+            vec!["zombi".into()],
         )
         .with_write_combiner(Some(combiner)),
     );
@@ -119,6 +230,7 @@ fn create_test_app_with_cold_storage() -> (axum::Router, tempfile::TempDir) {
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
@@ -133,9 +245,29 @@ fn create_test_app_with_panic_cold_storage() -> (axum::Router, tempfile::TempDir
         Arc::new(Metrics::new()),
         Arc::new(MetricsRegistry::new()),
         BackpressureConfig::default(),
+        vec!["zombi".into()],
     ));
     let router = create_router(state);
     (router, dir)
+}
+
+fn create_test_app_with_catalog_storage() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(dir.path()).unwrap();
+    let state = Arc::new(AppState::new(
+        Arc::new(storage),
+        Some(Arc::new(CatalogColdStorageMock::new())),
+        Arc::new(Metrics::new()),
+        Arc::new(MetricsRegistry::new()),
+        BackpressureConfig::default(),
+        vec!["zombi".into()],
+    ));
+    let router = create_router(state);
+    (router, dir)
+}
+
+fn configured_catalog_namespace() -> String {
+    std::env::var("ZOMBI_CATALOG_NAMESPACE").unwrap_or_else(|_| "zombi".into())
 }
 
 #[tokio::test]
@@ -153,6 +285,329 @@ async fn test_health_check() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_catalog_config_endpoint() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json["defaults"].is_object());
+    assert!(json["overrides"].is_object());
+    assert_eq!(json["overrides"]["warehouse"], "s3://test-bucket/tables");
+    assert_eq!(json["overrides"]["namespace-separator"], "%1F");
+
+    let endpoints = json["endpoints"].as_array().unwrap();
+    assert!(endpoints
+        .iter()
+        .any(|v| v.as_str() == Some("GET /v1/namespaces")));
+    assert!(endpoints
+        .iter()
+        .any(|v| v.as_str() == Some("GET /v1/namespaces/{namespace}")));
+    assert!(endpoints
+        .iter()
+        .any(|v| v.as_str() == Some("GET /v1/namespaces/{namespace}/tables/{table}")));
+    assert!(endpoints
+        .iter()
+        .any(|v| v.as_str() == Some("HEAD /v1/namespaces/{namespace}/tables/{table}")));
+}
+
+#[tokio::test]
+async fn test_catalog_list_namespaces() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let expected = configured_catalog_namespace();
+    let expected_top = expected.split('.').next().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["namespaces"][0][0], expected_top);
+}
+
+#[tokio::test]
+async fn test_catalog_list_tables() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/namespaces/{}/tables", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["identifiers"].as_array().unwrap().len(), 1);
+    assert_eq!(json["identifiers"][0]["name"], "events");
+}
+
+#[tokio::test]
+async fn test_catalog_load_table() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/namespaces/{}/tables/events", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["metadata-location"],
+        "s3://test-bucket/tables/events/metadata/v7.metadata.json"
+    );
+    assert_eq!(json["metadata"]["format-version"], 2);
+}
+
+#[tokio::test]
+async fn test_catalog_load_table_not_found() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/namespaces/{}/tables/missing", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "NoSuchTableException");
+    assert_eq!(json["error"]["code"], 404);
+}
+
+#[tokio::test]
+async fn test_catalog_namespace_not_found() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/unknown/tables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "NoSuchNamespaceException");
+    assert_eq!(json["error"]["code"], 404);
+}
+
+#[tokio::test]
+async fn test_catalog_load_namespace() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/namespaces/{}", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["namespace"], serde_json::json!(["zombi"]));
+    assert!(json["properties"].is_object());
+}
+
+#[tokio::test]
+async fn test_catalog_load_namespace_not_found() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "NoSuchNamespaceException");
+    assert_eq!(json["error"]["code"], 404);
+}
+
+#[tokio::test]
+async fn test_catalog_table_exists_head() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/v1/namespaces/{}/tables/events", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn test_catalog_table_not_exists_head() {
+    let (app, _dir) = create_test_app_with_catalog_storage();
+    let namespace = configured_catalog_namespace();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/v1/namespaces/{}/tables/missing", namespace))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_catalog_list_tables_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/zombi/tables")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["identifiers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_catalog_load_table_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/namespaces/zombi/tables/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "NoSuchTableException");
+}
+
+#[tokio::test]
+async fn test_catalog_table_exists_no_cold_storage() {
+    let (app, _dir) = create_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/v1/namespaces/zombi/tables/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

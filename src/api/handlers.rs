@@ -119,6 +119,8 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub max_inflight_bytes: u64,
     /// Optional write combiner for batching single writes
     pub write_combiner: Option<Arc<WriteCombiner<H>>>,
+    /// Catalog namespace, computed once at startup from ZOMBI_CATALOG_NAMESPACE.
+    pub catalog_namespace: Vec<String>,
 }
 
 impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
@@ -129,6 +131,7 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
         metrics: Arc<Metrics>,
         metrics_registry: Arc<MetricsRegistry>,
         backpressure: BackpressureConfig,
+        catalog_namespace: Vec<String>,
     ) -> Self {
         Self {
             storage,
@@ -139,6 +142,7 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
             write_combiner: None,
+            catalog_namespace,
         }
     }
 

@@ -6,7 +6,8 @@ pub mod sequence;
 pub mod storage;
 
 pub use cold_storage::{
-    ColdStorage, ColdStorageInfo, PendingSnapshotStats, SegmentInfo, SnapshotCommitContext,
+    ColdStorage, ColdStorageInfo, IcebergCatalogTable, PendingSnapshotStats, SegmentInfo,
+    SnapshotCommitContext,
 };
 pub use error::{LockResultExt, SequenceError, StorageError, ZombiError};
 pub use flusher::{FlushResult, Flusher};

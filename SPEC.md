@@ -336,7 +336,7 @@ s3://bucket/tables/{topic}/
 |---------|--------|----------|
 | Filesystem | ✅ Implemented | Development, simple deployments |
 | REST Catalog (client registration) | ✅ Implemented | Auto-register tables in external catalogs |
-| REST Catalog API (server) | Planned | Engine discovery via Zombi |
+| REST Catalog API (server, read-only) | ✅ Implemented | Engine discovery via Zombi (`/v1/config`, namespaces, tables, load-table) |
 | Hive Metastore | Planned | Legacy Hadoop environments |
 
 ### Query Engine Compatibility
@@ -520,7 +520,22 @@ GET /consumers/{group}/offset?topic=events&partition=0
 
 - **Arrow IPC response format** — `Accept: application/vnd.apache.arrow.stream` on `GET /tables/{table}` for plugin reads
 - **Watermark boundary** — per-partition committed flush watermark
-- **Iceberg REST Catalog API** — standards-compliant catalog endpoints for engine discovery
+
+### Iceberg REST Catalog API (Read-Only)
+
+For query-engine discovery, Zombi exposes a read-only subset of the Iceberg REST Catalog API:
+
+```http
+GET  /v1/config
+GET  /v1/namespaces
+GET  /v1/namespaces/{namespace}
+GET  /v1/namespaces/{namespace}/tables
+GET  /v1/namespaces/{namespace}/tables/{table}
+HEAD /v1/namespaces/{namespace}/tables/{table}
+```
+
+These routes are isolated from `/tables/*` ingestion/read routes and return Iceberg-compatible
+catalog responses, including the current `s3://.../metadata/v{N}.metadata.json` location on load-table.
 
 ### Admin APIs
 
