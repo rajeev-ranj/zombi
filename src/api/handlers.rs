@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,7 +14,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::contracts::{ColdStorage, ColumnProjection, HotStorage, StorageError, KNOWN_COLUMNS};
+use crate::contracts::{
+    ColdStorage, ColumnProjection, FlushResult, HotStorage, StorageError, KNOWN_COLUMNS,
+};
 use crate::metrics::MetricsRegistry;
 use crate::proto;
 use crate::storage::WriteCombiner;
@@ -105,6 +110,16 @@ impl BackpressureConfig {
     }
 }
 
+/// Type-erased flush callback for the `/flush` endpoint.
+///
+/// The `Flusher` trait uses RPITIT and cannot be used as `dyn Flusher`.
+/// This callback wraps `Flusher::flush_now()` without requiring object safety.
+pub type FlushCallback = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<FlushResult, StorageError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Application state shared across handlers.
 pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub storage: Arc<H>,
@@ -119,6 +134,8 @@ pub struct AppState<H: HotStorage, C: ColdStorage = NoopColdStorage> {
     pub max_inflight_bytes: u64,
     /// Optional write combiner for batching single writes
     pub write_combiner: Option<Arc<WriteCombiner<H>>>,
+    /// Optional flush callback for the `/flush` endpoint
+    pub flusher: Option<FlushCallback>,
 }
 
 impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
@@ -139,11 +156,17 @@ impl<H: HotStorage, C: ColdStorage> AppState<H, C> {
             inflight_bytes: AtomicU64::new(0),
             max_inflight_bytes: backpressure.max_inflight_bytes as u64,
             write_combiner: None,
+            flusher: None,
         }
     }
 
     pub fn with_write_combiner(mut self, combiner: Option<Arc<WriteCombiner<H>>>) -> Self {
         self.write_combiner = combiner;
+        self
+    }
+
+    pub fn with_flusher(mut self, flusher: Option<FlushCallback>) -> Self {
+        self.flusher = flusher;
         self
     }
 
@@ -318,6 +341,7 @@ pub struct ErrorResponse {
 pub enum ApiError {
     Storage(StorageError),
     BadRequest(String),
+    NotAcceptable(String),
 }
 
 impl IntoResponse for ApiError {
@@ -363,6 +387,13 @@ impl IntoResponse for ApiError {
                 ErrorResponse {
                     error: msg,
                     code: "BAD_REQUEST".into(),
+                },
+            ),
+            ApiError::NotAcceptable(msg) => (
+                StatusCode::NOT_ACCEPTABLE,
+                ErrorResponse {
+                    error: msg,
+                    code: "NOT_ACCEPTABLE".into(),
                 },
             ),
         };
@@ -748,19 +779,178 @@ fn project_event(
     }
 }
 
+/// MIME type for Apache Arrow IPC streaming format.
+const ARROW_IPC_MIME: &str = "application/vnd.apache.arrow.stream";
+
+/// Converts StoredEvents to Arrow IPC stream bytes.
+fn events_to_arrow_ipc(
+    events: &[crate::contracts::StoredEvent],
+    projection: &ColumnProjection,
+) -> Result<Vec<u8>, StorageError> {
+    use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+
+    let all_columns = projection.fields.is_none();
+    let fields_list = projection.fields.as_deref();
+    let include = |name: &str| -> bool {
+        all_columns || fields_list.is_some_and(|f| f.iter().any(|s| s == name))
+    };
+
+    let mut schema_fields = Vec::new();
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    if include("sequence") {
+        schema_fields.push(Field::new("sequence", DataType::Int64, false));
+        let values: Vec<i64> = events.iter().map(|e| e.sequence as i64).collect();
+        arrays.push(Arc::new(Int64Array::from(values)));
+    }
+
+    if include("topic") {
+        schema_fields.push(Field::new("topic", DataType::Utf8, false));
+        let values: Vec<&str> = events.iter().map(|e| e.topic.as_str()).collect();
+        arrays.push(Arc::new(StringArray::from(values)));
+    }
+
+    if include("partition") {
+        schema_fields.push(Field::new("partition", DataType::Int32, false));
+        let values: Vec<i32> = events.iter().map(|e| e.partition as i32).collect();
+        arrays.push(Arc::new(Int32Array::from(values)));
+    }
+
+    if include("timestamp_ms") {
+        schema_fields.push(Field::new("timestamp_ms", DataType::Int64, false));
+        let values: Vec<i64> = events.iter().map(|e| e.timestamp_ms).collect();
+        arrays.push(Arc::new(Int64Array::from(values)));
+    }
+
+    if include("payload") {
+        schema_fields.push(Field::new("payload", DataType::Binary, false));
+        let values: Vec<&[u8]> = events.iter().map(|e| e.payload.as_slice()).collect();
+        arrays.push(Arc::new(BinaryArray::from(values)));
+    }
+
+    if include("idempotency_key") {
+        schema_fields.push(Field::new("idempotency_key", DataType::Utf8, true));
+        let values: Vec<Option<&str>> = events
+            .iter()
+            .map(|e| e.idempotency_key.as_deref())
+            .collect();
+        arrays.push(Arc::new(StringArray::from(values)));
+    }
+
+    let schema = Arc::new(Schema::new(schema_fields));
+
+    let mut buf = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, &schema)
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    if !events.is_empty() {
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+    }
+
+    writer
+        .finish()
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+    Ok(buf)
+}
+
+/// A parsed media type with its quality weight.
+struct MediaType {
+    media: String,
+    quality: f32,
+}
+
+/// Parses the Accept header into a list of media types with quality weights.
+/// E.g. "application/json; q=0.8, application/vnd.apache.arrow.stream; q=1.0"
+/// → [("application/vnd.apache.arrow.stream", 1.0), ("application/json", 0.8)]
+fn parse_accepted_media_types(accept: &str) -> Vec<MediaType> {
+    let mut types: Vec<MediaType> = accept
+        .split(',')
+        .filter_map(|part| {
+            let mut parts = part.split(';');
+            let media = parts.next()?.trim().to_lowercase();
+            if media.is_empty() {
+                return None;
+            }
+            let mut quality = 1.0f32;
+            for param in parts {
+                let param = param.trim();
+                if let Some(q) = param.strip_prefix("q=") {
+                    quality = q.trim().parse().unwrap_or(1.0);
+                }
+            }
+            Some(MediaType { media, quality })
+        })
+        .collect();
+    // Sort by quality descending (stable sort preserves order for equal q values)
+    types.sort_by(|a, b| {
+        b.quality
+            .partial_cmp(&a.quality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    types
+}
+
 /// GET /tables/{table}
 /// Read records from the hot buffer (RocksDB only).
 /// Results are ordered by timestamp.
 /// Supports optional `fields` query parameter for column projection.
+/// Supports `Accept` header content negotiation:
+/// - `application/json` (default): JSON response
+/// - `application/vnd.apache.arrow.stream`: Arrow IPC stream
 ///
 /// Cold/historical reads go through Iceberg engines (Spark, Trino, DuckDB).
 pub async fn read_records<H: HotStorage, C: ColdStorage>(
     State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
     Query(query): Query<ReadRecordsQuery>,
-) -> Result<Json<ReadRecordsResponse>, ApiError> {
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
     validate_table_name(&table)?;
     let start = Instant::now();
+
+    // Determine response format from Accept header
+    let accept_raw = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    let media_types = parse_accepted_media_types(accept_raw);
+
+    // Determine preferred format based on highest-quality matching type.
+    // media_types is sorted by quality descending, so first match wins.
+    let preferred = media_types
+        .iter()
+        .find_map(|t| {
+            if t.media == ARROW_IPC_MIME {
+                Some("arrow")
+            } else if t.media == "application/json" || t.media == "*/*" {
+                Some("json")
+            } else {
+                None
+            }
+        })
+        .unwrap_or(if media_types.is_empty() {
+            "json" // No Accept header → default to JSON
+        } else {
+            "unsupported"
+        });
+
+    if preferred == "unsupported" {
+        return Err(ApiError::NotAcceptable(format!(
+            "Unsupported Accept type '{}'. Supported: application/json, {}",
+            accept_raw, ARROW_IPC_MIME
+        )));
+    }
+
+    let wants_arrow = preferred == "arrow";
 
     // Parse and validate projection
     let projection = parse_projection(&query.fields)?;
@@ -776,13 +966,7 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
 
     let has_more = all_events.len() > query.limit;
     let events: Vec<_> = all_events.into_iter().take(query.limit).collect();
-
-    let records: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| project_event(e, &projection))
-        .collect();
-
-    let count = records.len();
+    let count = events.len();
 
     let latency_us = start.elapsed().as_micros() as u64;
     state.metrics.record_read(count as u64, latency_us);
@@ -793,11 +977,26 @@ pub async fn read_records<H: HotStorage, C: ColdStorage>(
         .enhanced_api
         .record_read(&table, latency_us);
 
-    Ok(Json(ReadRecordsResponse {
-        records,
-        count,
-        has_more,
-    }))
+    if wants_arrow {
+        let ipc_bytes = events_to_arrow_ipc(&events, &projection)?;
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, ARROW_IPC_MIME)
+            .body(axum::body::Body::from(ipc_bytes))
+            .map_err(|e| ApiError::BadRequest(format!("Failed to build response: {}", e)))?)
+    } else {
+        let records: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| project_event(e, &projection))
+            .collect();
+
+        Ok(Json(ReadRecordsResponse {
+            records,
+            count,
+            has_more,
+        })
+        .into_response())
+    }
 }
 
 /// GET /health
@@ -978,6 +1177,10 @@ pub struct TableMetadataResponse {
 pub struct FlushResponse {
     pub status: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_flushed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments_written: Option<usize>,
 }
 
 /// Response for compact endpoint.
@@ -1020,23 +1223,111 @@ pub async fn get_table_metadata<H: HotStorage, C: ColdStorage>(
     Ok(Json(response))
 }
 
-/// POST /tables/{table}/flush
-/// Forces a flush of pending events to cold storage.
-/// Note: This endpoint requires the flusher to be wired into AppState.
-pub async fn flush_table<H: HotStorage, C: ColdStorage>(
-    State(_state): State<Arc<AppState<H, C>>>,
+/// Watermark information for a single partition.
+#[derive(Debug, Serialize)]
+pub struct PartitionWatermark {
+    /// Last sequence number successfully flushed to cold storage.
+    pub watermark: u64,
+    /// Highest sequence number written to hot storage.
+    pub high_watermark: u64,
+}
+
+/// Response for watermark endpoint.
+#[derive(Debug, Serialize)]
+pub struct WatermarkResponse {
+    pub topic: String,
+    pub partitions: HashMap<String, PartitionWatermark>,
+}
+
+/// GET /tables/{table}/watermark
+/// Returns the flush watermark and high watermark for all partitions.
+/// Returns 200 with empty partitions for unknown tables (consistent with lazy table creation).
+pub async fn get_watermark<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
     Path(table): Path<String>,
-) -> Result<Json<FlushResponse>, ApiError> {
+) -> Result<Json<WatermarkResponse>, ApiError> {
     validate_table_name(&table)?;
-    // TODO: Wire flusher into AppState to enable this endpoint
-    // For now, return 501 Not Implemented
-    Ok(Json(FlushResponse {
-        status: "not_implemented".into(),
-        message: format!(
-            "Flush for table '{}' is not yet wired. Add flusher to AppState to enable.",
-            table
-        ),
+
+    let partitions = state.storage.list_partitions(&table).map_err(|e| {
+        state.metrics.record_error();
+        ApiError::Storage(e)
+    })?;
+
+    let mut partition_watermarks = HashMap::new();
+
+    for partition in partitions {
+        let flush_wm = state
+            .storage
+            .load_flush_watermark(&table, partition)
+            .map_err(|e| {
+                state.metrics.record_error();
+                ApiError::Storage(e)
+            })?;
+
+        let high_wm = state
+            .storage
+            .high_watermark(&table, partition)
+            .map_err(|e| {
+                state.metrics.record_error();
+                ApiError::Storage(e)
+            })?;
+
+        partition_watermarks.insert(
+            partition.to_string(),
+            PartitionWatermark {
+                watermark: flush_wm,
+                high_watermark: high_wm,
+            },
+        );
+    }
+
+    Ok(Json(WatermarkResponse {
+        topic: table,
+        partitions: partition_watermarks,
     }))
+}
+
+/// POST /tables/{table}/flush
+/// Forces an immediate flush of pending events to cold storage.
+/// Note: The current flusher flushes all topics globally; table-scoped flush is planned for v0.4.
+pub async fn flush_table<H: HotStorage, C: ColdStorage>(
+    State(state): State<Arc<AppState<H, C>>>,
+    Path(table): Path<String>,
+) -> Result<(StatusCode, Json<FlushResponse>), ApiError> {
+    validate_table_name(&table)?;
+
+    let flusher = match &state.flusher {
+        Some(f) => f,
+        None => {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(FlushResponse {
+                    status: "not_available".into(),
+                    message: "Flusher not configured (no cold storage)".into(),
+                    events_flushed: None,
+                    segments_written: None,
+                }),
+            ));
+        }
+    };
+
+    let result = (flusher)().await.map_err(|e| {
+        state.metrics.record_error();
+        ApiError::Storage(e)
+    })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(FlushResponse {
+            status: "ok".into(),
+            message: format!(
+                "Flushed {} events (global flush; table-scoped flush planned for v0.4)",
+                result.events_flushed
+            ),
+            events_flushed: Some(result.events_flushed),
+            segments_written: Some(result.segments_written),
+        }),
+    ))
 }
 
 /// POST /tables/{table}/compact
